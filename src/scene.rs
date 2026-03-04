@@ -1,0 +1,726 @@
+use bevy::{
+    asset::RenderAssetUsages, camera::visibility::RenderLayers, prelude::*,
+    render::render_resource::PrimitiveTopology,
+};
+use bevy_egui::{EguiContexts, EguiGlobalSettings, PrimaryEguiContext};
+use bevy_panorbit_camera::PanOrbitCamera;
+use monster_step_viewer::{StepScene, StepShell};
+use monstertruck::meshing::prelude::PolygonMesh;
+use std::sync::mpsc::TryRecvError;
+
+use crate::state::{
+    AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, FaceMesh, FaceRecord,
+    KEY_LIGHT_ILLUMINANCE, LoadJob, MATERIAL_METALLIC, MATERIAL_ROUGHNESS, MainCamera,
+    NEUTRAL_GRAY, ShellRecord, ViewerState,
+};
+
+pub(crate) fn setup_scene(
+    mut commands: Commands,
+    mut egui_global_settings: ResMut<EguiGlobalSettings>,
+) {
+    // Disable auto egui context - we create our own camera for it.
+    egui_global_settings.auto_create_primary_context = false;
+
+    // Ambient light - low for more contrast.
+    commands.insert_resource(GlobalAmbientLight {
+        color: Color::WHITE,
+        brightness: AMBIENT_BRIGHTNESS,
+        affects_lightmapped_meshes: false,
+    });
+
+    // Main 3D camera with lights as children (so lights move with camera).
+    // Camera at ~2 units from origin for viewing unit-sized normalized scene.
+    commands
+        .spawn((
+            MainCamera,
+            Camera3d::default(),
+            Transform::from_xyz(1.5, 1.0, 1.5).looking_at(Vec3::ZERO, Vec3::Y),
+            PanOrbitCamera {
+                focus: Vec3::ZERO,
+                radius: Some(2.0),
+                ..Default::default()
+            },
+        ))
+        .with_children(|parent| {
+            // Key light - main directional light from top-left (relative to camera).
+            parent.spawn((
+                DirectionalLight {
+                    illuminance: KEY_LIGHT_ILLUMINANCE,
+                    shadows_enabled: true,
+                    ..Default::default()
+                },
+                Transform::from_rotation(Quat::from_euler(
+                    EulerRot::YXZ,
+                    std::f32::consts::PI * 0.25,
+                    std::f32::consts::PI * -0.3,
+                    0.0,
+                )),
+            ));
+
+            // Back light - from bottom-right-back (relative to camera).
+            parent.spawn((
+                DirectionalLight {
+                    illuminance: BACK_LIGHT_ILLUMINANCE,
+                    shadows_enabled: false,
+                    ..Default::default()
+                },
+                Transform::from_rotation(Quat::from_euler(
+                    EulerRot::YXZ,
+                    std::f32::consts::PI * -0.7,
+                    std::f32::consts::PI * 0.15,
+                    0.0,
+                )),
+            ));
+        });
+
+    // Egui-only camera for UI overlay.
+    commands.spawn((
+        PrimaryEguiContext,
+        Camera3d::default(),
+        RenderLayers::none(),
+        Camera {
+            order: 1,
+            ..Default::default()
+        },
+    ));
+}
+
+pub(crate) fn process_load_requests(
+    mut commands: Commands,
+    mut state: ResMut<ViewerState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    existing_meshes: Query<Entity, With<FaceMesh>>,
+) {
+    // Start a new load if requested.
+    if let Some(path) = state.pending_path.take() {
+        for entity in existing_meshes.iter() {
+            commands.entity(entity).despawn();
+        }
+        state.shells.clear();
+        state.faces.clear();
+        state.metadata = None;
+        state.loaded_path = None;
+        state.error = None;
+        state.scene_data = None;
+
+        let receiver =
+            monster_step_viewer::load_step_file_streaming(path.clone(), state.tessellation_factor);
+        state.loading_job = Some(LoadJob {
+            path,
+            receiver: parking_lot::Mutex::new(receiver),
+            current_shell: 0,
+            total_shells: 0,
+        });
+        info!("Started loading STEP file");
+    }
+
+    // Poll the loading job for new messages.
+    let Some(job) = state.loading_job.as_mut() else {
+        return;
+    };
+
+    // Collect all available messages first (to avoid borrow issues).
+    let (messages, disconnected): (Vec<_>, bool) = {
+        let receiver = job.receiver.lock();
+        let mut messages = Vec::new();
+        let mut disconnected = false;
+
+        loop {
+            match receiver.try_recv() {
+                Ok(msg) => messages.push(msg),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        (messages, disconnected)
+    };
+
+    // Process collected messages.
+    for msg in messages {
+        // Re-borrow job mutably for each message.
+        let Some(job) = state.loading_job.as_mut() else {
+            return;
+        };
+
+        match msg {
+            monster_step_viewer::LoadMessage::Metadata(meta) => {
+                state.metadata = Some(meta);
+            }
+            monster_step_viewer::LoadMessage::TotalShells(total) => {
+                job.total_shells = total;
+            }
+            monster_step_viewer::LoadMessage::Progress(current, _total) => {
+                job.current_shell = current;
+            }
+            monster_step_viewer::LoadMessage::Shell(shell) => {
+                // Store shell in scene_data - don't spawn meshes yet (need bounds first).
+                if let Some(scene) = state.scene_data.as_mut() {
+                    scene.shells.push(shell);
+                } else {
+                    state.scene_data = Some(StepScene {
+                        metadata: state.metadata.clone().unwrap_or_default(),
+                        shells: vec![shell],
+                    });
+                }
+            }
+            monster_step_viewer::LoadMessage::Done => {
+                let path = job.path.clone();
+                state.loaded_path = Some(path);
+                state.loading_job = None;
+
+                // Compute bounds for ENTIRE scene.
+                let bounds = state.scene_data.as_ref().and_then(compute_bounds);
+
+                if let Some(bounds) = bounds {
+                    let size = bounds.max - bounds.min;
+                    let max_dim = size.x.max(size.y).max(size.z);
+                    let scale = if max_dim > 0.0 { 1.0 / max_dim } else { 1.0 };
+
+                    // Store normalization params for wireframe rendering.
+                    state.scene_center = bounds.center;
+                    state.scene_scale = scale;
+
+                    info!(
+                        "Scene bounds: center=({:.2}, {:.2}, {:.2}), max_dim={:.2}, scale={:.4}",
+                        bounds.center.x, bounds.center.y, bounds.center.z, max_dim, scale
+                    );
+
+                    // Now spawn all meshes with normalization applied.
+                    // Take scene_data temporarily to avoid borrow conflict.
+                    if let Some(scene) = state.scene_data.take() {
+                        for shell in &scene.shells {
+                            spawn_shell_faces_normalized(
+                                shell,
+                                &mut commands,
+                                &mut meshes,
+                                &mut materials,
+                                &mut state,
+                                bounds.center,
+                                scale,
+                            );
+                        }
+                        state.scene_data = Some(scene);
+                    }
+                    state.current_bounds = Some(Bounds {
+                        center: Vec3::ZERO,
+                        min: (bounds.min - bounds.center) * scale,
+                        max: (bounds.max - bounds.center) * scale,
+                    });
+                }
+
+                // Track the tessellation factor used for this load.
+                state.applied_tessellation_factor = state.tessellation_factor;
+
+                info!(
+                    "Finished loading {} shells, {} faces",
+                    state.shells.len(),
+                    state.faces.len()
+                );
+                return;
+            }
+            monster_step_viewer::LoadMessage::Error(err) => {
+                state.error = Some(err);
+                state.loading_job = None;
+                return;
+            }
+        }
+    }
+
+    if disconnected {
+        state.error = Some("STEP loader stopped unexpectedly before completion".to_string());
+        state.loading_job = None;
+    }
+}
+
+/// Spawn faces for a single shell with normalization applied.
+pub(crate) fn spawn_shell_faces_normalized(
+    shell: &StepShell,
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    state: &mut ResMut<ViewerState>,
+    scene_center: Vec3,
+    scale: f32,
+) {
+    let use_random_colors = state.show_random_colors;
+    let base_face_id = state.faces.len();
+    let face_ids: Vec<usize> = (0..shell.faces.len())
+        .map(|idx| base_face_id + idx)
+        .collect();
+
+    // Shell color from STEP file (if defined).
+    let step_color = shell.color;
+
+    for (idx, face) in shell.faces.iter().enumerate() {
+        let global_face_id = base_face_id + idx;
+
+        // For random colors: each face gets its own color based on global_face_id.
+        // For STEP colors: all faces in shell use the STEP-defined color.
+        // Otherwise: neutral gray (handled in mesh function).
+        let ui_rgb = if let Some(color) = step_color {
+            color
+        } else {
+            let (_, rgb) = color_for_index(global_face_id);
+            rgb
+        };
+
+        let (mesh, tri_count) = bevy_mesh_from_polygon_normalized(
+            &face.mesh,
+            ui_rgb,
+            use_random_colors || step_color.is_some(),
+            scene_center,
+            scale,
+        );
+        let mesh_handle = meshes.add(mesh);
+
+        let material = materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: MATERIAL_ROUGHNESS,
+            metallic: MATERIAL_METALLIC,
+            ..Default::default()
+        });
+
+        commands.spawn((
+            FaceMesh {
+                face_id: global_face_id,
+            },
+            Mesh3d(mesh_handle.clone()),
+            MeshMaterial3d(material),
+            Transform::default(),
+            Visibility::Visible,
+        ));
+
+        state.faces.push(FaceRecord {
+            id: global_face_id,
+            shell_id: shell.id,
+            name: face.name.clone(),
+            triangles: tri_count,
+            visible: true,
+            ui_color: ui_rgb,
+            mesh_handle,
+        });
+    }
+
+    state.shells.push(ShellRecord {
+        id: shell.id,
+        name: shell.name.clone(),
+        expanded: true,
+        face_ids,
+    });
+}
+
+pub(crate) fn compute_bounds(scene: &StepScene) -> Option<Bounds> {
+    let mut min = Vec3::splat(f32::MAX);
+    let mut max = Vec3::splat(f32::MIN);
+    let mut has_points = false;
+
+    for shell in &scene.shells {
+        for face in &shell.faces {
+            for p in face.mesh.positions() {
+                let pos = Vec3::new(p.x as f32, p.y as f32, p.z as f32);
+                min = min.min(pos);
+                max = max.max(pos);
+                has_points = true;
+            }
+        }
+    }
+
+    if !has_points {
+        return None;
+    }
+
+    let center = (min + max) * 0.5;
+    let size = max - min;
+    log::info!(
+        "Scene bounds: min=({:.2}, {:.2}, {:.2}), max=({:.2}, {:.2}, {:.2}), size=({:.2}, {:.2}, {:.2})",
+        min.x,
+        min.y,
+        min.z,
+        max.x,
+        max.y,
+        max.z,
+        size.x,
+        size.y,
+        size.z
+    );
+    Some(Bounds { center, min, max })
+}
+
+pub(crate) fn bevy_mesh_from_polygon_normalized(
+    mesh: &PolygonMesh,
+    shell_color: [f32; 3],
+    use_random_colors: bool,
+    scene_center: Vec3,
+    scale: f32,
+) -> (Mesh, usize) {
+    // Apply normalization: (pos - center) * scale.
+    let positions: Vec<[f32; 3]> = mesh
+        .positions()
+        .iter()
+        .map(|p| {
+            let pos = Vec3::new(p.x as f32, p.y as f32, p.z as f32);
+            let normalized = (pos - scene_center) * scale;
+            [normalized.x, normalized.y, normalized.z]
+        })
+        .collect();
+
+    let normals: Vec<[f32; 3]> = mesh
+        .normals()
+        .iter()
+        .map(|n| [n.x as f32, n.y as f32, n.z as f32])
+        .collect();
+
+    // Collect vertices as (pos_idx, nor_idx) tuples.
+    let mut vertices: Vec<(usize, Option<usize>)> = Vec::new();
+
+    for tri in mesh.tri_faces() {
+        vertices.extend([
+            (tri[0].pos, tri[0].nor),
+            (tri[1].pos, tri[1].nor),
+            (tri[2].pos, tri[2].nor),
+        ]);
+    }
+
+    for quad in mesh.quad_faces() {
+        vertices.extend([
+            (quad[0].pos, quad[0].nor),
+            (quad[1].pos, quad[1].nor),
+            (quad[2].pos, quad[2].nor),
+            (quad[0].pos, quad[0].nor),
+            (quad[2].pos, quad[2].nor),
+            (quad[3].pos, quad[3].nor),
+        ]);
+    }
+
+    for face in mesh.other_faces() {
+        if face.len() < 3 {
+            continue;
+        }
+        let first = (face[0].pos, face[0].nor);
+        face.windows(2).skip(1).for_each(|w| {
+            vertices.extend([first, (w[0].pos, w[0].nor), (w[1].pos, w[1].nor)]);
+        });
+    }
+
+    // Expand indexed geometry to flat arrays.
+    let (flat_positions, flat_normals): (Vec<[f32; 3]>, Vec<[f32; 3]>) = vertices
+        .iter()
+        .map(|(pos_idx, nor_idx)| {
+            let pos = positions[*pos_idx];
+            // Fallback normal.
+            let nor = nor_idx.map(|ni| normals[ni]).unwrap_or([0.0, 0.0, 1.0]);
+            (pos, nor)
+        })
+        .unzip();
+
+    // Uniform color per shell: distinct color if random colors enabled, gray otherwise.
+    let color = if use_random_colors {
+        [shell_color[0], shell_color[1], shell_color[2], 1.0]
+    } else {
+        NEUTRAL_GRAY
+    };
+    let colors: Vec<[f32; 4]> = vec![color; flat_positions.len()];
+
+    let mut bevy_mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, flat_positions);
+    bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, flat_normals);
+    bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+
+    (bevy_mesh, vertices.len() / 3)
+}
+
+pub(crate) fn apply_face_visibility(
+    mut state: ResMut<ViewerState>,
+    mut query: Query<(&FaceMesh, &mut Visibility)>,
+) {
+    if !state.visibility_changed {
+        return;
+    }
+    state.visibility_changed = false;
+
+    for (mesh, mut visibility) in query.iter_mut() {
+        if let Some(record) = state.faces.iter().find(|f| f.id == mesh.face_id) {
+            *visibility = if record.visible {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
+        }
+    }
+}
+
+pub(crate) fn normalize_scene_and_setup_camera(
+    mut state: ResMut<ViewerState>,
+    mut camera_query: Query<(&mut Transform, &mut PanOrbitCamera), With<MainCamera>>,
+    mesh_query: Query<&Transform, (With<FaceMesh>, Without<MainCamera>)>,
+) {
+    let Some(bounds) = state.pending_bounds else {
+        return;
+    };
+
+    // Wait until meshes are actually available in the query (ECS delay).
+    let mesh_count = mesh_query.iter().count();
+    let expected_faces = state.faces.len();
+    if mesh_count < expected_faces {
+        // Meshes not ready yet, try again next frame.
+        return;
+    }
+
+    // Now we can consume pending_bounds.
+    state.pending_bounds = None;
+
+    // Calculate scene dimensions.
+    let size = bounds.max - bounds.min;
+    let max_dim = size.x.max(size.y).max(size.z);
+
+    // Store bounds for bounding box gizmo.
+    state.current_bounds = Some(bounds);
+
+    log::info!(
+        "DEBUG: About to setup camera. Bounds center=({:.2}, {:.2}, {:.2}), max_dim={:.2}",
+        bounds.center.x,
+        bounds.center.y,
+        bounds.center.z,
+        max_dim
+    );
+
+    // Set up camera to view the scene from appropriate distance.
+    // Use ~1.5x the max dimension for good framing.
+    let camera_distance = max_dim * 1.5;
+    if let Ok((mut transform, mut pan_orbit)) = camera_query.single_mut() {
+        log::info!("DEBUG: Found camera, updating PanOrbitCamera");
+        pan_orbit.focus = bounds.center;
+        pan_orbit.radius = Some(camera_distance);
+        // 45 degrees.
+        pan_orbit.yaw = Some(std::f32::consts::FRAC_PI_4);
+        // 30 degrees.
+        pan_orbit.pitch = Some(std::f32::consts::FRAC_PI_6);
+        pan_orbit.force_update = true;
+        // Force re-initialization.
+        pan_orbit.initialized = false;
+
+        // Set initial transform position.
+        let yaw = std::f32::consts::FRAC_PI_4;
+        let pitch = std::f32::consts::FRAC_PI_6;
+        let offset = Vec3::new(
+            camera_distance * yaw.cos() * pitch.cos(),
+            camera_distance * pitch.sin(),
+            camera_distance * yaw.sin() * pitch.cos(),
+        );
+        transform.translation = bounds.center + offset;
+        *transform = transform.looking_at(bounds.center, Vec3::Y);
+
+        log::info!(
+            "Camera setup: focus=({:.2}, {:.2}, {:.2}), distance={:.2}",
+            bounds.center.x,
+            bounds.center.y,
+            bounds.center.z,
+            camera_distance
+        );
+    } else {
+        state.pending_bounds = Some(bounds);
+    }
+}
+
+pub(crate) fn rebuild_meshes_on_toggle(
+    mut state: ResMut<ViewerState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    if !state.needs_mesh_rebuild {
+        return;
+    }
+    state.needs_mesh_rebuild = false;
+
+    let Some(scene) = &state.scene_data else {
+        return;
+    };
+
+    let use_random_colors = state.show_random_colors;
+
+    // Update vertex colors in-place on existing meshes (no despawn/respawn).
+    // Iterate through all faces in all shells.
+    for shell in &scene.shells {
+        // STEP-defined colors always show; random colors only when toggle is on.
+        let apply_colors = use_random_colors || shell.color.is_some();
+
+        for step_face in &shell.faces {
+            // Find the corresponding FaceRecord.
+            if let Some(face_record) = state
+                .faces
+                .iter()
+                .find(|f| f.shell_id == shell.id && f.name == step_face.name)
+                && let Some(mesh) = meshes.get_mut(&face_record.mesh_handle)
+            {
+                let colors =
+                    recompute_colors_for_mesh(&step_face.mesh, face_record.ui_color, apply_colors);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+            }
+        }
+    }
+}
+
+pub(crate) fn color_for_index(idx: usize) -> (Color, [f32; 3]) {
+    use bevy::color::Hsva;
+    // Use golden ratio for hue spread (in degrees for Hsva).
+    let hue = (idx as f32 * 0.618_034 * 360.0) % 360.0;
+    // Vary saturation and value to distinguish similar hues.
+    // 0.5-0.9.
+    let s = 0.5 + 0.4 * ((idx as f32 * 0.317) % 1.0);
+    // 0.7-0.95.
+    let v = 0.7 + 0.25 * ((idx as f32 * 0.513) % 1.0);
+    let hsva = Hsva::new(hue, s, v, 1.0);
+    let color = Color::from(hsva);
+    let srgba = color.to_srgba();
+    (color, [srgba.red, srgba.green, srgba.blue])
+}
+
+/// Recompute vertex colors for a mesh without rebuilding geometry.
+/// Returns colors in the same vertex order as bevy_mesh_from_polygon.
+pub(crate) fn recompute_colors_for_mesh(
+    mesh: &PolygonMesh,
+    shell_color: [f32; 3],
+    use_random_colors: bool,
+) -> Vec<[f32; 4]> {
+    // Count total vertices.
+    let mut vertex_count = 0usize;
+    vertex_count += mesh.tri_faces().len() * 3;
+    // 2 triangles per quad.
+    vertex_count += mesh.quad_faces().len() * 6;
+    for face in mesh.other_faces() {
+        if face.len() >= 3 {
+            vertex_count += (face.len() - 2) * 3;
+        }
+    }
+
+    // Use shell's distinct color if random colors enabled, otherwise neutral gray.
+    let color = if use_random_colors {
+        [shell_color[0], shell_color[1], shell_color[2], 1.0]
+    } else {
+        // Neutral gray.
+        NEUTRAL_GRAY
+    };
+
+    vec![color; vertex_count]
+}
+
+/// Disable PanOrbitCamera when egui wants pointer input (e.g., during panel resize).
+pub(crate) fn disable_camera_when_egui_wants_input(
+    mut contexts: EguiContexts,
+    mut camera_query: Query<&mut PanOrbitCamera, With<MainCamera>>,
+) {
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+
+    let egui_wants_input = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
+
+    if let Ok(mut pan_orbit) = camera_query.single_mut() {
+        pan_orbit.enabled = !egui_wants_input;
+    }
+}
+
+/// Draw bounding box and wireframe gizmos when enabled.
+pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
+    // Draw wireframe edges (STEP geometry boundary edges stored in scene_data).
+    if state.show_wireframe
+        && let Some(scene) = &state.scene_data
+    {
+        let color = Color::srgba(0.0, 0.0, 0.0, 0.7);
+        let center = state.scene_center;
+        let scale = state.scene_scale;
+
+        for shell in &scene.shells {
+            for (p0_arr, p1_arr) in &shell.edges {
+                // Apply same normalization as mesh vertices: (pos - center) * scale.
+                let p0_raw = Vec3::new(p0_arr[0] as f32, p0_arr[1] as f32, p0_arr[2] as f32);
+                let p1_raw = Vec3::new(p1_arr[0] as f32, p1_arr[1] as f32, p1_arr[2] as f32);
+                let p0 = (p0_raw - center) * scale;
+                let p1 = (p1_raw - center) * scale;
+                gizmos.line(p0, p1, color);
+            }
+        }
+    }
+
+    // Draw bounding box.
+    if state.show_bounding_box
+        && let Some(bounds) = state.current_bounds
+    {
+        let min = bounds.min;
+        let max = bounds.max;
+        // Green.
+        let color = Color::srgb(0.0, 1.0, 0.0);
+
+        // 12 edges of the bounding box.
+        // Bottom face.
+        gizmos.line(
+            Vec3::new(min.x, min.y, min.z),
+            Vec3::new(max.x, min.y, min.z),
+            color,
+        );
+        gizmos.line(
+            Vec3::new(max.x, min.y, min.z),
+            Vec3::new(max.x, min.y, max.z),
+            color,
+        );
+        gizmos.line(
+            Vec3::new(max.x, min.y, max.z),
+            Vec3::new(min.x, min.y, max.z),
+            color,
+        );
+        gizmos.line(
+            Vec3::new(min.x, min.y, max.z),
+            Vec3::new(min.x, min.y, min.z),
+            color,
+        );
+        // Top face.
+        gizmos.line(
+            Vec3::new(min.x, max.y, min.z),
+            Vec3::new(max.x, max.y, min.z),
+            color,
+        );
+        gizmos.line(
+            Vec3::new(max.x, max.y, min.z),
+            Vec3::new(max.x, max.y, max.z),
+            color,
+        );
+        gizmos.line(
+            Vec3::new(max.x, max.y, max.z),
+            Vec3::new(min.x, max.y, max.z),
+            color,
+        );
+        gizmos.line(
+            Vec3::new(min.x, max.y, max.z),
+            Vec3::new(min.x, max.y, min.z),
+            color,
+        );
+        // Vertical edges.
+        gizmos.line(
+            Vec3::new(min.x, min.y, min.z),
+            Vec3::new(min.x, max.y, min.z),
+            color,
+        );
+        gizmos.line(
+            Vec3::new(max.x, min.y, min.z),
+            Vec3::new(max.x, max.y, min.z),
+            color,
+        );
+        gizmos.line(
+            Vec3::new(max.x, min.y, max.z),
+            Vec3::new(max.x, max.y, max.z),
+            color,
+        );
+        gizmos.line(
+            Vec3::new(min.x, min.y, max.z),
+            Vec3::new(min.x, max.y, max.z),
+            color,
+        );
+    }
+}

@@ -1,27 +1,33 @@
 [package]
-name = "step-viewer"
+name = "monster-step-viewer"
 version = "0.1.0"
-authors = ["Matt Keeter <matt.j.keeter@gmail.com>"]
+authors = ["Moritz Moeller <virtualritz@protonmail.com>"]
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
+
+[[bin]]
+name = "mstpv"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-bevy = { version = "0.17", default-features = true, features = ["wayland"] }
-bevy_egui = "0.38"
-bevy_panorbit_camera = "0.33"
+bevy = { version = "0.18", default-features = false, features = [
+    "3d_bevy_render",
+    "default_app",
+    "default_platform",
+] }
+bevy_egui = "0.39"
+bevy_panorbit_camera = "0.34"
 futures-lite = "2"
 env_logger = "0.11"
-glam = "0.30"
+glam = "0.32"
 log = "0.4"
+parking_lot = "0.12"
 rayon = "1"
-rfd = "0.15"
+rfd = "0.17"
 ruststep = { version = "0.4", features = ["ap203"] }
 serde = { version = "1", features = ["derive"] }
-truck-geotrait = { path = "../truck/truck-geotrait" }
-truck-meshalgo = { path = "../truck/truck-meshalgo" }
-truck-stepio = { path = "../truck/truck-stepio" }
-truck-topology = { path = "../truck/truck-topology" }
+monstertruck = { version = "0.1", features = ["step"] }
 
 [profile.release]
 opt-level = 2 # fast and small wasm
