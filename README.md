@@ -1,6 +1,6 @@
-# `step-viewer`
+# `monster-step-viewer`
 
-A 3D viewer for STEP (ISO 10303-21) CAD files, built with `truck`, `bevy` and `egui`.
+A 3D viewer for STEP (ISO 10303-21) CAD files, built with [`monstertruck`](https://github.com/virtualritz/monstertruck), `bevy` and `egui`.
 
 ## Features
 
@@ -15,14 +15,22 @@ A 3D viewer for STEP (ISO 10303-21) CAD files, built with `truck`, `bevy` and `e
 - Pan/orbit camera controls.
 - File metadata display.
 
+## Installation
+
+```bash
+cargo install monster-step-viewer
+```
+
+The installed binary is called `mstpv`
+
 ## Usage
 
 ```bash
 # Run with a STEP file
-cargo run --release path/to/model.step
+mstpv path/to/model.step
 
 # Or run and use the file dialog
-cargo run --release
+mstpv
 ```
 
 ## Controls
