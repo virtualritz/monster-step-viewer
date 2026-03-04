@@ -6,6 +6,7 @@ use bevy_egui::{EguiContexts, EguiGlobalSettings, PrimaryEguiContext};
 use bevy_panorbit_camera::PanOrbitCamera;
 use monster_step_viewer::{StepScene, StepShell};
 use monstertruck::meshing::prelude::PolygonMesh;
+use rayon::prelude::*;
 use std::sync::mpsc::TryRecvError;
 
 use crate::state::{
@@ -361,7 +362,7 @@ pub(crate) fn bevy_mesh_from_polygon_normalized(
     // Apply normalization: (pos - center) * scale.
     let positions: Vec<[f32; 3]> = mesh
         .positions()
-        .iter()
+        .par_iter()
         .map(|p| {
             let pos = Vec3::new(p.x as f32, p.y as f32, p.z as f32);
             let normalized = (pos - scene_center) * scale;
@@ -371,7 +372,7 @@ pub(crate) fn bevy_mesh_from_polygon_normalized(
 
     let normals: Vec<[f32; 3]> = mesh
         .normals()
-        .iter()
+        .par_iter()
         .map(|n| [n.x as f32, n.y as f32, n.z as f32])
         .collect();
 
@@ -408,15 +409,17 @@ pub(crate) fn bevy_mesh_from_polygon_normalized(
     }
 
     // Expand indexed geometry to flat arrays.
-    let (flat_positions, flat_normals): (Vec<[f32; 3]>, Vec<[f32; 3]>) = vertices
-        .iter()
+    let expanded: Vec<_> = vertices
+        .par_iter()
         .map(|(pos_idx, nor_idx)| {
             let pos = positions[*pos_idx];
             // Fallback normal.
             let nor = nor_idx.map(|ni| normals[ni]).unwrap_or([0.0, 0.0, 1.0]);
             (pos, nor)
         })
-        .unzip();
+        .collect();
+    let (flat_positions, flat_normals): (Vec<[f32; 3]>, Vec<[f32; 3]>) =
+        expanded.into_iter().unzip();
 
     // Uniform color per shell: distinct color if random colors enabled, gray otherwise.
     let color = if use_random_colors {

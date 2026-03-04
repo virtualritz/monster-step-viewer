@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use monstertruck::meshing::prelude::*;
+use rayon::prelude::*;
 
 use super::transform::Transform;
 
@@ -11,7 +12,7 @@ pub(crate) fn apply_transform_to_mesh(mesh: &mut PolygonMesh, transform: &Transf
     // Transform positions.
     let positions: Vec<_> = mesh
         .positions()
-        .iter()
+        .par_iter()
         .map(|p| {
             let transformed = transform.transform_point([p.x, p.y, p.z]);
             Point3::new(transformed[0], transformed[1], transformed[2])
@@ -21,7 +22,7 @@ pub(crate) fn apply_transform_to_mesh(mesh: &mut PolygonMesh, transform: &Transf
     // Transform normals (rotation only).
     let normals: Vec<_> = mesh
         .normals()
-        .iter()
+        .par_iter()
         .map(|n| {
             let transformed = transform.transform_normal([n.x, n.y, n.z]);
             // Normalize the result.
@@ -83,10 +84,15 @@ pub(crate) fn extract_mesh_edges(
     }
 
     // Boundary edges appear exactly once.
-    edge_counts
+    let boundary: Vec<_> = edge_counts
         .into_iter()
         .filter(|(_, occurrences)| occurrences.len() == 1)
-        .map(|((a, b), _)| {
+        .map(|(key, _)| key)
+        .collect();
+
+    boundary
+        .into_par_iter()
+        .map(|(a, b)| {
             let pa = positions[a];
             let pb = positions[b];
             let mut coord_a = [pa.x, pa.y, pa.z];
