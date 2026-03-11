@@ -25,9 +25,13 @@ log = "0.4"
 parking_lot = "0.12"
 rayon = "1"
 rfd = "0.17"
-ruststep = { version = "0.4", features = ["ap203"] }
 serde = { version = "1", features = ["derive"] }
-monstertruck = { version = "0.1", features = ["step"] }
+serde_json = "1"
+dirs = "6"
+monstertruck = { version = "0.1", features = ["step", "meshing"] }
+
+[patch.crates-io]
+monstertruck = { path = "../truck/monstertruck" }
 
 [profile.release]
 opt-level = 2 # fast and small wasm

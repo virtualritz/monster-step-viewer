@@ -10,9 +10,9 @@ use rayon::prelude::*;
 use std::sync::mpsc::TryRecvError;
 
 use crate::state::{
-    AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, FaceMesh, FaceRecord,
-    KEY_LIGHT_ILLUMINANCE, LoadJob, MATERIAL_METALLIC, MATERIAL_ROUGHNESS, MainCamera,
-    NEUTRAL_GRAY, ShellRecord, ViewerState,
+    AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, EdgeRecord, FaceMesh, FaceRecord,
+    KEY_LIGHT_ILLUMINANCE, LoadJob, LoopRecord, MATERIAL_METALLIC, MATERIAL_ROUGHNESS, MainCamera,
+    NEUTRAL_GRAY, Selection, ShellRecord, ViewerState,
 };
 
 pub(crate) fn setup_scene(
@@ -100,6 +100,10 @@ pub(crate) fn process_load_requests(
         }
         state.shells.clear();
         state.faces.clear();
+        state.edges.clear();
+        state.loops.clear();
+        state.selection = None;
+        state.prev_selection = None;
         state.metadata = None;
         state.loaded_path = None;
         state.error = None;
@@ -279,7 +283,7 @@ pub(crate) fn spawn_shell_faces_normalized(
         );
         let mesh_handle = meshes.add(mesh);
 
-        let material = materials.add(StandardMaterial {
+        let material_handle = materials.add(StandardMaterial {
             base_color: Color::WHITE,
             perceptual_roughness: MATERIAL_ROUGHNESS,
             metallic: MATERIAL_METALLIC,
@@ -291,7 +295,7 @@ pub(crate) fn spawn_shell_faces_normalized(
                 face_id: global_face_id,
             },
             Mesh3d(mesh_handle.clone()),
-            MeshMaterial3d(material),
+            MeshMaterial3d(material_handle.clone()),
             Transform::default(),
             Visibility::Visible,
         ));
@@ -304,14 +308,79 @@ pub(crate) fn spawn_shell_faces_normalized(
             visible: true,
             ui_color: ui_rgb,
             mesh_handle,
+            material_handle,
+            edge_ids: Vec::new(),
+            loop_ids: Vec::new(),
         });
     }
+
+    // Register edge records for this shell's curve edges.
+    let base_edge_id = state.edges.len();
+    for (i, curve_edge) in shell.curve_edges.iter().enumerate() {
+        let global_edge_id = base_edge_id + i;
+        state.edges.push(EdgeRecord {
+            id: global_edge_id,
+            shell_id: shell.id,
+            name: format!("Edge {} ({})", i + 1, curve_edge.curve_type),
+            point_count: curve_edge.points.len(),
+            visible: true,
+        });
+    }
+
+    // Register loop records and link edges to faces.
+    let mut referenced_edge_ids = std::collections::HashSet::new();
+    let mut face_edge_loop_data: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
+
+    for (idx, face) in shell.faces.iter().enumerate() {
+        let global_face_id = base_face_id + idx;
+        let mut face_edge_ids = Vec::new();
+        let mut face_loop_ids = Vec::new();
+
+        for (loop_idx, boundary_loop) in face.boundary_loops.iter().enumerate() {
+            let global_loop_id = state.loops.len();
+            let loop_edge_ids: Vec<usize> = boundary_loop
+                .edge_indices
+                .iter()
+                .map(|&local_idx| base_edge_id + local_idx)
+                .collect();
+
+            for &eid in &loop_edge_ids {
+                referenced_edge_ids.insert(eid);
+            }
+            face_edge_ids.extend(&loop_edge_ids);
+            face_loop_ids.push(global_loop_id);
+
+            state.loops.push(LoopRecord {
+                id: global_loop_id,
+                face_id: global_face_id,
+                shell_id: shell.id,
+                is_outer: loop_idx == 0,
+                edge_ids: loop_edge_ids,
+                trimming_active: true,
+            });
+        }
+
+        face_edge_loop_data.push((global_face_id, face_edge_ids, face_loop_ids));
+    }
+
+    // Assign collected edge/loop data to face records (avoids overlapping borrows).
+    for (face_id, edge_ids, loop_ids) in face_edge_loop_data {
+        state.faces[face_id].edge_ids = edge_ids;
+        state.faces[face_id].loop_ids = loop_ids;
+    }
+
+    // Compute standalone edges (not referenced by any face boundary).
+    let standalone_edge_ids: Vec<usize> = (base_edge_id..base_edge_id + shell.curve_edges.len())
+        .filter(|id| !referenced_edge_ids.contains(id))
+        .collect();
 
     state.shells.push(ShellRecord {
         id: shell.id,
         name: shell.name.clone(),
         expanded: true,
+        visible: true,
         face_ids,
+        standalone_edge_ids,
     });
 }
 
@@ -451,13 +520,69 @@ pub(crate) fn apply_face_visibility(
 
     for (mesh, mut visibility) in query.iter_mut() {
         if let Some(record) = state.faces.iter().find(|f| f.id == mesh.face_id) {
-            *visibility = if record.visible {
+            // Face is visible only when both its own toggle and its shell's toggle are on.
+            let shell_visible = state
+                .shells
+                .iter()
+                .find(|s| s.id == record.shell_id)
+                .is_none_or(|s| s.visible);
+            *visibility = if record.visible && shell_visible {
                 Visibility::Visible
             } else {
                 Visibility::Hidden
             };
         }
     }
+}
+
+pub(crate) fn apply_selection_highlight(
+    mut state: ResMut<ViewerState>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if state.selection == state.prev_selection {
+        return;
+    }
+
+    let highlight_emissive = Color::linear_rgba(0.6, 0.45, 0.0, 1.0);
+
+    // Determine which face IDs should be highlighted.
+    let selected_face_ids: Vec<usize> = match &state.selection {
+        Some(Selection::Face(fid)) => vec![*fid],
+        Some(Selection::Loop(lid)) => state
+            .loops
+            .iter()
+            .find(|l| l.id == *lid)
+            .map(|l| vec![l.face_id])
+            .unwrap_or_default(),
+        _ => vec![],
+    };
+    let prev_face_ids: Vec<usize> = match &state.prev_selection {
+        Some(Selection::Face(fid)) => vec![*fid],
+        Some(Selection::Loop(lid)) => state
+            .loops
+            .iter()
+            .find(|l| l.id == *lid)
+            .map(|l| vec![l.face_id])
+            .unwrap_or_default(),
+        _ => vec![],
+    };
+
+    // Clear highlight on previously selected faces.
+    for face in state.faces.iter() {
+        if prev_face_ids.contains(&face.id) && !selected_face_ids.contains(&face.id)
+            && let Some(mat) = materials.get_mut(&face.material_handle) {
+                mat.emissive = Color::BLACK.into();
+            }
+    }
+    // Apply highlight on newly selected faces.
+    for face in state.faces.iter() {
+        if selected_face_ids.contains(&face.id)
+            && let Some(mat) = materials.get_mut(&face.material_handle) {
+                mat.emissive = highlight_emissive.into();
+            }
+    }
+
+    state.prev_selection = state.selection;
 }
 
 pub(crate) fn normalize_scene_and_setup_camera(
@@ -499,7 +624,6 @@ pub(crate) fn normalize_scene_and_setup_camera(
     // Use ~1.5x the max dimension for good framing.
     let camera_distance = max_dim * 1.5;
     if let Ok((mut transform, mut pan_orbit)) = camera_query.single_mut() {
-        log::info!("DEBUG: Found camera, updating PanOrbitCamera");
         pan_orbit.focus = bounds.center;
         pan_orbit.radius = Some(camera_distance);
         // 45 degrees.
@@ -636,7 +760,7 @@ pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
     if state.show_wireframe
         && let Some(scene) = &state.scene_data
     {
-        let color = Color::srgba(0.0, 0.0, 0.0, 0.7);
+        let color = Color::srgba(0.0, 0.0, 0.0, 0.4);
         let center = state.scene_center;
         let scale = state.scene_scale;
 
@@ -649,6 +773,75 @@ pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
                 let p1 = (p1_raw - center) * scale;
                 gizmos.line(p0, p1, color);
             }
+        }
+    }
+
+    // Draw STEP curve edges as blue polylines (highlighted if selected).
+    if state.show_edges
+        && let Some(scene) = &state.scene_data
+    {
+        let edge_color = Color::srgba(0.2, 0.6, 1.0, 0.9);
+        let highlight_color = Color::srgba(1.0, 0.85, 0.0, 1.0);
+        let center = state.scene_center;
+        let scale = state.scene_scale;
+        let mut edge_offset = 0usize;
+
+        // Precompute which edge IDs are highlighted by the current selection.
+        let highlighted_edges: std::collections::HashSet<usize> = match &state.selection {
+            Some(Selection::Edge(eid)) => [*eid].into_iter().collect(),
+            Some(Selection::Loop(lid)) => state
+                .loops
+                .iter()
+                .find(|l| l.id == *lid)
+                .map(|l| l.edge_ids.iter().copied().collect())
+                .unwrap_or_default(),
+            Some(Selection::Face(fid)) => state
+                .faces
+                .iter()
+                .find(|f| f.id == *fid)
+                .map(|f| f.edge_ids.iter().copied().collect())
+                .unwrap_or_default(),
+            _ => std::collections::HashSet::new(),
+        };
+
+        for shell in &scene.shells {
+            // Check if shell is visible.
+            let shell_visible = state
+                .shells
+                .iter()
+                .find(|s| s.id == shell.id)
+                .is_none_or(|s| s.visible);
+
+            if shell_visible {
+                for curve_edge in &shell.curve_edges {
+                    let global_edge_id = edge_offset + curve_edge.id;
+                    let edge_visible = state.edges.get(global_edge_id).is_none_or(|e| e.visible);
+
+                    if edge_visible {
+                        let color = if highlighted_edges.contains(&global_edge_id) {
+                            highlight_color
+                        } else {
+                            edge_color
+                        };
+                        for window in curve_edge.points.windows(2) {
+                            let p0_raw = Vec3::new(
+                                window[0][0] as f32,
+                                window[0][1] as f32,
+                                window[0][2] as f32,
+                            );
+                            let p1_raw = Vec3::new(
+                                window[1][0] as f32,
+                                window[1][1] as f32,
+                                window[1][2] as f32,
+                            );
+                            let p0 = (p0_raw - center) * scale;
+                            let p1 = (p1_raw - center) * scale;
+                            gizmos.line(p0, p1, color);
+                        }
+                    }
+                }
+            }
+            edge_offset += shell.curve_edges.len();
         }
     }
 
@@ -726,4 +919,102 @@ pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
             color,
         );
     }
+}
+
+/// Re-tessellate a face when loop trimming changes.
+pub(crate) fn retessellate_face(mut state: ResMut<ViewerState>, mut meshes: ResMut<Assets<Mesh>>) {
+    let Some(face_id) = state.retessellate_face.take() else {
+        return;
+    };
+
+    // Find the face record and its shell.
+    let Some(face_rec) = state.faces.iter().find(|f| f.id == face_id) else {
+        log::warn!("retessellate_face: face {} not found", face_id);
+        return;
+    };
+    let shell_id = face_rec.shell_id;
+    let mesh_handle = face_rec.mesh_handle.clone();
+    let ui_color = face_rec.ui_color;
+
+    // Find the shell in scene_data.
+    let Some(scene) = &state.scene_data else {
+        return;
+    };
+    let Some(shell) = scene.shells.iter().find(|s| s.id == shell_id) else {
+        return;
+    };
+    let Some(shell_data) = &shell.original_shell else {
+        log::warn!(
+            "retessellate_face: no original shell data for shell {}",
+            shell_id
+        );
+        return;
+    };
+
+    // Compute base_face_id for this shell.
+    let base_face_id = state
+        .shells
+        .iter()
+        .take_while(|s| s.id != shell_id)
+        .flat_map(|s| s.face_ids.iter())
+        .count();
+    let local_face_idx = face_id - base_face_id;
+
+    let tolerance = shell.tessellation_tolerance;
+    let transform = shell.transform.as_ref();
+
+    // Determine actual boundary indices from the original compressed face.
+    // Loop records are in order of the original boundaries. We need the indices
+    // of loops that have trimming_active = true.
+    let face_loops: Vec<&crate::state::LoopRecord> = state
+        .loops
+        .iter()
+        .filter(|l| l.face_id == face_id)
+        .collect();
+    let active_indices: Vec<usize> = face_loops
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trimming_active)
+        .map(|(i, _)| i)
+        .collect();
+
+    let new_mesh = monster_step_viewer::retessellate_face(
+        shell_data,
+        local_face_idx,
+        &active_indices,
+        tolerance,
+        transform,
+    );
+
+    let Some(polygon_mesh) = new_mesh else {
+        log::warn!("Re-tessellation returned no mesh for face {}", face_id);
+        return;
+    };
+
+    // Build the Bevy mesh from the new polygon mesh.
+    let use_random_colors = state.show_random_colors;
+    let (bevy_mesh, tri_count) = bevy_mesh_from_polygon_normalized(
+        &polygon_mesh,
+        ui_color,
+        use_random_colors,
+        state.scene_center,
+        state.scene_scale,
+    );
+
+    // Update the existing mesh asset.
+    if let Some(existing) = meshes.get_mut(&mesh_handle) {
+        *existing = bevy_mesh;
+    }
+
+    // Update triangle count in face record.
+    if let Some(face_rec) = state.faces.iter_mut().find(|f| f.id == face_id) {
+        face_rec.triangles = tri_count;
+    }
+
+    // Also update the StepFace mesh in scene_data for wireframe consistency.
+    if let Some(scene) = &mut state.scene_data
+        && let Some(shell) = scene.shells.iter_mut().find(|s| s.id == shell_id)
+            && let Some(step_face) = shell.faces.iter_mut().find(|f| f.id == local_face_idx) {
+                step_face.mesh = polygon_mesh;
+            }
 }

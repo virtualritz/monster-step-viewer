@@ -4,11 +4,14 @@ pub mod transform;
 
 use anyhow::Context;
 use monstertruck::meshing::prelude::*;
-use monstertruck::step::r#in::Table;
+use monstertruck::step::load::Table;
+use monstertruck::step::load::step_geometry::{Curve3D, Surface};
+use monstertruck::topology::compress::CompressedShell;
+type OriginalShell = CompressedShell<Point3, Curve3D, Surface>;
+pub use monstertruck::step::load::ruststep::ast::Parameter;
+use monstertruck::step::load::ruststep::parser::parse;
 use parking_lot::Mutex;
 use rayon::prelude::*;
-pub use ruststep::ast::Parameter;
-use ruststep::parser::parse;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -33,12 +36,52 @@ pub struct StepMetadata {
     pub entity_count: usize,
 }
 
+/// A single tessellated edge curve from the STEP model.
+#[derive(Clone, Debug)]
+pub struct StepEdge {
+    pub id: usize,
+    pub curve_type: String,
+    pub points: Vec<[f64; 3]>,
+}
+
+/// A boundary loop of a face (outer boundary or hole).
+#[derive(Clone, Debug)]
+pub struct StepBoundaryLoop {
+    pub edge_indices: Vec<usize>,
+    pub is_outer: bool,
+}
+
+/// Wraps an original CompressedShell for potential re-tessellation.
+#[derive(Clone)]
+pub struct CompressedShellData {
+    inner: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl CompressedShellData {
+    pub fn new<T: std::any::Any + Send + Sync + 'static>(data: T) -> Self {
+        Self {
+            inner: Arc::new(data),
+        }
+    }
+
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
+        self.inner.downcast_ref()
+    }
+}
+
+impl std::fmt::Debug for CompressedShellData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompressedShellData").finish()
+    }
+}
+
 /// A single STEP face (surface) with its tessellated mesh.
 #[derive(Clone, Debug)]
 pub struct StepFace {
     pub id: usize,
     pub name: String,
     pub mesh: PolygonMesh,
+    pub boundary_loops: Vec<StepBoundaryLoop>,
 }
 
 /// A STEP shell containing multiple faces.
@@ -53,6 +96,12 @@ pub struct StepShell {
     pub transform: Option<Transform>,
     /// Tessellated boundary edges (each edge is a pair of 3D points).
     pub edges: Vec<([f64; 3], [f64; 3])>,
+    /// Tessellated STEP curve edges (polylines from curve tessellation).
+    pub curve_edges: Vec<StepEdge>,
+    /// Original compressed shell for potential re-tessellation.
+    pub original_shell: Option<CompressedShellData>,
+    /// Tessellation tolerance used for this shell.
+    pub tessellation_tolerance: f64,
 }
 
 /// Full scene extracted from a STEP file.
@@ -145,6 +194,13 @@ pub fn load_step_file_with_progress(
                 .to_compressed_shell(shell_holder)
                 .map_err(|e| anyhow::anyhow!("Failed to convert STEP shell into topology: {e}"))?;
 
+            // Classify curve types from original geometry (before tessellation).
+            let curve_types: Vec<String> = compressed
+                .edges
+                .iter()
+                .map(|e| classify_curve_type(&e.curve))
+                .collect();
+
             // Compute tolerance from geometric extents without a coarse triangulation pass.
             let mut bounds: BoundingBox<Point3> = compressed.vertices.iter().collect();
             for edge in &compressed.edges {
@@ -171,7 +227,26 @@ pub fn load_step_file_with_progress(
                 tol = 0.01;
             }
 
+            let original_shell = CompressedShellData::new(compressed.clone());
             let poly_shell = compressed.robust_triangulation(tol);
+
+            // Extract tessellated curve edges.
+            let curve_edges: Vec<StepEdge> = poly_shell
+                .edges
+                .iter()
+                .enumerate()
+                .map(|(i, edge)| {
+                    let points = edge.curve.iter().map(|p| [p.x, p.y, p.z]).collect();
+                    StepEdge {
+                        id: i,
+                        curve_type: curve_types
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| "Unknown".to_string()),
+                        points,
+                    }
+                })
+                .collect();
 
             // Extract individual faces and boundary edges from each face mesh.
             let mut all_edges: Vec<([f64; 3], [f64; 3])> = Vec::new();
@@ -189,10 +264,22 @@ pub fn load_step_file_with_progress(
                         let face_edges = extract_mesh_edges(&mesh, None);
                         all_edges.extend(face_edges);
 
+                        // Extract boundary loop topology.
+                        let boundary_loops: Vec<StepBoundaryLoop> = face
+                            .boundaries
+                            .iter()
+                            .enumerate()
+                            .map(|(loop_idx, loop_edges)| StepBoundaryLoop {
+                                edge_indices: loop_edges.iter().map(|ei| ei.index).collect(),
+                                is_outer: loop_idx == 0,
+                            })
+                            .collect();
+
                         StepFace {
                             id: face_idx,
                             name: format!("Face {}", face_idx + 1),
                             mesh,
+                            boundary_loops,
                         }
                     })
                 })
@@ -205,11 +292,12 @@ pub fn load_step_file_with_progress(
                 id: local_idx,
                 name: format!("Shell {}", local_idx + 1),
                 faces,
-                // Non-streaming loader doesn't parse colors.
                 color: None,
-                // Non-streaming loader doesn't parse assembly transforms.
                 transform: None,
                 edges: all_edges,
+                curve_edges,
+                original_shell: Some(original_shell),
+                tessellation_tolerance: tol,
             })
         })
         .collect();
@@ -231,6 +319,7 @@ pub fn load_step_file(path: &Path) -> anyhow::Result<StepScene> {
 }
 
 /// Message sent from background loader to main thread.
+#[allow(clippy::large_enum_variant)]
 pub enum LoadMessage {
     /// Metadata parsed from STEP header.
     Metadata(StepMetadata),
@@ -360,6 +449,13 @@ fn load_step_streaming_inner(
                 }
             };
 
+            // Classify curve types from original geometry (before tessellation).
+            let curve_types: Vec<String> = compressed
+                .edges
+                .iter()
+                .map(|e| classify_curve_type(&e.curve))
+                .collect();
+
             // Compute tolerance from geometric extents without a coarse triangulation pass.
             let mut bounds: BoundingBox<Point3> = compressed.vertices.iter().collect();
             for edge in &compressed.edges {
@@ -392,7 +488,36 @@ fn load_step_streaming_inner(
                 tol
             );
 
+            let original_shell = CompressedShellData::new(compressed.clone());
             let poly_shell = compressed.robust_triangulation(tol);
+
+            // Extract tessellated curve edges (with transform applied).
+            let curve_edges: Vec<StepEdge> = poly_shell
+                .edges
+                .iter()
+                .enumerate()
+                .map(|(i, edge)| {
+                    let points = edge
+                        .curve
+                        .iter()
+                        .map(|p| {
+                            let mut coord = [p.x, p.y, p.z];
+                            if let Some(xform) = transform.as_ref() {
+                                coord = xform.transform_point(coord);
+                            }
+                            coord
+                        })
+                        .collect();
+                    StepEdge {
+                        id: i,
+                        curve_type: curve_types
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| "Unknown".to_string()),
+                        points,
+                    }
+                })
+                .collect();
 
             // Extract individual faces and apply transform to mesh vertices.
             // Also extract boundary edges from each face mesh.
@@ -418,10 +543,22 @@ fn load_step_streaming_inner(
                             apply_transform_to_mesh(&mut mesh, &xform);
                         }
 
+                        // Extract boundary loop topology.
+                        let boundary_loops: Vec<StepBoundaryLoop> = face
+                            .boundaries
+                            .iter()
+                            .enumerate()
+                            .map(|(loop_idx, loop_edges)| StepBoundaryLoop {
+                                edge_indices: loop_edges.iter().map(|ei| ei.index).collect(),
+                                is_outer: loop_idx == 0,
+                            })
+                            .collect();
+
                         StepFace {
                             id: face_idx,
                             name: format!("Face {}", face_idx + 1),
                             mesh,
+                            boundary_loops,
                         }
                     })
                 })
@@ -444,6 +581,9 @@ fn load_step_streaming_inner(
                 color,
                 transform,
                 edges: all_edges,
+                curve_edges,
+                original_shell: Some(original_shell),
+                tessellation_tolerance: tol,
             };
 
             // Send shell immediately (true streaming).
@@ -461,4 +601,60 @@ fn load_step_streaming_inner(
 
     tx.send(LoadMessage::Done)?;
     Ok(())
+}
+
+/// Re-tessellate a single face with modified boundaries.
+/// `active_boundaries` contains the loop indices (into the original face's boundaries) that should remain active.
+/// If empty, the face is tessellated with no trim boundaries (full surface domain).
+pub fn retessellate_face(
+    shell_data: &CompressedShellData,
+    face_idx: usize,
+    active_boundary_indices: &[usize],
+    tolerance: f64,
+    transform: Option<&crate::step_loader::Transform>,
+) -> Option<PolygonMesh> {
+    let original: &OriginalShell = shell_data.downcast_ref()?;
+
+    // Clone the shell and modify the target face's boundaries.
+    let mut modified = original.clone();
+    if let Some(face) = modified.faces.get_mut(face_idx) {
+        let original_boundaries = face.boundaries.clone();
+        face.boundaries = active_boundary_indices
+            .iter()
+            .filter_map(|&idx| original_boundaries.get(idx).cloned())
+            .collect();
+    } else {
+        return None;
+    }
+
+    // Re-tessellate the entire shell (necessary because edges are shared).
+    let poly_shell = modified.robust_triangulation(tolerance);
+
+    // Extract the target face's mesh.
+    let poly_face = poly_shell.faces.get(face_idx)?;
+    let surface = poly_face.surface.as_ref()?;
+    let mut mesh = if poly_face.orientation {
+        surface.clone()
+    } else {
+        surface.inverse()
+    };
+
+    // Apply transform if present.
+    if let Some(xform) = transform {
+        apply_transform_to_mesh(&mut mesh, xform);
+    }
+
+    Some(mesh)
+}
+
+fn classify_curve_type(curve: &Curve3D) -> String {
+    match curve {
+        Curve3D::Line(_) => "Line",
+        Curve3D::Polyline(_) => "Polyline",
+        Curve3D::Conic(_) => "Conic",
+        Curve3D::BsplineCurve(_) => "BSpline",
+        Curve3D::Pcurve(_) => "Pcurve",
+        Curve3D::NurbsCurve(_) => "NURBS",
+    }
+    .to_string()
 }

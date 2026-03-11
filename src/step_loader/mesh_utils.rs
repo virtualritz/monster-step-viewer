@@ -69,11 +69,7 @@ pub(crate) fn extract_mesh_edges(
     let mut edge_counts: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
 
     for tri in tri_faces {
-        let indices = [
-            tri[0].pos,
-            tri[1].pos,
-            tri[2].pos,
-        ];
+        let indices = [tri[0].pos, tri[1].pos, tri[2].pos];
         // Three edges per triangle.
         for i in 0..3 {
             let a = indices[i];
