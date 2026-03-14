@@ -1794,6 +1794,9 @@ fn solidify_clip_inner(
     tol: f64,
 ) -> Result<StepScene, String> {
     use monstertruck::meshing::prelude::{BoundingBox, Point3, RobustMeshableShape};
+    use monstertruck::modeling::Curve as ModelingCurve;
+    use monstertruck::modeling::Surface as ModelingSurface;
+    use monstertruck::modeling::Invertible;
     use monstertruck::solid::and as solid_and;
     use monstertruck::step::load::step_geometry::{Curve3D, Surface};
     use monstertruck::topology::compress::CompressedSolid;
@@ -1801,14 +1804,21 @@ fn solidify_clip_inner(
 
     type StepSolid = Solid<Point3, Curve3D, Surface>;
     type StepCompressedSolid = CompressedSolid<Point3, Curve3D, Surface>;
+    type ModelingSolid = Solid<Point3, ModelingCurve, ModelingSurface>;
 
     // Downcast and extract the solid.
     let csolid: &StepCompressedSolid = solid_data
         .downcast_ref::<StepCompressedSolid>()
         .ok_or_else(|| "Failed to downcast CompressedShellData to CompressedSolid".to_string())?;
 
-    let mut current_solid: StepSolid = StepSolid::extract(csolid.clone())
+    let current_solid: StepSolid = StepSolid::extract(csolid.clone())
         .map_err(|e| format!("Failed to extract solid: {}", e))?;
+
+    let mut current_solid: ModelingSolid = current_solid.try_mapped(
+        |p| Some(*p),
+        |c: &Curve3D| ModelingCurve::try_from(c).ok(),
+        |s: &Surface| ModelingSurface::try_from(s).ok(),
+    ).ok_or_else(|| "Failed to convert STEP solid to modeling types".to_string())?;
 
     // Apply each active clip plane as a boolean AND with a half-space box.
     // The shader discards fragments where dot(normal, pos) + d > 0, which for
@@ -1862,7 +1872,7 @@ fn solidify_clip_inner(
         };
 
         let bbox = BoundingBox::from_iter([min_pt, max_pt]);
-        let halfspace: StepSolid = monstertruck::modeling::primitive::cuboid(bbox);
+        let halfspace: ModelingSolid = monstertruck::modeling::primitive::cuboid(bbox);
 
         current_solid = solid_and(&current_solid, &halfspace, tol)
             .map_err(|e| format!("Boolean AND failed on axis {}: {:?}", axis, e))?;
@@ -1969,15 +1979,16 @@ pub(crate) fn poll_solidify_clip(
 
     let result = {
         let receiver = job.receiver.lock();
-        match receiver.try_recv() {
-            Ok(r) => r,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                state.solidify_job = None;
-                state.error =
-                    Some("Solidify job thread terminated unexpectedly".to_string());
-                return;
-            }
+        receiver.try_recv()
+    };
+
+    let result = match result {
+        Ok(r) => r,
+        Err(TryRecvError::Empty) => return,
+        Err(TryRecvError::Disconnected) => {
+            state.solidify_job = None;
+            state.error = Some("Solidify job thread terminated unexpectedly".to_string());
+            return;
         }
     };
 
