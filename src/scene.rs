@@ -257,6 +257,13 @@ pub(crate) fn process_load_requests(
                         })
                     });
 
+                // Apply persisted clip plane / shading state to the newly
+                // spawned materials.
+                state.clip_planes_dirty = true;
+                if state.shading_mode != ShadingMode::default() {
+                    state.shading_mode_changed = true;
+                }
+
                 info!(
                     "Finished loading {} shells, {} faces (has_solid_topology={})",
                     state.shells.len(),
@@ -1804,23 +1811,23 @@ fn solidify_clip_inner(
         .map_err(|e| format!("Failed to extract solid: {}", e))?;
 
     // Apply each active clip plane as a boolean AND with a half-space box.
+    // The shader discards fragments where dot(normal, pos) + d > 0, which for
+    // no-flip (normal = +axis, d = -pos) keeps the NEGATIVE side (x <= pos).
+    // The solidify box must match: no-flip keeps (-big .. world_pos).
     let big = 1e6;
     for &(axis, world_pos, flip) in active_clips {
-        // Build the half-space bounding box.
-        // Default (no flip): keep the positive side (world_pos .. +big).
-        // With flip: keep the negative side (-big .. world_pos).
         let (min_pt, max_pt) = match axis {
             0 => {
                 // X axis
                 if flip {
                     (
-                        Point3::new(-big, -big, -big),
-                        Point3::new(world_pos, big, big),
+                        Point3::new(world_pos, -big, -big),
+                        Point3::new(big, big, big),
                     )
                 } else {
                     (
-                        Point3::new(world_pos, -big, -big),
-                        Point3::new(big, big, big),
+                        Point3::new(-big, -big, -big),
+                        Point3::new(world_pos, big, big),
                     )
                 }
             }
@@ -1828,13 +1835,13 @@ fn solidify_clip_inner(
                 // Y axis
                 if flip {
                     (
-                        Point3::new(-big, -big, -big),
-                        Point3::new(big, world_pos, big),
+                        Point3::new(-big, world_pos, -big),
+                        Point3::new(big, big, big),
                     )
                 } else {
                     (
-                        Point3::new(-big, world_pos, -big),
-                        Point3::new(big, big, big),
+                        Point3::new(-big, -big, -big),
+                        Point3::new(big, world_pos, big),
                     )
                 }
             }
@@ -1842,13 +1849,13 @@ fn solidify_clip_inner(
                 // Z axis
                 if flip {
                     (
-                        Point3::new(-big, -big, -big),
-                        Point3::new(big, big, world_pos),
+                        Point3::new(-big, -big, world_pos),
+                        Point3::new(big, big, big),
                     )
                 } else {
                     (
-                        Point3::new(-big, -big, world_pos),
-                        Point3::new(big, big, big),
+                        Point3::new(-big, -big, -big),
+                        Point3::new(big, big, world_pos),
                     )
                 }
             }

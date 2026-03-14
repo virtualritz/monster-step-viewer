@@ -49,7 +49,6 @@ impl Default for ClipPlaneState {
 
 impl ClipPlaneState {
     /// Get position as f32 in 0.0..=1.0 range.
-    #[allow(dead_code)]
     pub fn position_f32(&self) -> f32 {
         self.position as f32 / 1000.0
     }
