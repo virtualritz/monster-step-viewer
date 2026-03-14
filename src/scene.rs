@@ -1105,6 +1105,64 @@ pub(crate) fn retessellate_face(
     }
 }
 
+/// Update clip-plane uniforms on every `ViewerMaterial` asset when dirty.
+pub(crate) fn update_clip_plane_uniforms(
+    mut state: ResMut<ViewerState>,
+    mut materials: ResMut<Assets<ViewerMaterial>>,
+) {
+    if !state.clip_planes_dirty {
+        return;
+    }
+    state.clip_planes_dirty = false;
+
+    // Need bounding box to map normalised position to world coords.
+    let bounds = match state.current_bounds {
+        Some(b) => b,
+        None => return,
+    };
+
+    // Axis unit vectors for X, Y, Z.
+    const AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
+    let bounds_min = [bounds.min.x, bounds.min.y, bounds.min.z];
+    let bounds_max = [bounds.max.x, bounds.max.y, bounds.max.z];
+
+    let mut planes = [Vec4::ZERO; 3];
+    let mut active_bits: u32 = 0;
+
+    for (i, (plane, cp)) in planes
+        .iter_mut()
+        .zip(state.clip_planes.iter())
+        .enumerate()
+    {
+        if !cp.enabled {
+            continue;
+        }
+
+        // Map position (0..1) to bounding-box range on axis `i`.
+        let pos = bounds_min[i]
+            + cp.position_f32() * (bounds_max[i] - bounds_min[i]);
+
+        // Normal: unit vector along axis, negated when flipped.
+        let normal = if cp.flip { -AXES[i] } else { AXES[i] };
+
+        // d = -dot(normal, point_on_plane). The point lies at `pos` on this
+        // axis (other components zero), so d = -normal[i] * pos.
+        let d = -normal[i] * pos;
+        *plane = Vec4::new(normal.x, normal.y, normal.z, d);
+        active_bits |= 1 << i;
+    }
+
+    let clip_active = UVec4::new(active_bits, 0, 0, 0);
+
+    // Push to every material asset.
+    for (_id, mat) in materials.iter_mut() {
+        mat.extension.clip_plane_0 = planes[0];
+        mat.extension.clip_plane_1 = planes[1];
+        mat.extension.clip_plane_2 = planes[2];
+        mat.extension.clip_active = clip_active;
+    }
+}
+
 /// Global observer: clicking a face mesh in the viewport selects it in the
 /// hierarchy.
 pub(crate) fn on_mesh_click(

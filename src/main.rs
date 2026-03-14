@@ -108,6 +108,7 @@ fn main() {
         .add_systems(Update, scene::disable_camera_when_egui_wants_input)
         .add_systems(Update, scene::draw_gizmos)
         .add_systems(Update, scene::retessellate_face)
+        .add_systems(Update, scene::update_clip_plane_uniforms)
         .add_systems(Update, persistence::auto_save_system)
         .add_observer(scene::on_mesh_click)
         .add_systems(
