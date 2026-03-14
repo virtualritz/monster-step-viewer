@@ -9,7 +9,7 @@ use crate::{
     },
     state::{
         AppMode, BrowserState, DirectoryEntry, MainCamera, PreviewStatus,
-        Selection, ViewerState,
+        Selection, ShadingMode, ViewerState,
     },
 };
 use bevy::{
@@ -899,6 +899,35 @@ fn viewer_ui(
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
 
+                            // Shading mode dropdown.
+                            let mode_label = match state.shading_mode {
+                                ShadingMode::Shaded => "Shaded",
+                                ShadingMode::Flat => "Flat",
+                                ShadingMode::Matcap => "Matcap",
+                                ShadingMode::XRay => "X-Ray",
+                                ShadingMode::Wireframe => "Wireframe",
+                            };
+                            egui::ComboBox::from_id_salt("shading_mode")
+                                .selected_text(mode_label)
+                                .width(90.0)
+                                .show_ui(ui, |ui| {
+                                    for (mode, label) in [
+                                        (ShadingMode::Shaded, "Shaded"),
+                                        (ShadingMode::Flat, "Flat"),
+                                        (ShadingMode::Matcap, "Matcap"),
+                                        (ShadingMode::XRay, "X-Ray"),
+                                        (ShadingMode::Wireframe, "Wireframe"),
+                                    ] {
+                                        if ui.selectable_label(state.shading_mode == mode, label).clicked() {
+                                            state.shading_mode = mode;
+                                            state.shading_mode_changed = true;
+                                            state.settings_dirty = true;
+                                        }
+                                    }
+                                });
+
+                            ui.separator();
+
                             // Quality slider.
                             let mut quality = -state.tessellation_factor.log10();
                             let slider = ui.add(
@@ -975,6 +1004,65 @@ fn viewer_ui(
                                 state.settings_dirty = true;
                             }
                             edge_btn.on_hover_text("Curve edges");
+
+                            ui.separator();
+
+                            let clip_labels = ["X", "Y", "Z"];
+                            let clip_colors = [
+                                egui::Color32::from_rgb(220, 80, 80),
+                                egui::Color32::from_rgb(80, 200, 80),
+                                egui::Color32::from_rgb(80, 120, 220),
+                            ];
+                            for i in 0..3 {
+                                let active = state.clip_planes[i].enabled;
+                                let label = if active {
+                                    egui::RichText::new(clip_labels[i])
+                                        .color(clip_colors[i])
+                                        .strong()
+                                } else {
+                                    egui::RichText::new(clip_labels[i])
+                                };
+                                let clip_btn = ui.selectable_label(active, label);
+                                if clip_btn.clicked() {
+                                    state.clip_planes[i].enabled = !state.clip_planes[i].enabled;
+                                    state.clip_planes_dirty = true;
+                                    state.settings_dirty = true;
+                                }
+                                clip_btn.on_hover_text(format!("Clip {} axis", clip_labels[i]));
+                            }
+
+                            ui.separator();
+
+                            // Solidify Clip button.
+                            let any_clip_active = state.clip_planes.iter().any(|c| c.enabled);
+                            let is_processing = state.solidify_job.is_some();
+                            let can_solidify = state.has_solid_topology && any_clip_active && !is_processing;
+
+                            if is_processing {
+                                ui.spinner();
+                                ui.label(
+                                    egui::RichText::new("Processing...")
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                );
+                            } else {
+                                let solidify_btn = ui.add_enabled(
+                                    can_solidify,
+                                    egui::Button::new(
+                                        egui::RichText::new("Solidify").strong(),
+                                    ),
+                                );
+                                if solidify_btn.clicked() {
+                                    state.start_solidify = true;
+                                }
+                                if !state.has_solid_topology {
+                                    solidify_btn.on_hover_text("Only for STEP solids");
+                                } else if !any_clip_active {
+                                    solidify_btn.on_hover_text("Enable clip planes first");
+                                } else {
+                                    solidify_btn.on_hover_text("Boolean-clip the solid using active clip planes");
+                                }
+                            }
                         });
                     });
                 });

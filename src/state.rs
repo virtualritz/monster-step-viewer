@@ -28,6 +28,44 @@ pub(crate) enum AppMode {
     Browser,
 }
 
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub(crate) struct ClipPlaneState {
+    pub enabled: bool,
+    pub position: u16,
+    pub flip: bool,
+}
+
+impl Default for ClipPlaneState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            position: 500,
+            flip: false,
+        }
+    }
+}
+
+impl ClipPlaneState {
+    /// Get position as f32 in 0.0..=1.0 range.
+    pub fn position_f32(&self) -> f32 {
+        self.position as f32 / 1000.0
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub(crate) enum ShadingMode {
+    #[default]
+    Shaded,
+    Flat,
+    Matcap,
+    XRay,
+    Wireframe,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Selection {
     #[allow(dead_code)]
@@ -96,6 +134,25 @@ pub(crate) struct ViewerState {
     pub hover: Option<Selection>,
     /// Previous hover (to detect changes and update materials).
     pub prev_hover: Option<Selection>,
+    /// Clip plane state for X, Y, Z axes.
+    pub clip_planes: [ClipPlaneState; 3],
+    /// Flag indicating clip plane uniforms need updating on materials.
+    pub clip_planes_dirty: bool,
+    /// Current shading mode.
+    pub shading_mode: ShadingMode,
+    /// Flag indicating shading mode changed and materials need updating.
+    pub shading_mode_changed: bool,
+    /// Previous shading mode (to detect transitions requiring mesh rebuilds).
+    pub previous_shading_mode: ShadingMode,
+    /// Flag indicating normals need rebuilding (flat <-> smooth transition).
+    pub needs_normal_rebuild: bool,
+    /// Whether any loaded shell has solid (manifold_solid_brep) topology,
+    /// enabling the "Solidify Clip" feature.
+    pub has_solid_topology: bool,
+    /// Active solidify-clip background job.
+    pub solidify_job: Option<SolidifyJob>,
+    /// Flag to trigger solidify-clip computation.
+    pub start_solidify: bool,
 }
 
 impl Default for ViewerState {
@@ -135,6 +192,15 @@ impl Default for ViewerState {
             selection_from_viewport: false,
             hover: None,
             prev_hover: None,
+            clip_planes: [ClipPlaneState::default(); 3],
+            clip_planes_dirty: false,
+            shading_mode: ShadingMode::default(),
+            shading_mode_changed: false,
+            previous_shading_mode: ShadingMode::default(),
+            needs_normal_rebuild: false,
+            has_solid_topology: false,
+            solidify_job: None,
+            start_solidify: false,
         }
     }
 }
@@ -148,7 +214,7 @@ pub(crate) struct FaceRecord {
     pub visible: bool,
     pub ui_color: [f32; 3],
     pub mesh_handle: Handle<Mesh>,
-    pub material_handle: Handle<StandardMaterial>,
+    pub material_handle: Handle<crate::viewer_material::ViewerMaterial>,
     /// Global edge IDs belonging to this face's boundary loops.
     pub edge_ids: Vec<usize>,
     /// Global loop IDs for this face.
@@ -194,12 +260,36 @@ pub(crate) struct FaceMesh {
     pub face_id: usize,
 }
 
+/// Marker for the translucent 3D quad that visualises a clip plane.
+#[derive(Component, Debug)]
+pub(crate) struct ClipPlaneHandle {
+    pub axis: usize, // 0=X, 1=Y, 2=Z
+}
+
+/// Resource tracking whether a clip-plane handle is being dragged.
+/// While active the `PanOrbitCamera` is disabled.
+#[derive(Resource, Default, Debug)]
+pub(crate) struct ClipPlaneDragState {
+    pub dragging: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct LoadJob {
     pub path: PathBuf,
     pub receiver: Mutex<Receiver<LoadMessage>>,
     pub current_shell: usize,
     pub total_shells: usize,
+}
+
+/// Background job for solidify-clip boolean operation.
+pub(crate) struct SolidifyJob {
+    pub receiver: Mutex<Receiver<Result<StepScene, String>>>,
+}
+
+impl std::fmt::Debug for SolidifyJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SolidifyJob").finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

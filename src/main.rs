@@ -4,6 +4,7 @@ mod persistence;
 mod scene;
 mod state;
 mod ui;
+mod viewer_material;
 
 use bevy::{
     log::LogPlugin,
@@ -13,7 +14,7 @@ use bevy::{
 };
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass, EguiUserTextures};
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
-use state::{AppMode, BrowserState, ViewerState};
+use state::{AppMode, BrowserState, ClipPlaneDragState, ViewerState};
 use std::{
     env,
     path::PathBuf,
@@ -54,6 +55,8 @@ fn main() {
             tessellation_factor: settings.tessellation_factor,
             applied_tessellation_factor: settings.tessellation_factor,
             mode: settings.mode,
+            clip_planes: settings.clip_planes,
+            shading_mode: settings.shading_mode,
             ..Default::default()
         })
         .insert_resource(BrowserState {
@@ -70,6 +73,7 @@ fn main() {
             thumb_size: 200.0,
         })
         .insert_resource(persistence::SaveTimer::default())
+        .insert_resource(ClipPlaneDragState::default())
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
@@ -89,14 +93,19 @@ fn main() {
                     ..Default::default()
                 }),
         )
+        .add_plugins(bevy::pbr::MaterialPlugin::<viewer_material::ViewerMaterial>::default())
+        .add_plugins(bevy::pbr::wireframe::WireframePlugin::default())
         .add_plugins(EguiPlugin::default())
         .add_plugins(MeshPickingPlugin)
         .add_plugins(PanOrbitCameraPlugin)
         .insert_resource(WinitSettings::desktop_app())
         .add_systems(Startup, scene::setup_scene)
+        .add_systems(Startup, viewer_material::setup_matcap_texture)
         .add_systems(Startup, setup_browser_render_slots)
         .add_systems(Update, scene::process_load_requests)
         .add_systems(Update, scene::rebuild_meshes_on_toggle)
+        .add_systems(Update, scene::apply_shading_mode)
+        .add_systems(Update, scene::rebuild_normals)
         .add_systems(EguiPrimaryContextPass, ui::ui_system)
         .add_systems(Update, scene::normalize_scene_and_setup_camera)
         .add_systems(Update, scene::apply_face_visibility)
@@ -104,8 +113,15 @@ fn main() {
         .add_systems(Update, scene::disable_camera_when_egui_wants_input)
         .add_systems(Update, scene::draw_gizmos)
         .add_systems(Update, scene::retessellate_face)
+        .add_systems(Update, scene::update_clip_plane_uniforms)
+        .add_systems(Update, scene::manage_clip_plane_visuals)
+        .add_systems(Update, scene::start_solidify_clip)
+        .add_systems(Update, scene::poll_solidify_clip)
         .add_systems(Update, persistence::auto_save_system)
         .add_observer(scene::on_mesh_click)
+        .add_observer(scene::on_clip_plane_drag_start)
+        .add_observer(scene::on_clip_plane_drag)
+        .add_observer(scene::on_clip_plane_drag_end)
         .add_systems(
             Update,
             browser::update_turntable_system.run_if(in_browser_mode),
