@@ -240,10 +240,25 @@ pub(crate) fn process_load_requests(
                 // Track the tessellation factor used for this load.
                 state.applied_tessellation_factor = state.tessellation_factor;
 
+                // Check whether any shell has solid topology (for Solidify
+                // Clip).
+                state.has_solid_topology = state
+                    .scene_data
+                    .as_ref()
+                    .is_some_and(|scene| {
+                        scene.shells.iter().any(|s| {
+                            matches!(
+                                s.topology,
+                                Some(monster_step_viewer::StepTopology::Solid(_))
+                            )
+                        })
+                    });
+
                 info!(
-                    "Finished loading {} shells, {} faces",
+                    "Finished loading {} shells, {} faces (has_solid_topology={})",
                     state.shells.len(),
-                    state.faces.len()
+                    state.faces.len(),
+                    state.has_solid_topology,
                 );
                 return;
             }

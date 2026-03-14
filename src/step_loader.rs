@@ -11,9 +11,12 @@ use monstertruck::{
     },
     topology::compress::CompressedShell,
 };
+use monstertruck::step::load::ruststep::{
+    ast::Name,
+    parser::parse,
+    tables::PlaceHolder,
+};
 type OriginalShell = CompressedShell<Point3, Curve3D, Surface>;
-pub use monstertruck::step::load::ruststep::ast::Parameter;
-use monstertruck::step::load::ruststep::parser::parse;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::{
@@ -25,6 +28,7 @@ use std::{
     },
 };
 
+pub use monstertruck::step::load::ruststep::ast::Parameter;
 pub use transform::Transform;
 
 use mesh_utils::{apply_transform_to_mesh, extract_mesh_edges};
@@ -83,6 +87,17 @@ impl std::fmt::Debug for CompressedShellData {
     }
 }
 
+/// Whether the original STEP entity was a solid or a shell.
+#[derive(Clone, Debug)]
+pub enum StepTopology {
+    /// From `manifold_solid_brep` — watertight, suitable for boolean ops.
+    /// Wraps a `CompressedSolid<Point3, Curve3D, Surface>`.
+    Solid(CompressedShellData),
+    /// From `shell_based_surface_model` or standalone shell — open surface.
+    /// Wraps a `CompressedShell<Point3, Curve3D, Surface>`.
+    Shell(CompressedShellData),
+}
+
 /// A single STEP face (surface) with its tessellated mesh.
 #[derive(Clone, Debug)]
 pub struct StepFace {
@@ -108,6 +123,8 @@ pub struct StepShell {
     pub curve_edges: Vec<StepEdge>,
     /// Original compressed shell for potential re-tessellation.
     pub original_shell: Option<CompressedShellData>,
+    /// Original topology (solid or shell) for boolean operations.
+    pub topology: Option<StepTopology>,
     /// Tessellation tolerance used for this shell.
     pub tessellation_tolerance: f64,
 }
@@ -153,6 +170,96 @@ impl LoadProgress {
     }
 }
 
+/// Resolve an entity ID that might be an oriented_shell to the underlying
+/// shell entity ID.  If `idx` is in `table.oriented_shell` and that entry's
+/// `shell_element` is a `PlaceHolder::Ref(Name::Entity(shell_idx))`, return
+/// `shell_idx`.  Otherwise return the original `idx` (it may already be a
+/// direct shell reference).
+fn resolve_to_shell_id(table: &Table, idx: u64) -> u64 {
+    if let Some(oriented) = table.oriented_shell.get(&idx) {
+        if let PlaceHolder::Ref(Name::Entity(shell_idx)) =
+            &oriented.shell_element
+        {
+            return *shell_idx;
+        }
+    }
+    idx
+}
+
+/// Build a mapping from shell entity IDs (in `table.shell`) to their parent
+/// solid entity IDs.
+///
+/// A solid can reference shells via `outer` (always) and `voids` (optional).
+/// References may go through an `oriented_shell` indirection, so we resolve
+/// those to the underlying shell ID.
+fn build_shell_to_solid_map(table: &Table) -> std::collections::HashMap<u64, u64> {
+    let mut shell_to_solid: std::collections::HashMap<u64, u64> =
+        std::collections::HashMap::new();
+    for (solid_id, solid_holder) in &table.manifold_solid_brep {
+        // Extract the outer shell entity ID (may be shell or oriented_shell).
+        if let PlaceHolder::Ref(Name::Entity(outer_idx)) = &solid_holder.outer
+        {
+            let shell_id = resolve_to_shell_id(table, *outer_idx);
+            shell_to_solid.insert(shell_id, *solid_id);
+        }
+        // Extract void shell entity IDs (always oriented_shell references).
+        for void_ref in &solid_holder.voids {
+            if let PlaceHolder::Ref(Name::Entity(void_idx)) = void_ref {
+                let shell_id = resolve_to_shell_id(table, *void_idx);
+                shell_to_solid.insert(shell_id, *solid_id);
+            }
+        }
+    }
+    shell_to_solid
+}
+
+/// Build the `StepTopology` for a shell, given the shell-to-solid mapping.
+///
+/// If the shell belongs to a solid, call `to_compressed_solid` and wrap as
+/// `StepTopology::Solid`. Otherwise wrap the already-converted
+/// `CompressedShell` as `StepTopology::Shell`.
+///
+/// Multiple shells in the same solid share the same `CompressedSolid` via
+/// `Arc` inside `CompressedShellData`.
+fn build_topology_for_shell(
+    shell_id: &u64,
+    compressed: &OriginalShell,
+    table: &Table,
+    shell_to_solid: &std::collections::HashMap<u64, u64>,
+    solid_cache: &Mutex<std::collections::HashMap<u64, CompressedShellData>>,
+) -> Option<StepTopology> {
+    if let Some(&solid_id) = shell_to_solid.get(shell_id) {
+        // Check cache first (multiple shells can belong to the same solid).
+        let mut cache = solid_cache.lock();
+        let solid_data = if let Some(cached) = cache.get(&solid_id) {
+            cached.clone()
+        } else {
+            // Convert the solid.
+            let solid_holder = table.manifold_solid_brep.get(&solid_id)?;
+            match table.to_compressed_solid(solid_holder) {
+                Ok(solid) => {
+                    let data = CompressedShellData::new(solid);
+                    cache.insert(solid_id, data.clone());
+                    data
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to convert solid #{} to CompressedSolid: {}",
+                        solid_id,
+                        e
+                    );
+                    return None;
+                }
+            }
+        };
+        Some(StepTopology::Solid(solid_data))
+    } else {
+        Some(StepTopology::Shell(CompressedShellData::new(
+            compressed.clone(),
+        )))
+    }
+}
+
 /// Load and tessellate a STEP file into polygon meshes with progress reporting.
 pub fn load_step_file_with_progress(
     path: &Path,
@@ -187,6 +294,11 @@ pub fn load_step_file_with_progress(
             .sum(),
     };
 
+    // Build shell-to-solid mapping for topology preservation.
+    let shell_to_solid = build_shell_to_solid_map(&table);
+    let solid_cache: Mutex<std::collections::HashMap<u64, CompressedShellData>> =
+        Mutex::new(std::collections::HashMap::new());
+
     // Convert each shell into a triangulated mesh (in parallel).
     let mut shell_entries: Vec<_> = table.shell.iter().collect();
     shell_entries.sort_by_key(|(id, _)| *id);
@@ -198,13 +310,22 @@ pub fn load_step_file_with_progress(
     let shells: Result<Vec<StepShell>, anyhow::Error> = shell_entries
         .into_par_iter()
         .enumerate()
-        .map(|(local_idx, (_id, shell_holder))| {
+        .map(|(local_idx, (shell_id, shell_holder))| {
             let compressed =
                 table.to_compressed_shell(shell_holder).map_err(|e| {
                     anyhow::anyhow!(
                         "Failed to convert STEP shell into topology: {e}"
                     )
                 })?;
+
+            // Build topology (Solid or Shell).
+            let topology = build_topology_for_shell(
+                shell_id,
+                &compressed,
+                &table,
+                &shell_to_solid,
+                &solid_cache,
+            );
 
             // Classify curve types from original geometry (before
             // tessellation).
@@ -318,6 +439,7 @@ pub fn load_step_file_with_progress(
                 edges: all_edges,
                 curve_edges,
                 original_shell: Some(original_shell),
+                topology,
                 tessellation_tolerance: tol,
             })
         })
@@ -433,6 +555,11 @@ fn load_step_streaming_inner(
     };
     tx.send(LoadMessage::Metadata(metadata))?;
 
+    // Build shell-to-solid mapping for topology preservation.
+    let shell_to_solid = build_shell_to_solid_map(&table);
+    let solid_cache: Arc<Mutex<std::collections::HashMap<u64, CompressedShellData>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
     // Convert each shell into a triangulated mesh (in parallel).
     let mut shell_entries: Vec<_> = table.shell.iter().collect();
     shell_entries.sort_by_key(|(id, _)| *id);
@@ -475,6 +602,15 @@ fn load_step_streaming_inner(
                     return;
                 }
             };
+
+            // Build topology (Solid or Shell).
+            let topology = build_topology_for_shell(
+                shell_id,
+                &compressed,
+                &table,
+                &shell_to_solid,
+                &solid_cache,
+            );
 
             // Classify curve types from original geometry (before
             // tessellation).
@@ -623,6 +759,7 @@ fn load_step_streaming_inner(
                 edges: all_edges,
                 curve_edges,
                 original_shell: Some(original_shell),
+                topology,
                 tessellation_tolerance: tol,
             };
 

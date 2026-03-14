@@ -147,6 +147,9 @@ pub(crate) struct ViewerState {
     pub previous_shading_mode: ShadingMode,
     /// Flag indicating normals need rebuilding (flat <-> smooth transition).
     pub needs_normal_rebuild: bool,
+    /// Whether any loaded shell has solid (manifold_solid_brep) topology,
+    /// enabling the "Solidify Clip" feature.
+    pub has_solid_topology: bool,
 }
 
 impl Default for ViewerState {
@@ -192,6 +195,7 @@ impl Default for ViewerState {
             shading_mode_changed: false,
             previous_shading_mode: ShadingMode::default(),
             needs_normal_rebuild: false,
+            has_solid_topology: false,
         }
     }
 }
