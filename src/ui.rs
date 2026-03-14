@@ -9,7 +9,7 @@ use crate::{
     },
     state::{
         AppMode, BrowserState, DirectoryEntry, MainCamera, PreviewStatus,
-        Selection, ViewerState,
+        Selection, ShadingMode, ViewerState,
     },
 };
 use bevy::{
@@ -898,6 +898,35 @@ fn viewer_ui(
                     overlay_frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+
+                            // Shading mode dropdown.
+                            let mode_label = match state.shading_mode {
+                                ShadingMode::Shaded => "Shaded",
+                                ShadingMode::Flat => "Flat",
+                                ShadingMode::Matcap => "Matcap",
+                                ShadingMode::XRay => "X-Ray",
+                                ShadingMode::Wireframe => "Wireframe",
+                            };
+                            egui::ComboBox::from_id_salt("shading_mode")
+                                .selected_text(mode_label)
+                                .width(90.0)
+                                .show_ui(ui, |ui| {
+                                    for (mode, label) in [
+                                        (ShadingMode::Shaded, "Shaded"),
+                                        (ShadingMode::Flat, "Flat"),
+                                        (ShadingMode::Matcap, "Matcap"),
+                                        (ShadingMode::XRay, "X-Ray"),
+                                        (ShadingMode::Wireframe, "Wireframe"),
+                                    ] {
+                                        if ui.selectable_label(state.shading_mode == mode, label).clicked() {
+                                            state.shading_mode = mode;
+                                            state.shading_mode_changed = true;
+                                            state.settings_dirty = true;
+                                        }
+                                    }
+                                });
+
+                            ui.separator();
 
                             // Quality slider.
                             let mut quality = -state.tessellation_factor.log10();
