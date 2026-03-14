@@ -1,6 +1,7 @@
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::alpha_discard,
+    mesh_view_bindings::view,
 }
 
 #ifdef PREPASS_PIPELINE
@@ -22,7 +23,7 @@
 //
 // clip_active: bitmask in .x — bit 0 = plane 0, bit 1 = plane 1, bit 2 = plane 2.
 //
-// shading_flags: bit 0 = matcap mode (reserved for later use).
+// shading_flags: bit 0 = matcap mode.
 struct ViewerMaterialExt {
     clip_plane_0: vec4<f32>,
     clip_plane_1: vec4<f32>,
@@ -36,6 +37,11 @@ struct ViewerMaterialExt {
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100)
 var<uniform> viewer_ext: ViewerMaterialExt;
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(101)
+var matcap_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(102)
+var matcap_sampler: sampler;
 
 @fragment
 fn fragment(
@@ -64,6 +70,20 @@ fn fragment(
             discard;
         }
     }
+
+#ifndef PREPASS_PIPELINE
+    // --- Matcap shading path (forward only) ---
+    if (viewer_ext.shading_flags & 1u) != 0u {
+        // Transform world normal to view space for matcap UV lookup.
+        let world_normal = normalize(in.world_normal);
+        let view_normal = normalize((view.view_from_world * vec4(world_normal, 0.0)).xyz);
+        // Map view-space normal XY to UV: X goes left-to-right, Y goes top-to-bottom.
+        let uv = vec2(view_normal.x * 0.5 + 0.5, 1.0 - (view_normal.y * 0.5 + 0.5));
+        var out: FragmentOutput;
+        out.color = textureSample(matcap_texture, matcap_sampler, uv);
+        return out;
+    }
+#endif
 
     // --- Standard PBR path ---
     var pbr_input = pbr_input_from_standard_material(in, is_front);

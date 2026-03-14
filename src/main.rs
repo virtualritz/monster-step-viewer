@@ -100,6 +100,7 @@ fn main() {
         .add_plugins(PanOrbitCameraPlugin)
         .insert_resource(WinitSettings::desktop_app())
         .add_systems(Startup, scene::setup_scene)
+        .add_systems(Startup, viewer_material::setup_matcap_texture)
         .add_systems(Startup, setup_browser_render_slots)
         .add_systems(Update, scene::process_load_requests)
         .add_systems(Update, scene::rebuild_meshes_on_toggle)

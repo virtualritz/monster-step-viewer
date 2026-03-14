@@ -1120,6 +1120,7 @@ pub(crate) fn apply_shading_mode(
     mut state: ResMut<ViewerState>,
     mut materials: ResMut<Assets<ViewerMaterial>>,
     face_query: Query<(Entity, &FaceMesh)>,
+    matcap_res: Option<Res<crate::viewer_material::MatcapTexture>>,
 ) {
     if !state.shading_mode_changed {
         return;
@@ -1146,6 +1147,7 @@ pub(crate) fn apply_shading_mode(
                     mat.base.cull_mode = Some(bevy::render::render_resource::Face::Back);
                     mat.base.base_color = Color::WHITE;
                     mat.extension.shading_flags = 0;
+                    mat.extension.matcap_texture = None;
                 }
             }
             // Remove Wireframe component from all face entities.
@@ -1161,6 +1163,7 @@ pub(crate) fn apply_shading_mode(
                     mat.base.cull_mode = Some(bevy::render::render_resource::Face::Back);
                     mat.base.base_color = Color::WHITE;
                     mat.extension.shading_flags = 0;
+                    mat.extension.matcap_texture = None;
                 }
             }
             for (entity, _) in face_query.iter() {
@@ -1175,6 +1178,7 @@ pub(crate) fn apply_shading_mode(
                     mat.base.cull_mode = None;
                     mat.base.base_color = Color::srgba(0.7, 0.7, 0.7, 0.3);
                     mat.extension.shading_flags = 0;
+                    mat.extension.matcap_texture = None;
                 }
             }
             for (entity, _) in face_query.iter() {
@@ -1194,6 +1198,7 @@ pub(crate) fn apply_shading_mode(
                         Some(bevy::render::render_resource::Face::Back)
                     };
                     mat.extension.shading_flags = 0;
+                    mat.extension.matcap_texture = None;
                 }
             }
             for (entity, _) in face_query.iter() {
@@ -1201,13 +1206,14 @@ pub(crate) fn apply_shading_mode(
             }
         }
         ShadingMode::Matcap => {
-            // Placeholder: set shading_flags bit 0 for matcap shader.
+            let matcap_handle = matcap_res.map(|r| r.0.clone());
             for face in &state.faces {
                 if let Some(mat) = materials.get_mut(&face.material_handle) {
                     mat.base.alpha_mode = AlphaMode::Opaque;
                     mat.base.cull_mode = Some(bevy::render::render_resource::Face::Back);
                     mat.base.base_color = Color::WHITE;
                     mat.extension.shading_flags = 1;
+                    mat.extension.matcap_texture = matcap_handle.clone();
                 }
             }
             for (entity, _) in face_query.iter() {
