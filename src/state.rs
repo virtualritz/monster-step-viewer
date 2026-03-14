@@ -142,8 +142,11 @@ pub(crate) struct ViewerState {
     /// Current shading mode.
     pub shading_mode: ShadingMode,
     /// Flag indicating shading mode changed and materials need updating.
-    #[allow(dead_code)]
     pub shading_mode_changed: bool,
+    /// Previous shading mode (to detect transitions requiring mesh rebuilds).
+    pub previous_shading_mode: ShadingMode,
+    /// Flag indicating normals need rebuilding (flat <-> smooth transition).
+    pub needs_normal_rebuild: bool,
 }
 
 impl Default for ViewerState {
@@ -187,6 +190,8 @@ impl Default for ViewerState {
             clip_planes_dirty: false,
             shading_mode: ShadingMode::default(),
             shading_mode_changed: false,
+            previous_shading_mode: ShadingMode::default(),
+            needs_normal_rebuild: false,
         }
     }
 }

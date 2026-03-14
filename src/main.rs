@@ -94,6 +94,7 @@ fn main() {
                 }),
         )
         .add_plugins(bevy::pbr::MaterialPlugin::<viewer_material::ViewerMaterial>::default())
+        .add_plugins(bevy::pbr::wireframe::WireframePlugin::default())
         .add_plugins(EguiPlugin::default())
         .add_plugins(MeshPickingPlugin)
         .add_plugins(PanOrbitCameraPlugin)
@@ -102,6 +103,8 @@ fn main() {
         .add_systems(Startup, setup_browser_render_slots)
         .add_systems(Update, scene::process_load_requests)
         .add_systems(Update, scene::rebuild_meshes_on_toggle)
+        .add_systems(Update, scene::apply_shading_mode)
+        .add_systems(Update, scene::rebuild_normals)
         .add_systems(EguiPrimaryContextPass, ui::ui_system)
         .add_systems(Update, scene::normalize_scene_and_setup_camera)
         .add_systems(Update, scene::apply_face_visibility)

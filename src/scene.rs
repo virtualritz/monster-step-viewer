@@ -1,6 +1,9 @@
 use bevy::{
-    asset::RenderAssetUsages, camera::visibility::RenderLayers,
-    picking::pointer::PointerButton, prelude::*,
+    asset::RenderAssetUsages,
+    camera::visibility::RenderLayers,
+    pbr::wireframe::Wireframe,
+    picking::pointer::PointerButton,
+    prelude::*,
     render::render_resource::PrimitiveTopology,
 };
 use bevy_egui::{EguiContexts, EguiGlobalSettings, PrimaryEguiContext};
@@ -14,7 +17,7 @@ use crate::state::{
     AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, ClipPlaneDragState,
     ClipPlaneHandle, EdgeRecord, FaceMesh, FaceRecord, KEY_LIGHT_ILLUMINANCE,
     LoadJob, LoopRecord, MATERIAL_METALLIC, MATERIAL_ROUGHNESS, MainCamera,
-    NEUTRAL_GRAY, Selection, ShellRecord, ViewerState,
+    NEUTRAL_GRAY, Selection, ShadingMode, ShellRecord, ViewerState,
 };
 use crate::viewer_material::{ViewerMaterial, ViewerMaterialExt};
 
@@ -1109,6 +1112,252 @@ pub(crate) fn retessellate_face(
     {
         step_face.mesh = polygon_mesh;
     }
+}
+
+/// Apply shading mode changes to materials and trigger mesh rebuilds.
+pub(crate) fn apply_shading_mode(
+    mut commands: Commands,
+    mut state: ResMut<ViewerState>,
+    mut materials: ResMut<Assets<ViewerMaterial>>,
+    face_query: Query<(Entity, &FaceMesh)>,
+) {
+    if !state.shading_mode_changed {
+        return;
+    }
+    state.shading_mode_changed = false;
+
+    let mode = state.shading_mode;
+    let prev_mode = state.previous_shading_mode;
+    state.previous_shading_mode = mode;
+
+    // Determine whether we need a normal rebuild (flat <-> smooth transition).
+    let entering_flat = mode == ShadingMode::Flat && prev_mode != ShadingMode::Flat;
+    let leaving_flat = mode != ShadingMode::Flat && prev_mode == ShadingMode::Flat;
+    if entering_flat || leaving_flat {
+        state.needs_normal_rebuild = true;
+    }
+
+    match mode {
+        ShadingMode::Shaded => {
+            // Opaque, back-face culled, white base color, no special flags.
+            for face in &state.faces {
+                if let Some(mat) = materials.get_mut(&face.material_handle) {
+                    mat.base.alpha_mode = AlphaMode::Opaque;
+                    mat.base.cull_mode = Some(bevy::render::render_resource::Face::Back);
+                    mat.base.base_color = Color::WHITE;
+                    mat.extension.shading_flags = 0;
+                }
+            }
+            // Remove Wireframe component from all face entities.
+            for (entity, _) in face_query.iter() {
+                commands.entity(entity).remove::<Wireframe>();
+            }
+        }
+        ShadingMode::Flat => {
+            // Same material properties as Shaded; normals rebuilt separately.
+            for face in &state.faces {
+                if let Some(mat) = materials.get_mut(&face.material_handle) {
+                    mat.base.alpha_mode = AlphaMode::Opaque;
+                    mat.base.cull_mode = Some(bevy::render::render_resource::Face::Back);
+                    mat.base.base_color = Color::WHITE;
+                    mat.extension.shading_flags = 0;
+                }
+            }
+            for (entity, _) in face_query.iter() {
+                commands.entity(entity).remove::<Wireframe>();
+            }
+        }
+        ShadingMode::XRay => {
+            // Translucent, double-sided.
+            for face in &state.faces {
+                if let Some(mat) = materials.get_mut(&face.material_handle) {
+                    mat.base.alpha_mode = AlphaMode::Blend;
+                    mat.base.cull_mode = None;
+                    mat.base.base_color = Color::srgba(0.7, 0.7, 0.7, 0.3);
+                    mat.extension.shading_flags = 0;
+                }
+            }
+            for (entity, _) in face_query.iter() {
+                commands.entity(entity).remove::<Wireframe>();
+            }
+        }
+        ShadingMode::Wireframe => {
+            // Add Wireframe component to all face entities.
+            // Make mesh nearly invisible so only wireframe lines show.
+            for face in &state.faces {
+                if let Some(mat) = materials.get_mut(&face.material_handle) {
+                    mat.base.alpha_mode = AlphaMode::Blend;
+                    mat.base.base_color = Color::srgba(0.0, 0.0, 0.0, 0.02);
+                    mat.base.cull_mode = if state.show_edges {
+                        None
+                    } else {
+                        Some(bevy::render::render_resource::Face::Back)
+                    };
+                    mat.extension.shading_flags = 0;
+                }
+            }
+            for (entity, _) in face_query.iter() {
+                commands.entity(entity).insert(Wireframe);
+            }
+        }
+        ShadingMode::Matcap => {
+            // Placeholder: set shading_flags bit 0 for matcap shader.
+            for face in &state.faces {
+                if let Some(mat) = materials.get_mut(&face.material_handle) {
+                    mat.base.alpha_mode = AlphaMode::Opaque;
+                    mat.base.cull_mode = Some(bevy::render::render_resource::Face::Back);
+                    mat.base.base_color = Color::WHITE;
+                    mat.extension.shading_flags = 1;
+                }
+            }
+            for (entity, _) in face_query.iter() {
+                commands.entity(entity).remove::<Wireframe>();
+            }
+        }
+    }
+}
+
+/// Rebuild mesh normals when switching between flat and smooth shading.
+pub(crate) fn rebuild_normals(
+    mut state: ResMut<ViewerState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    if !state.needs_normal_rebuild {
+        return;
+    }
+    state.needs_normal_rebuild = false;
+
+    let use_flat = state.shading_mode == ShadingMode::Flat;
+
+    let Some(scene) = &state.scene_data else {
+        return;
+    };
+
+    let center = state.scene_center;
+    let scale = state.scene_scale;
+    let use_random_colors = state.show_random_colors;
+
+    for shell in &scene.shells {
+        let apply_colors = use_random_colors || shell.color.is_some();
+
+        for step_face in &shell.faces {
+            let Some(face_record) = state
+                .faces
+                .iter()
+                .find(|f| f.shell_id == shell.id && f.name == step_face.name)
+            else {
+                continue;
+            };
+            let Some(mesh) = meshes.get_mut(&face_record.mesh_handle) else {
+                continue;
+            };
+
+            // Rebuild the entire mesh geometry (positions + normals + colors)
+            // to get correct flat or smooth normals.
+            let (new_mesh, _tri_count) = if use_flat {
+                bevy_mesh_from_polygon_flat_normals(
+                    &step_face.mesh,
+                    face_record.ui_color,
+                    apply_colors,
+                    center,
+                    scale,
+                )
+            } else {
+                bevy_mesh_from_polygon_normalized(
+                    &step_face.mesh,
+                    face_record.ui_color,
+                    apply_colors,
+                    center,
+                    scale,
+                )
+            };
+
+            *mesh = new_mesh;
+        }
+    }
+}
+
+/// Build a Bevy mesh from a `PolygonMesh` using flat (per-face) normals.
+/// Each triangle gets a single normal computed from the cross product of its
+/// edges, giving a faceted appearance.
+fn bevy_mesh_from_polygon_flat_normals(
+    mesh: &PolygonMesh,
+    shell_color: [f32; 3],
+    use_random_colors: bool,
+    scene_center: Vec3,
+    scale: f32,
+) -> (Mesh, usize) {
+    let positions: Vec<[f32; 3]> = mesh
+        .positions()
+        .par_iter()
+        .map(|p| {
+            let pos = Vec3::new(p.x as f32, p.y as f32, p.z as f32);
+            let normalized = (pos - scene_center) * scale;
+            [normalized.x, normalized.y, normalized.z]
+        })
+        .collect();
+
+    // Collect all triangles as (pos_idx0, pos_idx1, pos_idx2).
+    let mut triangles: Vec<[usize; 3]> = Vec::new();
+
+    for tri in mesh.tri_faces() {
+        triangles.push([tri[0].pos, tri[1].pos, tri[2].pos]);
+    }
+
+    for quad in mesh.quad_faces() {
+        triangles.push([quad[0].pos, quad[1].pos, quad[2].pos]);
+        triangles.push([quad[0].pos, quad[2].pos, quad[3].pos]);
+    }
+
+    for face in mesh.other_faces() {
+        if face.len() < 3 {
+            continue;
+        }
+        let first = face[0].pos;
+        for w in face.windows(2).skip(1) {
+            triangles.push([first, w[0].pos, w[1].pos]);
+        }
+    }
+
+    // Build flat arrays with per-face normals.
+    let mut flat_positions = Vec::with_capacity(triangles.len() * 3);
+    let mut flat_normals = Vec::with_capacity(triangles.len() * 3);
+
+    for tri_indices in &triangles {
+        let v0 = Vec3::from(positions[tri_indices[0]]);
+        let v1 = Vec3::from(positions[tri_indices[1]]);
+        let v2 = Vec3::from(positions[tri_indices[2]]);
+
+        let edge1 = v1 - v0;
+        let edge2 = v2 - v0;
+        let normal = edge1.cross(edge2).normalize_or_zero();
+        let n = [normal.x, normal.y, normal.z];
+
+        flat_positions.push(positions[tri_indices[0]]);
+        flat_positions.push(positions[tri_indices[1]]);
+        flat_positions.push(positions[tri_indices[2]]);
+
+        flat_normals.push(n);
+        flat_normals.push(n);
+        flat_normals.push(n);
+    }
+
+    let color = if use_random_colors {
+        [shell_color[0], shell_color[1], shell_color[2], 1.0]
+    } else {
+        NEUTRAL_GRAY
+    };
+    let colors: Vec<[f32; 4]> = vec![color; flat_positions.len()];
+
+    let mut bevy_mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, flat_positions);
+    bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, flat_normals);
+    bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+
+    (bevy_mesh, triangles.len())
 }
 
 /// Update clip-plane uniforms on every `ViewerMaterial` asset when dirty.
