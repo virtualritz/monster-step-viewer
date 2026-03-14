@@ -148,7 +148,7 @@ pub(crate) struct FaceRecord {
     pub visible: bool,
     pub ui_color: [f32; 3],
     pub mesh_handle: Handle<Mesh>,
-    pub material_handle: Handle<StandardMaterial>,
+    pub material_handle: Handle<crate::viewer_material::ViewerMaterial>,
     /// Global edge IDs belonging to this face's boundary loops.
     pub edge_ids: Vec<usize>,
     /// Global loop IDs for this face.

@@ -16,6 +16,7 @@ use crate::state::{
     MATERIAL_ROUGHNESS, MainCamera, NEUTRAL_GRAY, Selection, ShellRecord,
     ViewerState,
 };
+use crate::viewer_material::{ViewerMaterial, ViewerMaterialExt};
 
 pub(crate) fn setup_scene(
     mut commands: Commands,
@@ -93,7 +94,7 @@ pub(crate) fn process_load_requests(
     mut commands: Commands,
     mut state: ResMut<ViewerState>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<ViewerMaterial>>,
     existing_meshes: Query<Entity, With<FaceMesh>>,
 ) {
     // Start a new load if requested.
@@ -259,7 +260,7 @@ pub(crate) fn spawn_shell_faces_normalized(
     shell: &StepShell,
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<StandardMaterial>>,
+    materials: &mut ResMut<Assets<ViewerMaterial>>,
     state: &mut ResMut<ViewerState>,
     scene_center: Vec3,
     scale: f32,
@@ -296,11 +297,14 @@ pub(crate) fn spawn_shell_faces_normalized(
         );
         let mesh_handle = meshes.add(mesh);
 
-        let material_handle = materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            perceptual_roughness: MATERIAL_ROUGHNESS,
-            metallic: MATERIAL_METALLIC,
-            ..Default::default()
+        let material_handle = materials.add(ViewerMaterial {
+            base: StandardMaterial {
+                base_color: Color::WHITE,
+                perceptual_roughness: MATERIAL_ROUGHNESS,
+                metallic: MATERIAL_METALLIC,
+                ..Default::default()
+            },
+            extension: ViewerMaterialExt::default(),
         });
 
         commands.spawn((
@@ -565,7 +569,7 @@ pub(crate) fn apply_face_visibility(
 
 pub(crate) fn apply_selection_highlight(
     mut state: ResMut<ViewerState>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<ViewerMaterial>>,
 ) {
     let sel_changed = state.selection != state.prev_selection;
     let hover_changed = state.hover != state.prev_hover;
@@ -626,11 +630,11 @@ pub(crate) fn apply_selection_highlight(
         };
         // Selection takes priority over hover.
         if sel_faces.contains(&face.id) {
-            mat.emissive = selection_emissive.into();
+            mat.base.emissive = selection_emissive.into();
         } else if hover_faces.contains(&face.id) {
-            mat.emissive = hover_emissive.into();
+            mat.base.emissive = hover_emissive.into();
         } else {
-            mat.emissive = Color::BLACK.into();
+            mat.base.emissive = Color::BLACK.into();
         }
     }
 

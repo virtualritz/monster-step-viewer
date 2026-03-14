@@ -697,6 +697,7 @@ fn classify_curve_type(curve: &Curve3D) -> String {
         Curve3D::BsplineCurve(_) => "BSpline",
         Curve3D::Pcurve(_) => "Pcurve",
         Curve3D::NurbsCurve(_) => "NURBS",
+        Curve3D::IntersectionCurve(_) => "IntersectionCurve",
     }
     .to_string()
 }

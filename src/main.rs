@@ -4,6 +4,7 @@ mod persistence;
 mod scene;
 mod state;
 mod ui;
+mod viewer_material;
 
 use bevy::{
     log::LogPlugin,
@@ -89,6 +90,7 @@ fn main() {
                     ..Default::default()
                 }),
         )
+        .add_plugins(bevy::pbr::MaterialPlugin::<viewer_material::ViewerMaterial>::default())
         .add_plugins(EguiPlugin::default())
         .add_plugins(MeshPickingPlugin)
         .add_plugins(PanOrbitCameraPlugin)
