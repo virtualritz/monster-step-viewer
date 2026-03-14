@@ -2,23 +2,34 @@ use bevy::{
     asset::RenderAssetUsages,
     camera::{RenderTarget, visibility::RenderLayers},
     prelude::*,
-    render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
+    render::render_resource::{
+        Extent3d, TextureDimension, TextureFormat, TextureUsages,
+    },
 };
 use bevy_egui::{EguiTextureHandle, EguiUserTextures};
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-
-use crate::scene::{bevy_mesh_from_polygon_normalized, color_for_index, compute_bounds};
-use crate::state::{
-    BrowserState, DirectoryEntry, MATERIAL_METALLIC, MATERIAL_ROUGHNESS, MAX_RENDER_SLOTS,
-    PREVIEW_SIZE, PREVIEW_TESSELLATION_FACTOR, PreviewCamera, PreviewData, PreviewEntry,
-    PreviewLight, PreviewMesh, PreviewStatus, RenderSlot,
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
 };
 
-/// Expand the tree from `root` down to `target`, loading children lazily along the way.
-/// Returns true if the target was found and expanded to.
+use crate::{
+    scene::{
+        bevy_mesh_from_polygon_normalized, color_for_index, compute_bounds,
+    },
+    state::{
+        BrowserState, DirectoryEntry, MATERIAL_METALLIC, MATERIAL_ROUGHNESS,
+        MAX_RENDER_SLOTS, PREVIEW_SIZE, PREVIEW_TESSELLATION_FACTOR,
+        PreviewCamera, PreviewData, PreviewEntry, PreviewLight, PreviewMesh,
+        PreviewStatus, RenderSlot,
+    },
+};
+
+/// Expand the tree from `root` down to `target`, loading children lazily along
+/// the way. Returns true if the target was found and expanded to.
 pub(crate) fn expand_tree_to_path(
     tree: &mut Vec<DirectoryEntry>,
     root: &Path,
@@ -34,7 +45,9 @@ pub(crate) fn expand_tree_to_path(
     let mut current_level = tree.as_mut_slice();
     for component in &components {
         let name = component.as_os_str().to_string_lossy();
-        let Some(entry) = current_level.iter_mut().find(|e| e.name == name.as_ref()) else {
+        let Some(entry) =
+            current_level.iter_mut().find(|e| e.name == name.as_ref())
+        else {
             return false;
         };
         entry.expanded = true;
@@ -64,6 +77,43 @@ pub(crate) fn scan_subdirs(path: &Path) -> Vec<DirectoryEntry> {
         .collect();
     entries.sort_by_key(|a| a.name.to_lowercase());
     entries
+}
+
+/// Refresh a tree entry's children by re-scanning the directory on disk.
+/// Preserves expanded state of existing children.
+pub(crate) fn refresh_tree_entry(tree: &mut [DirectoryEntry], target: &Path) {
+    for entry in tree.iter_mut() {
+        if entry.path == target {
+            let fresh = scan_subdirs(&entry.path);
+            if let Some(existing) = &mut entry.children {
+                // Preserve expanded state and loaded children for entries that
+                // still exist.
+                let mut merged: Vec<DirectoryEntry> = fresh
+                    .into_iter()
+                    .map(|mut new_entry| {
+                        if let Some(old) =
+                            existing.iter().find(|e| e.name == new_entry.name)
+                        {
+                            new_entry.expanded = old.expanded;
+                            new_entry.children = old
+                                .children
+                                .is_some()
+                                .then(|| scan_subdirs(&new_entry.path));
+                        }
+                        new_entry
+                    })
+                    .collect();
+                merged.sort_by_key(|a| a.name.to_lowercase());
+                *existing = merged;
+            } else {
+                entry.children = Some(scan_subdirs(&entry.path));
+            }
+            return;
+        }
+        if let Some(children) = &mut entry.children {
+            refresh_tree_entry(children, target);
+        }
+    }
 }
 
 /// Scan a directory for STEP files, returning sorted preview entries.
@@ -115,7 +165,8 @@ pub(crate) fn start_preview_loads(state: &mut BrowserState) {
     let (tx, rx) = mpsc::channel();
     state.preview_receiver = Some(parking_lot::Mutex::new(rx));
 
-    // Spawn background thread that processes files sequentially (to avoid overloading).
+    // Spawn background thread that processes files sequentially (to avoid
+    // overloading).
     std::thread::spawn(move || {
         for (idx, path) in pending {
             if cancel_flag.load(Ordering::Relaxed) {
@@ -130,7 +181,10 @@ pub(crate) fn start_preview_loads(state: &mut BrowserState) {
 }
 
 /// Load a single STEP file at preview quality.
-fn load_preview(path: &Path, cancel: &AtomicBool) -> Result<PreviewData, String> {
+fn load_preview(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<PreviewData, String> {
     let receiver = monster_step_viewer::load_step_file_streaming(
         path.to_path_buf(),
         PREVIEW_TESSELLATION_FACTOR,
@@ -208,8 +262,8 @@ pub(crate) fn setup_render_slots(
                 | TextureUsages::COPY_DST
                 | TextureUsages::RENDER_ATTACHMENT;
             let handle = images.add(image);
-            let egui_texture_id =
-                egui_textures.add_image(EguiTextureHandle::Strong(handle.clone()));
+            let egui_texture_id = egui_textures
+                .add_image(EguiTextureHandle::Strong(handle.clone()));
             RenderSlot {
                 image: handle,
                 egui_texture_id: Some(egui_texture_id),
@@ -243,8 +297,9 @@ fn spawn_preview_scene(
                 let (_, rgb) = color_for_index(global_idx);
                 rgb
             });
-            let (mesh, _) =
-                bevy_mesh_from_polygon_normalized(&face.mesh, ui_rgb, true, center, scale);
+            let (mesh, _) = bevy_mesh_from_polygon_normalized(
+                &face.mesh, ui_rgb, true, center, scale,
+            );
             let mesh_handle = meshes.add(mesh);
             let material = materials.add(StandardMaterial {
                 base_color: Color::WHITE,
@@ -275,7 +330,9 @@ fn spawn_preview_scene(
         PreviewCamera { slot: slot_idx },
         Camera3d::default(),
         Camera {
-            clear_color: ClearColorConfig::Custom(Color::srgba(0.12, 0.12, 0.12, 1.0)),
+            clear_color: ClearColorConfig::Custom(Color::srgba(
+                0.12, 0.12, 0.12, 1.0,
+            )),
             order: (slot_idx as isize) + 10,
             ..Default::default()
         },
@@ -340,12 +397,14 @@ pub(crate) fn update_turntable_system(
                 camera_distance * pitch.sin(),
                 camera_distance * yaw.sin() * pitch.cos(),
             );
-            *transform = Transform::from_translation(offset).looking_at(Vec3::ZERO, Vec3::Y);
+            *transform = Transform::from_translation(offset)
+                .looking_at(Vec3::ZERO, Vec3::Y);
         }
     }
 }
 
-/// Manage which previews get render slots based on visibility in the scroll area.
+/// Manage which previews get render slots based on visibility in the scroll
+/// area.
 pub(crate) fn manage_render_slots_system(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -365,10 +424,11 @@ pub(crate) fn manage_render_slots_system(
     let visible_rows = browser.visible_rows.max(1);
 
     // Calculate which preview indices are visible.
-    let first_visible_row = (scroll_offset / (thumb_size + 8.0)).floor() as usize;
+    let first_visible_row =
+        (scroll_offset / (thumb_size + 8.0)).floor() as usize;
     let first_visible_idx = first_visible_row * cols;
-    let last_visible_idx =
-        ((first_visible_row + visible_rows + 1) * cols).min(browser.previews.len());
+    let last_visible_idx = ((first_visible_row + visible_rows + 1) * cols)
+        .min(browser.previews.len());
 
     let visible_range = first_visible_idx..last_visible_idx;
 
@@ -425,11 +485,10 @@ pub(crate) fn manage_render_slots_system(
         }
         // Find a free slot not already claimed in this batch.
         let claimed: Vec<usize> = assignments.iter().map(|(s, _)| *s).collect();
-        let free_slot = browser
-            .render_slots
-            .iter()
-            .enumerate()
-            .position(|(i, s)| s.preview_index.is_none() && !claimed.contains(&i));
+        let free_slot =
+            browser.render_slots.iter().enumerate().position(|(i, s)| {
+                s.preview_index.is_none() && !claimed.contains(&i)
+            });
         let Some(slot_idx) = free_slot else {
             break;
         };
@@ -447,7 +506,9 @@ pub(crate) fn manage_render_slots_system(
         browser.render_slots[slot_idx].preview_index = Some(preview_idx);
         browser.render_slots[slot_idx].yaw = 0.0;
 
-        if let PreviewStatus::Ready(data) = &browser.previews[preview_idx].status {
+        if let PreviewStatus::Ready(data) =
+            &browser.previews[preview_idx].status
+        {
             spawn_preview_scene(
                 &mut commands,
                 &mut meshes,

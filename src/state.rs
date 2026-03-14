@@ -2,10 +2,10 @@ use bevy::prelude::*;
 use monster_step_viewer::{LoadMessage, StepMetadata, StepScene, StepShell};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Receiver;
+use std::{
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool, mpsc::Receiver},
+};
 
 pub(crate) const DEFAULT_PANEL_WIDTH: f32 = 340.0;
 pub(crate) const DEFAULT_TESSELLATION_FACTOR: f64 = 0.001;
@@ -19,7 +19,9 @@ pub(crate) const MATERIAL_ROUGHNESS: f32 = 0.4;
 pub(crate) const MATERIAL_METALLIC: f32 = 0.0;
 pub(crate) const NEUTRAL_GRAY: [f32; 4] = [0.7, 0.7, 0.7, 1.0];
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 pub(crate) enum AppMode {
     #[default]
     Viewer,
@@ -53,9 +55,11 @@ pub(crate) struct ViewerState {
     pub scene_data: Option<StepScene>,
     pub needs_mesh_rebuild: bool,
     pub current_bounds: Option<Bounds>,
-    /// Tessellation density factor (smaller = more triangles). Range: 0.0005 to 0.02.
+    /// Tessellation density factor (smaller = more triangles). Range: 0.0005
+    /// to 0.02.
     pub tessellation_factor: f64,
-    /// Tessellation factor used for currently loaded scene (to detect changes).
+    /// Tessellation factor used for currently loaded scene (to detect
+    /// changes).
     pub applied_tessellation_factor: f64,
     /// Flag to trigger visibility update (avoids costly is_changed() checks).
     pub visibility_changed: bool,
@@ -85,6 +89,13 @@ pub(crate) struct ViewerState {
     pub selection: Option<Selection>,
     /// Previous selection (to detect changes and update materials).
     pub prev_selection: Option<Selection>,
+    /// When true, selection was set from the viewport (click on mesh) — UI
+    /// should expand the parent shell to reveal the selected face.
+    pub selection_from_viewport: bool,
+    /// Currently hovered hierarchy item (lighter highlight than selection).
+    pub hover: Option<Selection>,
+    /// Previous hover (to detect changes and update materials).
+    pub prev_hover: Option<Selection>,
 }
 
 impl Default for ViewerState {
@@ -121,6 +132,9 @@ impl Default for ViewerState {
             retessellate_face: None,
             selection: None,
             prev_selection: None,
+            selection_from_viewport: false,
+            hover: None,
+            prev_hover: None,
         }
     }
 }
@@ -271,7 +285,8 @@ pub(crate) struct BrowserState {
     pub cancel_flag: Arc<AtomicBool>,
     /// Receiver for completed preview loads.
     #[allow(clippy::type_complexity)]
-    pub preview_receiver: Option<Mutex<Receiver<(usize, Result<PreviewData, String>)>>>,
+    pub preview_receiver:
+        Option<Mutex<Receiver<(usize, Result<PreviewData, String>)>>>,
     /// Scroll offset for virtualizing the grid.
     pub scroll_offset: f32,
     /// Number of visible rows (updated each frame from UI).

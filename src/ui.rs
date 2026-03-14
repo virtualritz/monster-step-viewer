@@ -1,13 +1,23 @@
-use crate::browser::{poll_preview_loads, scan_step_files, scan_subdirs, start_preview_loads};
-use crate::icons::{
-    ICON_BOUNDING_BOX, ICON_CASINO, ICON_EDGES, ICON_WIREFRAME, configure_fonts, icon_text,
+use crate::{
+    browser::{
+        poll_preview_loads, refresh_tree_entry, scan_step_files, scan_subdirs,
+        start_preview_loads,
+    },
+    icons::{
+        ICON_BOUNDING_BOX, ICON_CASINO, ICON_EDGES, ICON_WIREFRAME,
+        configure_fonts, icon_text,
+    },
+    state::{
+        AppMode, BrowserState, DirectoryEntry, MainCamera, PreviewStatus,
+        Selection, ViewerState,
+    },
 };
-use crate::state::{
-    AppMode, BrowserState, DEFAULT_PANEL_WIDTH, DirectoryEntry, MainCamera, PreviewStatus,
-    Selection, ViewerState,
+use bevy::{
+    app::AppExit,
+    camera::Viewport,
+    prelude::{MessageWriter, *},
 };
-use bevy::{app::AppExit, camera::Viewport, prelude::MessageWriter, prelude::*};
-use bevy_egui::{EguiContexts, egui};
+use bevy_egui::{EguiContextSettings, EguiContexts, PrimaryEguiContext, egui};
 use monster_step_viewer::Parameter;
 use std::cell::Cell;
 
@@ -41,7 +51,12 @@ fn format_leaf_param(p: &Parameter) -> String {
 }
 
 /// Render a STEP Parameter as a flat tree in egui.
-pub(crate) fn parameter_ui(ui: &mut egui::Ui, param: &Parameter, label: &str, depth: usize) {
+pub(crate) fn parameter_ui(
+    ui: &mut egui::Ui,
+    param: &Parameter,
+    label: &str,
+    depth: usize,
+) {
     // Max depth guard.
     if depth > 4 {
         ui.label(format!("{}: ...", label));
@@ -52,8 +67,11 @@ pub(crate) fn parameter_ui(ui: &mut egui::Ui, param: &Parameter, label: &str, de
         Parameter::List(items) if items.is_empty() => {
             ui.label(format!("{}: []", label));
         }
-        Parameter::List(items) if items.len() <= 3 && items.iter().all(is_leaf_param) => {
-            let values: Vec<String> = items.iter().map(format_leaf_param).collect();
+        Parameter::List(items)
+            if items.len() <= 3 && items.iter().all(is_leaf_param) =>
+        {
+            let values: Vec<String> =
+                items.iter().map(format_leaf_param).collect();
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{}: [{}]", label, values.join(", ")));
             });
@@ -121,6 +139,10 @@ pub(crate) fn ui_system(
     mut exit: MessageWriter<AppExit>,
     windows: Query<&Window>,
     mut camera_query: Query<&mut Camera, With<MainCamera>>,
+    mut egui_settings: Query<
+        &mut EguiContextSettings,
+        With<PrimaryEguiContext>,
+    >,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -135,30 +157,15 @@ pub(crate) fn ui_system(
     // Poll preview loads.
     poll_preview_loads(&mut browser);
 
-    // Top bar with tabs and menu items.
+    // Top bar: File menu on left, mode tabs on right.
     egui::TopBottomPanel::top("menu").show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.style_mut().override_text_style = Some(egui::TextStyle::Heading);
-            // Tab buttons.
-            let viewer_selected = state.mode == AppMode::Viewer;
-            if ui.selectable_label(viewer_selected, "Viewer").clicked() && !viewer_selected {
-                state.mode = AppMode::Viewer;
-                state.settings_dirty = true;
-            }
-            if ui.selectable_label(!viewer_selected, "Browser").clicked() && viewer_selected {
-                state.mode = AppMode::Browser;
-                state.settings_dirty = true;
-                // Load previews on first switch if a directory was previously selected.
-                if browser.previews.is_empty()
-                    && let Some(dir) = &browser.selected_dir {
-                        browser.previews = scan_step_files(dir);
-                        start_preview_loads(&mut browser);
-                    }
-            }
 
-            ui.separator();
-
-            if state.mode == AppMode::Viewer {
+            // File menu on the left.
+            ui.menu_button("File", |ui| {
+                ui.style_mut().override_text_style =
+                    Some(egui::TextStyle::Body);
                 if ui.button("Open STEP\u{2026}").clicked() {
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(path) = rfd::FileDialog::new()
@@ -171,17 +178,20 @@ pub(crate) fn ui_system(
 
                     #[cfg(target_arch = "wasm32")]
                     {
-                        state.error = Some("File open dialog is not supported on wasm".to_string());
+                        state.error = Some(
+                            "File open dialog is not supported on wasm"
+                                .to_string(),
+                        );
                     }
+                    ui.close();
                 }
+            });
 
-                if let Some(path) = &state.loaded_path {
-                    ui.separator();
-                    ui.label(format!("{}", path.display()));
-                }
-            } else {
+            if state.mode == AppMode::Browser {
                 // Browser mode: show breadcrumb path.
-                let display_path = browser.selected_dir.as_deref().unwrap_or(&browser.root);
+                ui.separator();
+                let display_path =
+                    browser.selected_dir.as_deref().unwrap_or(&browser.root);
                 let mut breadcrumb_nav: Option<std::path::PathBuf> = None;
                 let mut accumulated = std::path::PathBuf::new();
                 for (i, component) in display_path.components().enumerate() {
@@ -193,7 +203,8 @@ pub(crate) fn ui_system(
                     if ui
                         .add(
                             egui::Label::new(
-                                egui::RichText::new(name.as_ref()).color(egui::Color32::LIGHT_GRAY),
+                                egui::RichText::new(name.as_ref())
+                                    .color(egui::Color32::LIGHT_GRAY),
                             )
                             .sense(egui::Sense::click()),
                         )
@@ -209,34 +220,81 @@ pub(crate) fn ui_system(
                     browser.selected_dir = Some(nav_to.clone());
                     browser.previews = scan_step_files(&nav_to);
                     start_preview_loads(&mut browser);
-                    // Expand tree to this path.
                     let root = browser.root.clone();
-                    crate::browser::expand_tree_to_path(&mut browser.tree, &root, &nav_to);
+                    crate::browser::expand_tree_to_path(
+                        &mut browser.tree,
+                        &root,
+                        &nav_to,
+                    );
                     state.settings_dirty = true;
                 }
             }
+
+            // Right-aligned tabs.
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let viewer_selected = state.mode == AppMode::Viewer;
+                    // Render in reverse order (right-to-left layout).
+                    if ui
+                        .selectable_label(!viewer_selected, "Browser")
+                        .clicked()
+                        && viewer_selected
+                    {
+                        state.mode = AppMode::Browser;
+                        state.settings_dirty = true;
+                        if browser.previews.is_empty()
+                            && let Some(dir) = &browser.selected_dir
+                        {
+                            browser.previews = scan_step_files(dir);
+                            start_preview_loads(&mut browser);
+                        }
+                    }
+                    if ui.selectable_label(viewer_selected, "Viewer").clicked()
+                        && !viewer_selected
+                    {
+                        state.mode = AppMode::Viewer;
+                        state.settings_dirty = true;
+                    }
+                },
+            );
         });
     });
 
     match state.mode {
-        AppMode::Viewer => viewer_ui(ctx, &mut state, &windows, &mut camera_query),
+        AppMode::Viewer => {
+            viewer_ui(ctx, &mut state, &windows, &mut camera_query)
+        }
         AppMode::Browser => browser_ui(ctx, &mut state, &mut browser),
     }
 
-    // Ctrl+/- to zoom egui UI.
-    ctx.input(|i| {
+    // Ctrl+/- to zoom egui UI via EguiContextSettings::scale_factor.
+    let zoom_delta = ctx.input(|i| {
         if i.modifiers.command {
-            let mut ppp = ctx.pixels_per_point();
-            if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
-                ppp = (ppp + 0.1).min(3.0);
+            if i.key_pressed(egui::Key::Plus)
+                || i.key_pressed(egui::Key::Equals)
+            {
+                Some(0.1)
             } else if i.key_pressed(egui::Key::Minus) {
-                ppp = (ppp - 0.1).max(0.5);
+                Some(-0.1)
             } else if i.key_pressed(egui::Key::Num0) {
-                ppp = 1.0;
+                Some(0.0) // sentinel for reset
+            } else {
+                None
             }
-            ctx.set_pixels_per_point(ppp);
+        } else {
+            None
         }
     });
+    if let Some(delta) = zoom_delta
+        && let Ok(mut settings) = egui_settings.single_mut()
+    {
+        settings.scale_factor = if delta == 0.0 {
+            1.0
+        } else {
+            (settings.scale_factor + delta as f32).clamp(0.5, 3.0)
+        };
+    }
 
     // Allow escape to quit quickly on desktop.
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -250,9 +308,30 @@ fn viewer_ui(
     windows: &Query<&Window>,
     camera_query: &mut Query<&mut Camera, With<MainCamera>>,
 ) {
-    let panel_response = egui::SidePanel::left("entities")
-        .default_width(state.panel_width.max(DEFAULT_PANEL_WIDTH))
+    // Pre-seed panel width from settings on first frame (before egui has stored
+    // state).
+    let panel_id = egui::Id::new("entities");
+    if ctx
+        .data_mut(|d| {
+            d.get_persisted::<egui::containers::panel::PanelState>(panel_id)
+        })
+        .is_none()
+    {
+        ctx.data_mut(|d| {
+            d.insert_persisted(
+                panel_id,
+                egui::containers::panel::PanelState {
+                    rect: egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(state.panel_width, 100.0),
+                    ),
+                },
+            );
+        });
+    }
+    let panel_response = egui::SidePanel::left(panel_id)
         .resizable(true)
+        .width_range(100.0..=800.0)
         .show(ctx, |ui| {
             if state.shells.is_empty() && state.loading_job.is_none() {
                 ui.label("Load a STEP file to see hierarchy");
@@ -266,8 +345,12 @@ fn viewer_ui(
                 let edge_vis_changes: Cell<Vec<(usize, bool)>> = Cell::new(Vec::new());
                 let loop_trim_changes: Cell<Vec<(usize, bool)>> = Cell::new(Vec::new());
                 let current_selection = state.selection;
+                let viewport_selected = state.selection_from_viewport;
+                state.selection_from_viewport = false;
                 // None = no change, Some(x) = set selection to x
                 let new_selection: Cell<Option<Option<Selection>>> = Cell::new(None);
+                // Track hover: None = nothing hovered this frame.
+                let new_hover: Cell<Option<Selection>> = Cell::new(None);
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.spacing_mut().indent = 12.0;
@@ -359,6 +442,10 @@ fn viewer_ui(
                     {
                         let face_count = face_ids.len();
 
+                        // Force shell open if viewport click selected a face in this shell.
+                        let force_open = viewport_selected
+                            && matches!(current_selection, Some(Selection::Face(fid)) if face_ids.contains(&fid));
+
                         ui.horizontal(|ui| {
                             let mut vis = shell_visible;
                             if ui.checkbox(&mut vis, "").changed() {
@@ -368,12 +455,16 @@ fn viewer_ui(
                                 shell_vis_changes.set(changes);
                             }
 
-                            let header = egui::CollapsingHeader::new(format!(
+                            let mut header = egui::CollapsingHeader::new(format!(
                                 "{} ({} faces)",
                                 shell_name, face_count
                             ))
                             .id_salt(format!("shell_{}", shell_id))
                             .default_open(expanded);
+
+                            if force_open {
+                                header = header.open(Some(true));
+                            }
 
                             header.show(ui, |ui| {
                                 if !shell_visible {
@@ -498,7 +589,7 @@ fn viewer_ui(
                                                                                         edge_id,
                                                                                     ),
                                                                                 );
-                                                                        if ui
+                                                                        let edge_resp = ui
                                                                             .selectable_label(
                                                                                 is_sel,
                                                                                 format!(
@@ -506,8 +597,8 @@ fn viewer_ui(
                                                                                 edge.name,
                                                                                 edge.point_count
                                                                             ),
-                                                                            )
-                                                                            .clicked()
+                                                                            );
+                                                                        if edge_resp.clicked()
                                                                         {
                                                                             new_selection.set(
                                                                                 Some(if is_sel {
@@ -521,6 +612,9 @@ fn viewer_ui(
                                                                                 }),
                                                                             );
                                                                         }
+                                                                        if edge_resp.hovered() {
+                                                                            new_hover.set(Some(Selection::Edge(edge_id)));
+                                                                        }
                                                                     });
                                                                 }
                                                             });
@@ -531,6 +625,9 @@ fn viewer_ui(
                                                                 Some(Selection::Loop(loop_id))
                                                             }));
                                                         }
+                                                        if loop_resp.header_response.hovered() {
+                                                            new_hover.set(Some(Selection::Loop(loop_id)));
+                                                        }
                                                     }); // close ui.horizontal for loop
                                                 }
                                             });
@@ -540,6 +637,13 @@ fn viewer_ui(
                                                 } else {
                                                     Some(Selection::Face(face_id))
                                                 }));
+                                            }
+                                            if face_resp.header_response.hovered() {
+                                                new_hover.set(Some(Selection::Face(face_id)));
+                                            }
+                                            // Scroll to this face when selected from viewport.
+                                            if viewport_selected && face_sel {
+                                                face_resp.header_response.scroll_to_me(Some(egui::Align::Center));
                                             }
                                         });
                                     } else {
@@ -555,21 +659,26 @@ fn viewer_ui(
                                             ui.colored_label(color, "\u{25a0}");
                                             let face_sel =
                                                 current_selection == Some(Selection::Face(face_id));
-                                            if ui
-                                                .selectable_label(
-                                                    face_sel,
-                                                    format!(
-                                                        "{} ({} tris)",
-                                                        face.name, face.triangles
-                                                    ),
-                                                )
-                                                .clicked()
-                                            {
+                                            let face_label = ui.selectable_label(
+                                                face_sel,
+                                                format!(
+                                                    "{} ({} tris)",
+                                                    face.name, face.triangles
+                                                ),
+                                            );
+                                            if face_label.clicked() {
                                                 new_selection.set(Some(if face_sel {
                                                     None
                                                 } else {
                                                     Some(Selection::Face(face_id))
                                                 }));
+                                            }
+                                            if face_label.hovered() {
+                                                new_hover.set(Some(Selection::Face(face_id)));
+                                            }
+                                            // Scroll to this face when selected from viewport.
+                                            if viewport_selected && face_sel {
+                                                face_label.scroll_to_me(Some(egui::Align::Center));
                                             }
                                         });
                                     }
@@ -600,21 +709,22 @@ fn viewer_ui(
                                                 }
                                                 let is_sel = current_selection
                                                     == Some(Selection::Edge(edge_id));
-                                                if ui
-                                                    .selectable_label(
-                                                        is_sel,
-                                                        format!(
-                                                            "{} ({} pts)",
-                                                            edge.name, edge.point_count
-                                                        ),
-                                                    )
-                                                    .clicked()
-                                                {
+                                                let sa_edge_resp = ui.selectable_label(
+                                                    is_sel,
+                                                    format!(
+                                                        "{} ({} pts)",
+                                                        edge.name, edge.point_count
+                                                    ),
+                                                );
+                                                if sa_edge_resp.clicked() {
                                                     new_selection.set(Some(if is_sel {
                                                         None
                                                     } else {
                                                         Some(Selection::Edge(edge_id))
                                                     }));
+                                                }
+                                                if sa_edge_resp.hovered() {
+                                                    new_hover.set(Some(Selection::Edge(edge_id)));
                                                 }
                                             });
                                         }
@@ -649,6 +759,7 @@ fn viewer_ui(
                 if let Some(sel) = new_selection.take() {
                     state.selection = sel;
                 }
+                state.hover = new_hover.take();
                 if vis_changed.get() {
                     state.visibility_changed = true;
                 }
@@ -660,9 +771,30 @@ fn viewer_ui(
 
     let left_panel_width = panel_response.response.rect.width();
 
-    let right_panel_response = egui::SidePanel::right("metadata")
+    let right_panel_id = egui::Id::new("metadata");
+    if ctx
+        .data_mut(|d| {
+            d.get_persisted::<egui::containers::panel::PanelState>(
+                right_panel_id,
+            )
+        })
+        .is_none()
+    {
+        ctx.data_mut(|d| {
+            d.insert_persisted(
+                right_panel_id,
+                egui::containers::panel::PanelState {
+                    rect: egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(state.right_panel_width, 100.0),
+                    ),
+                },
+            );
+        });
+    }
+    let right_panel_response = egui::SidePanel::right(right_panel_id)
         .resizable(true)
-        .default_width(state.right_panel_width.max(200.0))
+        .width_range(100.0..=800.0)
         .show(ctx, |ui| {
             if let Some(meta) = &state.metadata {
                 ui.label(format!("Entity Count: {}", meta.entity_count));
@@ -671,7 +803,10 @@ fn viewer_ui(
                     for entry in &meta.headers {
                         egui::CollapsingHeader::new(&entry.name)
                             .id_salt(&entry.name)
-                            .default_open(entry.name == "FILE_NAME" || entry.name == "FILE_SCHEMA")
+                            .default_open(
+                                entry.name == "FILE_NAME"
+                                    || entry.name == "FILE_SCHEMA",
+                            )
                             .show(ui, |ui| {
                                 parameter_ui(ui, &entry.parameter, "value", 0);
                             });
@@ -718,117 +853,129 @@ fn viewer_ui(
     // Show viewport toolbar and overlays.
     if let Some((window_width, window_height)) = window_info {
         let viewport_x = left_panel_width;
-        let viewport_width = window_width - left_panel_width - right_panel_width;
+        let viewport_width =
+            window_width - left_panel_width - right_panel_width;
 
         let toolbar_margin = 8.0;
         let toolbar_y = toolbar_margin + 24.0;
 
-        // Quality slider overlay (top-left of viewport).
+        // Viewport overlay frame (no shadow).
+        let overlay_frame = egui::Frame::NONE
+            .fill(egui::Color32::from_rgba_unmultiplied(40, 40, 40, 220))
+            .corner_radius(4.0)
+            .inner_margin(4.0);
+
+        // Filename overlay (top-left of viewport).
+        if state.mode == AppMode::Viewer
+            && let Some(path) = &state.loaded_path
         {
-            let slider_x = viewport_x + toolbar_margin;
-            egui::Area::new(egui::Id::new("quality_overlay"))
-                .fixed_pos(egui::pos2(slider_x, toolbar_y))
+            let filename = path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            egui::Area::new(egui::Id::new("filename_overlay"))
+                .fixed_pos(egui::pos2(viewport_x + toolbar_margin, toolbar_y))
                 .show(ctx, |ui| {
-                    ui.visuals_mut().widgets.inactive.weak_bg_fill =
-                        egui::Color32::from_rgba_unmultiplied(40, 40, 40, 220);
-                    ui.visuals_mut().widgets.hovered.weak_bg_fill =
-                        egui::Color32::from_rgba_unmultiplied(60, 60, 60, 230);
-                    ui.visuals_mut().widgets.active.weak_bg_fill =
-                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 240);
-
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        let mut quality = -state.tessellation_factor.log10();
-                        let slider = ui.add(
-                            egui::Slider::new(&mut quality, 2.0_f64..=5.0_f64)
-                                .show_value(false)
-                                .custom_formatter(|v, _| {
-                                    if v > 4.5 {
-                                        "Ultra".to_string()
-                                    } else if v > 3.8 {
-                                        "High".to_string()
-                                    } else if v > 3.0 {
-                                        "Medium".to_string()
-                                    } else {
-                                        "Low".to_string()
-                                    }
-                                }),
+                    overlay_frame.show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(filename)
+                                .color(egui::Color32::LIGHT_GRAY),
                         );
-                        let new_factor = 10_f64.powf(-quality);
-                        if slider.changed() {
-                            state.tessellation_factor = new_factor;
-                            state.settings_dirty = true;
-                        }
-                        let factor_changed =
-                            (state.tessellation_factor - state.applied_tessellation_factor).abs()
-                                > 1e-10;
-
-                        if !slider.dragged()
-                            && factor_changed
-                            && state.loaded_path.is_some()
-                            && state.loading_job.is_none()
-                        {
-                            log::info!(
-                                "Quality changed: reloading with tessellation_factor={:.6}",
-                                state.tessellation_factor
-                            );
-                            state.pending_path = state.loaded_path.clone();
-                        }
-                        slider.on_hover_text("Tessellation quality");
                     });
                 });
         }
 
-        // Toggle toolbar (top-right of window).
+        // Viewport toolbar: toggle icons + quality slider (top-right of
+        // viewport).
         if state.scene_data.is_some() {
-            let toolbar_x = window_width - toolbar_margin;
-
             egui::Area::new(egui::Id::new("viewport_toolbar"))
-                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(0.0, 0.0))
-                .fixed_pos(egui::pos2(toolbar_x, toolbar_y))
+                .fixed_pos(egui::pos2(
+                    viewport_x + viewport_width - toolbar_margin,
+                    toolbar_y,
+                ))
+                .pivot(egui::Align2::RIGHT_TOP)
                 .show(ctx, |ui| {
-                    ui.visuals_mut().widgets.inactive.weak_bg_fill =
-                        egui::Color32::from_rgba_unmultiplied(40, 40, 40, 220);
-                    ui.visuals_mut().widgets.hovered.weak_bg_fill =
-                        egui::Color32::from_rgba_unmultiplied(60, 60, 60, 230);
-                    ui.visuals_mut().widgets.active.weak_bg_fill =
-                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 240);
+                    overlay_frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
 
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                            // Quality slider.
+                            let mut quality = -state.tessellation_factor.log10();
+                            let slider = ui.add(
+                                egui::Slider::new(&mut quality, 2.0_f64..=5.0_f64)
+                                    .show_value(false)
+                                    .custom_formatter(|v, _| {
+                                        if v > 4.5 {
+                                            "Ultra".to_string()
+                                        } else if v > 3.8 {
+                                            "High".to_string()
+                                        } else if v > 3.0 {
+                                            "Medium".to_string()
+                                        } else {
+                                            "Low".to_string()
+                                        }
+                                    }),
+                            );
+                            let new_factor = 10_f64.powf(-quality);
+                            if slider.changed() {
+                                state.tessellation_factor = new_factor;
+                                state.settings_dirty = true;
+                            }
+                            let factor_changed = (state.tessellation_factor
+                                - state.applied_tessellation_factor)
+                                .abs()
+                                > 1e-10;
 
-                        let colors_btn =
-                            ui.selectable_label(state.show_random_colors, icon_text(ICON_CASINO));
-                        if colors_btn.clicked() {
-                            state.show_random_colors = !state.show_random_colors;
-                            state.needs_mesh_rebuild = true;
-                            state.settings_dirty = true;
-                        }
-                        colors_btn.on_hover_text("Random colors");
+                            if !slider.dragged()
+                                && factor_changed
+                                && state.loaded_path.is_some()
+                                && state.loading_job.is_none()
+                            {
+                                log::info!(
+                                    "Quality changed: reloading with tessellation_factor={:.6}",
+                                    state.tessellation_factor
+                                );
+                                state.pending_path = state.loaded_path.clone();
+                            }
+                            slider.on_hover_text("Tessellation quality");
 
-                        let bbox_btn = ui.selectable_label(
-                            state.show_bounding_box,
-                            icon_text(ICON_BOUNDING_BOX),
-                        );
-                        if bbox_btn.clicked() {
-                            state.show_bounding_box = !state.show_bounding_box;
-                            state.settings_dirty = true;
-                        }
-                        bbox_btn.on_hover_text("Bounding box");
+                            ui.separator();
 
-                        let wire_btn =
-                            ui.selectable_label(state.show_wireframe, icon_text(ICON_WIREFRAME));
-                        if wire_btn.clicked() {
-                            state.show_wireframe = !state.show_wireframe;
-                            state.settings_dirty = true;
-                        }
-                        wire_btn.on_hover_text("Wireframe edges");
+                            let colors_btn = ui
+                                .selectable_label(state.show_random_colors, icon_text(ICON_CASINO));
+                            if colors_btn.clicked() {
+                                state.show_random_colors = !state.show_random_colors;
+                                state.needs_mesh_rebuild = true;
+                                state.settings_dirty = true;
+                            }
+                            colors_btn.on_hover_text("Random colors");
 
-                        let edge_btn = ui.selectable_label(state.show_edges, icon_text(ICON_EDGES));
-                        if edge_btn.clicked() {
-                            state.show_edges = !state.show_edges;
-                            state.settings_dirty = true;
-                        }
-                        edge_btn.on_hover_text("Curve edges");
+                            let bbox_btn = ui.selectable_label(
+                                state.show_bounding_box,
+                                icon_text(ICON_BOUNDING_BOX),
+                            );
+                            if bbox_btn.clicked() {
+                                state.show_bounding_box = !state.show_bounding_box;
+                                state.settings_dirty = true;
+                            }
+                            bbox_btn.on_hover_text("Bounding box");
+
+                            let wire_btn = ui
+                                .selectable_label(state.show_wireframe, icon_text(ICON_WIREFRAME));
+                            if wire_btn.clicked() {
+                                state.show_wireframe = !state.show_wireframe;
+                                state.settings_dirty = true;
+                            }
+                            wire_btn.on_hover_text("Wireframe edges");
+
+                            let edge_btn =
+                                ui.selectable_label(state.show_edges, icon_text(ICON_EDGES));
+                            if edge_btn.clicked() {
+                                state.show_edges = !state.show_edges;
+                                state.settings_dirty = true;
+                            }
+                            edge_btn.on_hover_text("Curve edges");
+                        });
                     });
                 });
         }
@@ -908,9 +1055,30 @@ fn browser_ui(
     browser: &mut ResMut<BrowserState>,
 ) {
     // Left panel: directory tree.
-    egui::SidePanel::left("browser_tree")
-        .default_width(state.panel_width.max(DEFAULT_PANEL_WIDTH))
+    let browser_panel_id = egui::Id::new("browser_tree");
+    if ctx
+        .data_mut(|d| {
+            d.get_persisted::<egui::containers::panel::PanelState>(
+                browser_panel_id,
+            )
+        })
+        .is_none()
+    {
+        ctx.data_mut(|d| {
+            d.insert_persisted(
+                browser_panel_id,
+                egui::containers::panel::PanelState {
+                    rect: egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(state.panel_width, 100.0),
+                    ),
+                },
+            );
+        });
+    }
+    egui::SidePanel::left(browser_panel_id)
         .resizable(true)
+        .width_range(100.0..=800.0)
         .show(ctx, |ui| {
             ui.heading("Directories");
             ui.separator();
@@ -933,14 +1101,17 @@ fn browser_ui(
 
                 // Apply expand/collapse.
                 for (path_indices, expanded) in expand_actions {
-                    if let Some(entry) = get_entry_mut(&mut browser.tree, &path_indices) {
+                    if let Some(entry) =
+                        get_entry_mut(&mut browser.tree, &path_indices)
+                    {
                         entry.expanded = expanded;
                     }
                 }
 
                 // Lazy-load children.
                 for path_indices in children_to_load {
-                    if let Some(entry) = get_entry_mut(&mut browser.tree, &path_indices)
+                    if let Some(entry) =
+                        get_entry_mut(&mut browser.tree, &path_indices)
                         && entry.children.is_none()
                     {
                         entry.children = Some(scan_subdirs(&entry.path));
@@ -955,6 +1126,10 @@ fn browser_ui(
                     browser.previews = scan_step_files(&dir);
                     start_preview_loads(browser);
                     state.settings_dirty = true;
+                    // Refresh the selected directory's children in the tree
+                    // so that newly created or removed subdirectories are
+                    // reflected.
+                    refresh_tree_entry(&mut browser.tree, &dir);
                 }
             });
         });
@@ -998,11 +1173,14 @@ fn browser_ui(
             let origin = response.rect.min;
 
             browser.scroll_offset = ui.clip_rect().min.y - origin.y;
-            browser.visible_rows = (ui.clip_rect().height() / cell_height).ceil() as usize + 1;
+            browser.visible_rows =
+                (ui.clip_rect().height() / cell_height).ceil() as usize + 1;
 
             // Render visible cells.
-            let first_visible_row = (browser.scroll_offset / cell_height).floor().max(0.0) as usize;
-            let last_visible_row = (first_visible_row + browser.visible_rows + 1).min(rows);
+            let first_visible_row =
+                (browser.scroll_offset / cell_height).floor().max(0.0) as usize;
+            let last_visible_row =
+                (first_visible_row + browser.visible_rows + 1).min(rows);
 
             for row in first_visible_row..last_visible_row {
                 for col in 0..cols {
@@ -1021,7 +1199,11 @@ fn browser_ui(
                     let preview = &browser.previews[idx];
 
                     // Draw thumbnail background.
-                    painter.rect_filled(thumb_rect, 4.0, egui::Color32::from_rgb(40, 40, 40));
+                    painter.rect_filled(
+                        thumb_rect,
+                        4.0,
+                        egui::Color32::from_rgb(40, 40, 40),
+                    );
 
                     match &preview.status {
                         PreviewStatus::Ready(_) => {
@@ -1054,13 +1236,31 @@ fn browser_ui(
                             }
                         }
                         PreviewStatus::Loading | PreviewStatus::Pending => {
-                            painter.text(
-                                thumb_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "Loading\u{2026}",
-                                egui::FontId::proportional(12.0),
-                                egui::Color32::GRAY,
-                            );
+                            // Animated spinner.
+                            let time = ctx.input(|i| i.time);
+                            let radius = thumb_size * 0.12;
+                            let center = thumb_rect.center();
+                            let n_points = 24u32;
+                            let start_angle = time * std::f64::consts::TAU;
+                            let end_angle =
+                                start_angle + 240f64.to_radians() * time.sin();
+                            let points: Vec<egui::Pos2> = (0..n_points)
+                                .map(|i| {
+                                    let t = i as f64 / n_points as f64;
+                                    let angle = start_angle
+                                        + (end_angle - start_angle) * t;
+                                    let (sin, cos) = angle.sin_cos();
+                                    center
+                                        + egui::vec2(
+                                            cos as f32 * radius,
+                                            sin as f32 * radius,
+                                        )
+                                })
+                                .collect();
+                            painter.add(egui::Shape::line(
+                                points,
+                                egui::Stroke::new(2.5, egui::Color32::GRAY),
+                            ));
                         }
                         PreviewStatus::Failed(err) => {
                             painter.text(
@@ -1104,7 +1304,10 @@ fn browser_ui(
                         painter.rect_stroke(
                             thumb_rect,
                             4.0,
-                            egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 149, 237)),
+                            egui::Stroke::new(
+                                2.0,
+                                egui::Color32::from_rgb(100, 149, 237),
+                            ),
                             egui::epaint::StrokeKind::Outside,
                         );
                     }
@@ -1112,15 +1315,15 @@ fn browser_ui(
             }
         });
 
-        // Request repaint while any previews are loading or turntables are active.
+        // Request repaint while any previews are loading or turntables are
+        // active.
         let has_active_slots = browser
             .render_slots
             .iter()
             .any(|s| s.preview_index.is_some());
-        let has_loading = browser
-            .previews
-            .iter()
-            .any(|p| matches!(p.status, PreviewStatus::Loading | PreviewStatus::Pending));
+        let has_loading = browser.previews.iter().any(|p| {
+            matches!(p.status, PreviewStatus::Loading | PreviewStatus::Pending)
+        });
         if has_active_slots || has_loading {
             ctx.request_repaint();
         }
@@ -1140,17 +1343,18 @@ fn render_dir_tree(
     for (i, entry) in entries.iter().enumerate() {
         current_path.push(i);
         let is_selected = selected_dir.as_ref() == Some(&entry.path);
-        let has_children = entry.children.as_ref().is_some_and(|c| !c.is_empty());
+        let has_children =
+            entry.children.as_ref().is_some_and(|c| !c.is_empty());
         let not_loaded = entry.children.is_none();
 
         if has_children || not_loaded {
-            let header = egui::CollapsingHeader::new(egui::RichText::new(&entry.name).color(
-                if is_selected {
+            let header = egui::CollapsingHeader::new(
+                egui::RichText::new(&entry.name).color(if is_selected {
                     egui::Color32::from_rgb(100, 149, 237)
                 } else {
                     egui::Color32::LIGHT_GRAY
-                },
-            ))
+                }),
+            )
             .id_salt(entry.path.display().to_string())
             .default_open(entry.expanded)
             .show_background(is_selected);

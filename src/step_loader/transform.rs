@@ -24,7 +24,11 @@ impl Transform {
     }
 
     /// Create a transform from AXIS2_PLACEMENT_3D components.
-    pub fn from_axis2_placement(location: [f64; 3], axis: [f64; 3], ref_dir: [f64; 3]) -> Self {
+    pub fn from_axis2_placement(
+        location: [f64; 3],
+        axis: [f64; 3],
+        ref_dir: [f64; 3],
+    ) -> Self {
         // axis is Z direction, ref_dir is X direction.
         // Y = Z cross X.
         let z = normalize(axis);
@@ -107,9 +111,15 @@ impl Transform {
     /// Transform a normal vector (rotation only, no translation).
     pub fn transform_normal(&self, n: [f64; 3]) -> [f64; 3] {
         [
-            self.cols[0][0] * n[0] + self.cols[1][0] * n[1] + self.cols[2][0] * n[2],
-            self.cols[0][1] * n[0] + self.cols[1][1] * n[1] + self.cols[2][1] * n[2],
-            self.cols[0][2] * n[0] + self.cols[1][2] * n[1] + self.cols[2][2] * n[2],
+            self.cols[0][0] * n[0]
+                + self.cols[1][0] * n[1]
+                + self.cols[2][0] * n[2],
+            self.cols[0][1] * n[0]
+                + self.cols[1][1] * n[1]
+                + self.cols[2][1] * n[2],
+            self.cols[0][2] * n[0]
+                + self.cols[1][2] * n[1]
+                + self.cols[2][2] * n[2],
         ]
     }
 }

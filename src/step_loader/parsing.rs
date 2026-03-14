@@ -21,7 +21,8 @@ pub(crate) fn preprocess_step_entities(raw: &str) -> String {
 
 /// Parse assembly transforms from raw STEP file content.
 /// Returns a map from shell entity ID to world transform.
-/// Uses foxtrot's approach: build parent->child graph, detect roots, traverse top-down.
+/// Uses foxtrot's approach: build parent->child graph, detect roots, traverse
+/// top-down.
 pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
     // Parse basic geometric entities.
     let mut cartesian_points: HashMap<u64, [f64; 3]> = HashMap::new();
@@ -29,11 +30,13 @@ pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
     let mut placement_refs: HashMap<u64, (u64, u64, u64)> = HashMap::new();
     // ITEM_DEFINED_TRANSFORMATION: id -> (from_placement, to_placement).
     let mut item_transforms: HashMap<u64, (u64, u64)> = HashMap::new();
-    // REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION: (rep_1, rep_2, transform_id).
+    // REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION: (rep_1, rep_2,
+    // transform_id).
     let mut rep_relationships: Vec<(u64, u64, u64)> = Vec::new();
     // MANIFOLD_SOLID_BREP: manifold_id -> shell_id.
     let mut manifold_to_shell: HashMap<u64, u64> = HashMap::new();
-    // ADVANCED_BREP_SHAPE_REPRESENTATION: absr_id -> Vec<all refs including manifolds>.
+    // ADVANCED_BREP_SHAPE_REPRESENTATION: absr_id -> Vec<all refs including
+    // manifolds>.
     let mut absr_refs: HashMap<u64, Vec<u64>> = HashMap::new();
     // SHAPE_REPRESENTATION_RELATIONSHIP: (rep_1, rep_2) - links reps.
     let mut shape_rep_relationships: Vec<(u64, u64)> = Vec::new();
@@ -75,7 +78,9 @@ pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
             if refs.len() >= 2 {
                 item_transforms.insert(id, (refs[0], refs[1]));
             }
-        } else if rest.contains("REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION") {
+        } else if rest
+            .contains("REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION")
+        {
             let refs = parse_hash_refs(rest);
             if refs.len() >= 3 {
                 rep_relationships.push((refs[0], refs[1], refs[2]));
@@ -111,8 +116,12 @@ pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
             .copied()
             .unwrap_or([0.0, 0.0, 0.0]);
         let axis = directions.get(&axis_id).copied().unwrap_or([0.0, 0.0, 1.0]);
-        let ref_dir = directions.get(&ref_id).copied().unwrap_or([1.0, 0.0, 0.0]);
-        resolved_placements.insert(id, Transform::from_axis2_placement(location, axis, ref_dir));
+        let ref_dir =
+            directions.get(&ref_id).copied().unwrap_or([1.0, 0.0, 0.0]);
+        resolved_placements.insert(
+            id,
+            Transform::from_axis2_placement(location, axis, ref_dir),
+        );
     }
 
     log::info!("Assembly parsing:");
@@ -132,8 +141,11 @@ pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
 
     // Step 1: Build transform stack (parent -> [(child, transform)]).
     // Try normal direction first.
-    let (transform_stack, flipped) =
-        build_transform_stack(&rep_relationships, &item_transforms, &resolved_placements);
+    let (transform_stack, flipped) = build_transform_stack(
+        &rep_relationships,
+        &item_transforms,
+        &resolved_placements,
+    );
 
     log::info!(
         "Transform stack: {} parents, flipped={}",
@@ -222,7 +234,9 @@ pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
 
     // If no transforms found via hierarchy, shells get identity.
     if shell_transforms.is_empty() {
-        log::info!("No transform hierarchy found, using identity for all shells");
+        log::info!(
+            "No transform hierarchy found, using identity for all shells"
+        );
         for &shell_id in manifold_to_shell.values() {
             shell_transforms.insert(shell_id, Transform::identity());
         }
@@ -239,8 +253,12 @@ fn build_transform_stack(
     placements: &HashMap<u64, Transform>,
 ) -> (HashMap<u64, Vec<(u64, Transform)>>, bool) {
     // Try normal direction first (rep_1 is parent, rep_2 is child).
-    let stack =
-        build_transform_stack_directed(rep_relationships, item_transforms, placements, false);
+    let stack = build_transform_stack_directed(
+        rep_relationships,
+        item_transforms,
+        placements,
+        false,
+    );
     let roots = find_transform_roots(&stack);
 
     // If multiple roots, flip direction (like foxtrot does).
@@ -249,8 +267,12 @@ fn build_transform_stack(
             "Multiple roots ({}), flipping transform direction",
             roots.len()
         );
-        let flipped_stack =
-            build_transform_stack_directed(rep_relationships, item_transforms, placements, true);
+        let flipped_stack = build_transform_stack_directed(
+            rep_relationships,
+            item_transforms,
+            placements,
+            true,
+        );
         let flipped_roots = find_transform_roots(&flipped_stack);
         if flipped_roots.len() < roots.len() {
             return (flipped_stack, true);
@@ -269,10 +291,12 @@ fn build_transform_stack_directed(
     let mut stack: HashMap<u64, Vec<(u64, Transform)>> = HashMap::new();
 
     for &(rep_1, rep_2, transform_id) in rep_relationships {
-        let (parent, child) = if flip { (rep_1, rep_2) } else { (rep_2, rep_1) };
+        let (parent, child) =
+            if flip { (rep_1, rep_2) } else { (rep_2, rep_1) };
 
         // Compute the transform from ITEM_DEFINED_TRANSFORMATION.
-        let mut mat = compute_item_transform(transform_id, item_transforms, placements);
+        let mut mat =
+            compute_item_transform(transform_id, item_transforms, placements);
         if flip {
             mat = mat.inverse();
         }
@@ -284,7 +308,9 @@ fn build_transform_stack_directed(
 }
 
 /// Find roots: representations that are parents but never children.
-fn find_transform_roots(stack: &HashMap<u64, Vec<(u64, Transform)>>) -> Vec<u64> {
+fn find_transform_roots(
+    stack: &HashMap<u64, Vec<(u64, Transform)>>,
+) -> Vec<u64> {
     let children: HashSet<u64> = stack
         .values()
         .flat_map(|v| v.iter().map(|(c, _)| *c))
@@ -304,7 +330,8 @@ fn compute_item_transform(
     item_transforms: &HashMap<u64, (u64, u64)>,
     placements: &HashMap<u64, Transform>,
 ) -> Transform {
-    let Some(&(place_1_id, place_2_id)) = item_transforms.get(&transform_id) else {
+    let Some(&(place_1_id, place_2_id)) = item_transforms.get(&transform_id)
+    else {
         return Transform::identity();
     };
 
@@ -339,7 +366,8 @@ pub(crate) fn parse_hash_refs(s: &str) -> Vec<u64> {
 }
 
 /// Parse coordinate values from CARTESIAN_POINT or DIRECTION.
-/// Format varies: CARTESIAN_POINT('',(x,y,z)) or CARTESIAN_POINT ( '', ( x, y, z ) ).
+/// Format varies: CARTESIAN_POINT('',(x,y,z)) or CARTESIAN_POINT ( '', ( x, y,
+/// z ) ).
 fn parse_point_coords(s: &str) -> Option<[f64; 3]> {
     // Find the coordinate tuple - whitespace varies between files.
     // Look for the comma after the name string, then find the opening paren.
@@ -365,7 +393,8 @@ fn parse_point_coords(s: &str) -> Option<[f64; 3]> {
 /// Parse a STEP float value (handles E notation like "0.E+000").
 pub(crate) fn parse_step_float(s: &str) -> Option<f64> {
     let s = s.trim();
-    // Handle STEP's weird notation like "0.E+000" (missing digit after decimal).
+    // Handle STEP's weird notation like "0.E+000" (missing digit after
+    // decimal).
     let s = if s.contains(".E") {
         s.replace(".E", ".0E")
     } else {
@@ -380,7 +409,8 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
     let mut colours: HashMap<u64, [f32; 3]> = HashMap::new();
     // (style_refs, target_id).
     let mut styled_items: Vec<(Vec<u64>, u64)> = Vec::new();
-    let mut fill_area_style_colour_to_colour: HashMap<u64, u64> = HashMap::new();
+    let mut fill_area_style_colour_to_colour: HashMap<u64, u64> =
+        HashMap::new();
     let mut fill_area_style_to_fasc: HashMap<u64, u64> = HashMap::new();
     // SURFACE_STYLE_FILL_AREA -> FAS.
     let mut ssfa_to_fas: HashMap<u64, u64> = HashMap::new();
@@ -425,7 +455,9 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
                     }
                 }
             }
-        } else if rest.starts_with("STYLED_ITEM") || rest.starts_with("OVER_RIDING_STYLED_ITEM") {
+        } else if rest.starts_with("STYLED_ITEM")
+            || rest.starts_with("OVER_RIDING_STYLED_ITEM")
+        {
             // STYLED_ITEM('name',(#style_refs),#target).
             let refs = parse_hash_refs(rest);
             if refs.len() >= 2 {
@@ -439,7 +471,8 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
             if !refs.is_empty() {
                 fill_area_style_colour_to_colour.insert(id, refs[0]);
             }
-        } else if rest.starts_with("FILL_AREA_STYLE") && !rest.starts_with("FILL_AREA_STYLE_COLOUR")
+        } else if rest.starts_with("FILL_AREA_STYLE")
+            && !rest.starts_with("FILL_AREA_STYLE_COLOUR")
         {
             // FILL_AREA_STYLE('',(#fasc_ref)).
             let refs = parse_hash_refs(rest);

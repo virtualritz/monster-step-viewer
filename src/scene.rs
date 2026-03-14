@@ -1,5 +1,6 @@
 use bevy::{
-    asset::RenderAssetUsages, camera::visibility::RenderLayers, prelude::*,
+    asset::RenderAssetUsages, camera::visibility::RenderLayers,
+    picking::pointer::PointerButton, prelude::*,
     render::render_resource::PrimitiveTopology,
 };
 use bevy_egui::{EguiContexts, EguiGlobalSettings, PrimaryEguiContext};
@@ -10,9 +11,10 @@ use rayon::prelude::*;
 use std::sync::mpsc::TryRecvError;
 
 use crate::state::{
-    AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, EdgeRecord, FaceMesh, FaceRecord,
-    KEY_LIGHT_ILLUMINANCE, LoadJob, LoopRecord, MATERIAL_METALLIC, MATERIAL_ROUGHNESS, MainCamera,
-    NEUTRAL_GRAY, Selection, ShellRecord, ViewerState,
+    AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, EdgeRecord, FaceMesh,
+    FaceRecord, KEY_LIGHT_ILLUMINANCE, LoadJob, LoopRecord, MATERIAL_METALLIC,
+    MATERIAL_ROUGHNESS, MainCamera, NEUTRAL_GRAY, Selection, ShellRecord,
+    ViewerState,
 };
 
 pub(crate) fn setup_scene(
@@ -43,7 +45,8 @@ pub(crate) fn setup_scene(
             },
         ))
         .with_children(|parent| {
-            // Key light - main directional light from top-left (relative to camera).
+            // Key light - main directional light from top-left (relative to
+            // camera).
             parent.spawn((
                 DirectionalLight {
                     illuminance: KEY_LIGHT_ILLUMINANCE,
@@ -109,8 +112,10 @@ pub(crate) fn process_load_requests(
         state.error = None;
         state.scene_data = None;
 
-        let receiver =
-            monster_step_viewer::load_step_file_streaming(path.clone(), state.tessellation_factor);
+        let receiver = monster_step_viewer::load_step_file_streaming(
+            path.clone(),
+            state.tessellation_factor,
+        );
         state.loading_job = Some(LoadJob {
             path,
             receiver: parking_lot::Mutex::new(receiver),
@@ -163,7 +168,8 @@ pub(crate) fn process_load_requests(
                 job.current_shell = current;
             }
             monster_step_viewer::LoadMessage::Shell(shell) => {
-                // Store shell in scene_data - don't spawn meshes yet (need bounds first).
+                // Store shell in scene_data - don't spawn meshes yet (need
+                // bounds first).
                 if let Some(scene) = state.scene_data.as_mut() {
                     scene.shells.push(shell);
                 } else {
@@ -192,7 +198,11 @@ pub(crate) fn process_load_requests(
 
                     info!(
                         "Scene bounds: center=({:.2}, {:.2}, {:.2}), max_dim={:.2}, scale={:.4}",
-                        bounds.center.x, bounds.center.y, bounds.center.z, max_dim, scale
+                        bounds.center.x,
+                        bounds.center.y,
+                        bounds.center.z,
+                        max_dim,
+                        scale
                     );
 
                     // Now spawn all meshes with normalization applied.
@@ -237,7 +247,9 @@ pub(crate) fn process_load_requests(
     }
 
     if disconnected {
-        state.error = Some("STEP loader stopped unexpectedly before completion".to_string());
+        state.error = Some(
+            "STEP loader stopped unexpectedly before completion".to_string(),
+        );
         state.loading_job = None;
     }
 }
@@ -264,9 +276,10 @@ pub(crate) fn spawn_shell_faces_normalized(
     for (idx, face) in shell.faces.iter().enumerate() {
         let global_face_id = base_face_id + idx;
 
-        // For random colors: each face gets its own color based on global_face_id.
-        // For STEP colors: all faces in shell use the STEP-defined color.
-        // Otherwise: neutral gray (handled in mesh function).
+        // For random colors: each face gets its own color based on
+        // global_face_id. For STEP colors: all faces in shell use the
+        // STEP-defined color. Otherwise: neutral gray (handled in mesh
+        // function).
         let ui_rgb = if let Some(color) = step_color {
             color
         } else {
@@ -329,14 +342,16 @@ pub(crate) fn spawn_shell_faces_normalized(
 
     // Register loop records and link edges to faces.
     let mut referenced_edge_ids = std::collections::HashSet::new();
-    let mut face_edge_loop_data: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
+    let mut face_edge_loop_data: Vec<(usize, Vec<usize>, Vec<usize>)> =
+        Vec::new();
 
     for (idx, face) in shell.faces.iter().enumerate() {
         let global_face_id = base_face_id + idx;
         let mut face_edge_ids = Vec::new();
         let mut face_loop_ids = Vec::new();
 
-        for (loop_idx, boundary_loop) in face.boundary_loops.iter().enumerate() {
+        for (loop_idx, boundary_loop) in face.boundary_loops.iter().enumerate()
+        {
             let global_loop_id = state.loops.len();
             let loop_edge_ids: Vec<usize> = boundary_loop
                 .edge_indices
@@ -360,17 +375,23 @@ pub(crate) fn spawn_shell_faces_normalized(
             });
         }
 
-        face_edge_loop_data.push((global_face_id, face_edge_ids, face_loop_ids));
+        face_edge_loop_data.push((
+            global_face_id,
+            face_edge_ids,
+            face_loop_ids,
+        ));
     }
 
-    // Assign collected edge/loop data to face records (avoids overlapping borrows).
+    // Assign collected edge/loop data to face records (avoids overlapping
+    // borrows).
     for (face_id, edge_ids, loop_ids) in face_edge_loop_data {
         state.faces[face_id].edge_ids = edge_ids;
         state.faces[face_id].loop_ids = loop_ids;
     }
 
     // Compute standalone edges (not referenced by any face boundary).
-    let standalone_edge_ids: Vec<usize> = (base_edge_id..base_edge_id + shell.curve_edges.len())
+    let standalone_edge_ids: Vec<usize> = (base_edge_id
+        ..base_edge_id + shell.curve_edges.len())
         .filter(|id| !referenced_edge_ids.contains(id))
         .collect();
 
@@ -473,7 +494,11 @@ pub(crate) fn bevy_mesh_from_polygon_normalized(
         }
         let first = (face[0].pos, face[0].nor);
         face.windows(2).skip(1).for_each(|w| {
-            vertices.extend([first, (w[0].pos, w[0].nor), (w[1].pos, w[1].nor)]);
+            vertices.extend([
+                first,
+                (w[0].pos, w[0].nor),
+                (w[1].pos, w[1].nor),
+            ]);
         });
     }
 
@@ -490,7 +515,8 @@ pub(crate) fn bevy_mesh_from_polygon_normalized(
     let (flat_positions, flat_normals): (Vec<[f32; 3]>, Vec<[f32; 3]>) =
         expanded.into_iter().unzip();
 
-    // Uniform color per shell: distinct color if random colors enabled, gray otherwise.
+    // Uniform color per shell: distinct color if random colors enabled, gray
+    // otherwise.
     let color = if use_random_colors {
         [shell_color[0], shell_color[1], shell_color[2], 1.0]
     } else {
@@ -519,8 +545,10 @@ pub(crate) fn apply_face_visibility(
     state.visibility_changed = false;
 
     for (mesh, mut visibility) in query.iter_mut() {
-        if let Some(record) = state.faces.iter().find(|f| f.id == mesh.face_id) {
-            // Face is visible only when both its own toggle and its shell's toggle are on.
+        if let Some(record) = state.faces.iter().find(|f| f.id == mesh.face_id)
+        {
+            // Face is visible only when both its own toggle and its shell's
+            // toggle are on.
             let shell_visible = state
                 .shells
                 .iter()
@@ -539,55 +567,83 @@ pub(crate) fn apply_selection_highlight(
     mut state: ResMut<ViewerState>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    if state.selection == state.prev_selection {
+    let sel_changed = state.selection != state.prev_selection;
+    let hover_changed = state.hover != state.prev_hover;
+    if !sel_changed && !hover_changed {
         return;
     }
 
-    let highlight_emissive = Color::linear_rgba(0.6, 0.45, 0.0, 1.0);
+    let selection_emissive = Color::linear_rgba(0.6, 0.45, 0.0, 1.0);
+    let hover_emissive = Color::linear_rgba(0.2, 0.15, 0.0, 1.0);
 
-    // Determine which face IDs should be highlighted.
-    let selected_face_ids: Vec<usize> = match &state.selection {
-        Some(Selection::Face(fid)) => vec![*fid],
-        Some(Selection::Loop(lid)) => state
-            .loops
-            .iter()
-            .find(|l| l.id == *lid)
-            .map(|l| vec![l.face_id])
-            .unwrap_or_default(),
-        _ => vec![],
-    };
-    let prev_face_ids: Vec<usize> = match &state.prev_selection {
-        Some(Selection::Face(fid)) => vec![*fid],
-        Some(Selection::Loop(lid)) => state
-            .loops
-            .iter()
-            .find(|l| l.id == *lid)
-            .map(|l| vec![l.face_id])
-            .unwrap_or_default(),
-        _ => vec![],
+    // Resolve selection → face IDs.
+    let resolve = |sel: &Option<Selection>,
+                   faces: &[FaceRecord],
+                   loops: &[LoopRecord]|
+     -> Vec<usize> {
+        match sel {
+            Some(Selection::Face(fid)) => vec![*fid],
+            Some(Selection::Loop(lid)) => loops
+                .iter()
+                .find(|l| l.id == *lid)
+                .map(|l| vec![l.face_id])
+                .unwrap_or_default(),
+            Some(Selection::Edge(eid)) => faces
+                .iter()
+                .find(|f| f.edge_ids.contains(eid))
+                .map(|f| vec![f.id])
+                .unwrap_or_default(),
+            _ => vec![],
+        }
     };
 
-    // Clear highlight on previously selected faces.
-    for face in state.faces.iter() {
-        if prev_face_ids.contains(&face.id) && !selected_face_ids.contains(&face.id)
-            && let Some(mat) = materials.get_mut(&face.material_handle) {
-                mat.emissive = Color::BLACK.into();
-            }
+    let sel_faces = resolve(&state.selection, &state.faces, &state.loops);
+    let prev_sel_faces =
+        resolve(&state.prev_selection, &state.faces, &state.loops);
+    let hover_faces = resolve(&state.hover, &state.faces, &state.loops);
+    let prev_hover_faces =
+        resolve(&state.prev_hover, &state.faces, &state.loops);
+
+    // Collect all face IDs that need updating.
+    let mut dirty: Vec<usize> = Vec::new();
+    for &id in sel_faces
+        .iter()
+        .chain(&prev_sel_faces)
+        .chain(&hover_faces)
+        .chain(&prev_hover_faces)
+    {
+        if !dirty.contains(&id) {
+            dirty.push(id);
+        }
     }
-    // Apply highlight on newly selected faces.
+
     for face in state.faces.iter() {
-        if selected_face_ids.contains(&face.id)
-            && let Some(mat) = materials.get_mut(&face.material_handle) {
-                mat.emissive = highlight_emissive.into();
-            }
+        if !dirty.contains(&face.id) {
+            continue;
+        }
+        let Some(mat) = materials.get_mut(&face.material_handle) else {
+            continue;
+        };
+        // Selection takes priority over hover.
+        if sel_faces.contains(&face.id) {
+            mat.emissive = selection_emissive.into();
+        } else if hover_faces.contains(&face.id) {
+            mat.emissive = hover_emissive.into();
+        } else {
+            mat.emissive = Color::BLACK.into();
+        }
     }
 
     state.prev_selection = state.selection;
+    state.prev_hover = state.hover;
 }
 
 pub(crate) fn normalize_scene_and_setup_camera(
     mut state: ResMut<ViewerState>,
-    mut camera_query: Query<(&mut Transform, &mut PanOrbitCamera), With<MainCamera>>,
+    mut camera_query: Query<
+        (&mut Transform, &mut PanOrbitCamera),
+        With<MainCamera>,
+    >,
     mesh_query: Query<&Transform, (With<FaceMesh>, Without<MainCamera>)>,
 ) {
     let Some(bounds) = state.pending_bounds else {
@@ -675,7 +731,8 @@ pub(crate) fn rebuild_meshes_on_toggle(
     // Update vertex colors in-place on existing meshes (no despawn/respawn).
     // Iterate through all faces in all shells.
     for shell in &scene.shells {
-        // STEP-defined colors always show; random colors only when toggle is on.
+        // STEP-defined colors always show; random colors only when toggle is
+        // on.
         let apply_colors = use_random_colors || shell.color.is_some();
 
         for step_face in &shell.faces {
@@ -686,8 +743,11 @@ pub(crate) fn rebuild_meshes_on_toggle(
                 .find(|f| f.shell_id == shell.id && f.name == step_face.name)
                 && let Some(mesh) = meshes.get_mut(&face_record.mesh_handle)
             {
-                let colors =
-                    recompute_colors_for_mesh(&step_face.mesh, face_record.ui_color, apply_colors);
+                let colors = recompute_colors_for_mesh(
+                    &step_face.mesh,
+                    face_record.ui_color,
+                    apply_colors,
+                );
                 mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
             }
         }
@@ -727,7 +787,8 @@ pub(crate) fn recompute_colors_for_mesh(
         }
     }
 
-    // Use shell's distinct color if random colors enabled, otherwise neutral gray.
+    // Use shell's distinct color if random colors enabled, otherwise neutral
+    // gray.
     let color = if use_random_colors {
         [shell_color[0], shell_color[1], shell_color[2], 1.0]
     } else {
@@ -738,7 +799,8 @@ pub(crate) fn recompute_colors_for_mesh(
     vec![color; vertex_count]
 }
 
-/// Disable PanOrbitCamera when egui wants pointer input (e.g., during panel resize).
+/// Disable PanOrbitCamera when egui wants pointer input (e.g., during panel
+/// resize).
 pub(crate) fn disable_camera_when_egui_wants_input(
     mut contexts: EguiContexts,
     mut camera_query: Query<&mut PanOrbitCamera, With<MainCamera>>,
@@ -747,7 +809,8 @@ pub(crate) fn disable_camera_when_egui_wants_input(
         return;
     };
 
-    let egui_wants_input = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
+    let egui_wants_input =
+        ctx.wants_pointer_input() || ctx.is_pointer_over_area();
 
     if let Ok(mut pan_orbit) = camera_query.single_mut() {
         pan_orbit.enabled = !egui_wants_input;
@@ -766,9 +829,18 @@ pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
 
         for shell in &scene.shells {
             for (p0_arr, p1_arr) in &shell.edges {
-                // Apply same normalization as mesh vertices: (pos - center) * scale.
-                let p0_raw = Vec3::new(p0_arr[0] as f32, p0_arr[1] as f32, p0_arr[2] as f32);
-                let p1_raw = Vec3::new(p1_arr[0] as f32, p1_arr[1] as f32, p1_arr[2] as f32);
+                // Apply same normalization as mesh vertices: (pos - center) *
+                // scale.
+                let p0_raw = Vec3::new(
+                    p0_arr[0] as f32,
+                    p0_arr[1] as f32,
+                    p0_arr[2] as f32,
+                );
+                let p1_raw = Vec3::new(
+                    p1_arr[0] as f32,
+                    p1_arr[1] as f32,
+                    p1_arr[2] as f32,
+                );
                 let p0 = (p0_raw - center) * scale;
                 let p1 = (p1_raw - center) * scale;
                 gizmos.line(p0, p1, color);
@@ -787,22 +859,23 @@ pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
         let mut edge_offset = 0usize;
 
         // Precompute which edge IDs are highlighted by the current selection.
-        let highlighted_edges: std::collections::HashSet<usize> = match &state.selection {
-            Some(Selection::Edge(eid)) => [*eid].into_iter().collect(),
-            Some(Selection::Loop(lid)) => state
-                .loops
-                .iter()
-                .find(|l| l.id == *lid)
-                .map(|l| l.edge_ids.iter().copied().collect())
-                .unwrap_or_default(),
-            Some(Selection::Face(fid)) => state
-                .faces
-                .iter()
-                .find(|f| f.id == *fid)
-                .map(|f| f.edge_ids.iter().copied().collect())
-                .unwrap_or_default(),
-            _ => std::collections::HashSet::new(),
-        };
+        let highlighted_edges: std::collections::HashSet<usize> =
+            match &state.selection {
+                Some(Selection::Edge(eid)) => [*eid].into_iter().collect(),
+                Some(Selection::Loop(lid)) => state
+                    .loops
+                    .iter()
+                    .find(|l| l.id == *lid)
+                    .map(|l| l.edge_ids.iter().copied().collect())
+                    .unwrap_or_default(),
+                Some(Selection::Face(fid)) => state
+                    .faces
+                    .iter()
+                    .find(|f| f.id == *fid)
+                    .map(|f| f.edge_ids.iter().copied().collect())
+                    .unwrap_or_default(),
+                _ => std::collections::HashSet::new(),
+            };
 
         for shell in &scene.shells {
             // Check if shell is visible.
@@ -815,14 +888,18 @@ pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
             if shell_visible {
                 for curve_edge in &shell.curve_edges {
                     let global_edge_id = edge_offset + curve_edge.id;
-                    let edge_visible = state.edges.get(global_edge_id).is_none_or(|e| e.visible);
+                    let edge_visible = state
+                        .edges
+                        .get(global_edge_id)
+                        .is_none_or(|e| e.visible);
 
                     if edge_visible {
-                        let color = if highlighted_edges.contains(&global_edge_id) {
-                            highlight_color
-                        } else {
-                            edge_color
-                        };
+                        let color =
+                            if highlighted_edges.contains(&global_edge_id) {
+                                highlight_color
+                            } else {
+                                edge_color
+                            };
                         for window in curve_edge.points.windows(2) {
                             let p0_raw = Vec3::new(
                                 window[0][0] as f32,
@@ -922,7 +999,10 @@ pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
 }
 
 /// Re-tessellate a face when loop trimming changes.
-pub(crate) fn retessellate_face(mut state: ResMut<ViewerState>, mut meshes: ResMut<Assets<Mesh>>) {
+pub(crate) fn retessellate_face(
+    mut state: ResMut<ViewerState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
     let Some(face_id) = state.retessellate_face.take() else {
         return;
     };
@@ -1014,7 +1094,26 @@ pub(crate) fn retessellate_face(mut state: ResMut<ViewerState>, mut meshes: ResM
     // Also update the StepFace mesh in scene_data for wireframe consistency.
     if let Some(scene) = &mut state.scene_data
         && let Some(shell) = scene.shells.iter_mut().find(|s| s.id == shell_id)
-            && let Some(step_face) = shell.faces.iter_mut().find(|f| f.id == local_face_idx) {
-                step_face.mesh = polygon_mesh;
-            }
+        && let Some(step_face) =
+            shell.faces.iter_mut().find(|f| f.id == local_face_idx)
+    {
+        step_face.mesh = polygon_mesh;
+    }
+}
+
+/// Global observer: clicking a face mesh in the viewport selects it in the
+/// hierarchy.
+pub(crate) fn on_mesh_click(
+    click: On<Pointer<Click>>,
+    face_query: Query<&FaceMesh>,
+    mut state: ResMut<ViewerState>,
+) {
+    // Only respond to primary (left) button.
+    if click.button != PointerButton::Primary {
+        return;
+    }
+    if let Ok(face_mesh) = face_query.get(click.entity) {
+        state.selection = Some(Selection::Face(face_mesh.face_id));
+        state.selection_from_viewport = true;
+    }
 }

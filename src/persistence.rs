@@ -1,10 +1,10 @@
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::time::Instant;
+use std::{path::PathBuf, time::Instant};
 
 use crate::state::{
-    AppMode, BrowserState, DEFAULT_PANEL_WIDTH, DEFAULT_TESSELLATION_FACTOR, ViewerState,
+    AppMode, BrowserState, DEFAULT_PANEL_WIDTH, DEFAULT_TESSELLATION_FACTOR,
+    ViewerState,
 };
 
 const APP_NAME: &str = "monster-step-viewer";

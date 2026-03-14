@@ -14,10 +14,11 @@ use bevy::{
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass, EguiUserTextures};
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use state::{AppMode, BrowserState, ViewerState};
-use std::env;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::{
+    env,
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 fn main() {
     let cli_path = env::args().nth(1).map(PathBuf::from);
@@ -27,10 +28,15 @@ fn main() {
     let browser_root = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let mut initial_tree = browser::scan_subdirs(&browser_root);
 
-    // Expand tree to the previously selected directory (and scan files only if starting in browser mode).
+    // Expand tree to the previously selected directory (and scan files only if
+    // starting in browser mode).
     let mut initial_previews = Vec::new();
     if let Some(ref last_dir) = settings.last_browser_dir {
-        browser::expand_tree_to_path(&mut initial_tree, &browser_root, last_dir);
+        browser::expand_tree_to_path(
+            &mut initial_tree,
+            &browser_root,
+            last_dir,
+        );
         if settings.mode == AppMode::Browser {
             initial_previews = browser::scan_step_files(last_dir);
         }
@@ -84,6 +90,7 @@ fn main() {
                 }),
         )
         .add_plugins(EguiPlugin::default())
+        .add_plugins(MeshPickingPlugin)
         .add_plugins(PanOrbitCameraPlugin)
         .insert_resource(WinitSettings::desktop_app())
         .add_systems(Startup, scene::setup_scene)
@@ -98,6 +105,7 @@ fn main() {
         .add_systems(Update, scene::draw_gizmos)
         .add_systems(Update, scene::retessellate_face)
         .add_systems(Update, persistence::auto_save_system)
+        .add_observer(scene::on_mesh_click)
         .add_systems(
             Update,
             browser::update_turntable_system.run_if(in_browser_mode),
@@ -119,7 +127,8 @@ fn setup_browser_render_slots(
     mut egui_textures: ResMut<EguiUserTextures>,
     state: Res<ViewerState>,
 ) {
-    browser.render_slots = browser::setup_render_slots(&mut images, &mut egui_textures);
+    browser.render_slots =
+        browser::setup_render_slots(&mut images, &mut egui_textures);
     // Start loading previews only if starting in browser mode.
     if state.mode == AppMode::Browser && !browser.previews.is_empty() {
         browser::start_preview_loads(&mut browser);

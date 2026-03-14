@@ -3,19 +3,27 @@ mod parsing;
 pub mod transform;
 
 use anyhow::Context;
-use monstertruck::meshing::prelude::*;
-use monstertruck::step::load::Table;
-use monstertruck::step::load::step_geometry::{Curve3D, Surface};
-use monstertruck::topology::compress::CompressedShell;
+use monstertruck::{
+    meshing::prelude::*,
+    step::load::{
+        Table,
+        step_geometry::{Curve3D, Surface},
+    },
+    topology::compress::CompressedShell,
+};
 type OriginalShell = CompressedShell<Point3, Curve3D, Surface>;
 pub use monstertruck::step::load::ruststep::ast::Parameter;
 use monstertruck::step::load::ruststep::parser::parse;
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+};
 
 pub use transform::Transform;
 
@@ -150,8 +158,9 @@ pub fn load_step_file_with_progress(
     path: &Path,
     progress: &LoadProgress,
 ) -> anyhow::Result<StepScene> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read STEP file {}", path.display()))?;
+    let raw = std::fs::read_to_string(path).with_context(|| {
+        format!("Failed to read STEP file {}", path.display())
+    })?;
 
     let exchange = parse(&raw).context("Failed to parse STEP file")?;
     let table = Table::from_data_section(
@@ -190,19 +199,25 @@ pub fn load_step_file_with_progress(
         .into_par_iter()
         .enumerate()
         .map(|(local_idx, (_id, shell_holder))| {
-            let compressed = table
-                .to_compressed_shell(shell_holder)
-                .map_err(|e| anyhow::anyhow!("Failed to convert STEP shell into topology: {e}"))?;
+            let compressed =
+                table.to_compressed_shell(shell_holder).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to convert STEP shell into topology: {e}"
+                    )
+                })?;
 
-            // Classify curve types from original geometry (before tessellation).
+            // Classify curve types from original geometry (before
+            // tessellation).
             let curve_types: Vec<String> = compressed
                 .edges
                 .iter()
                 .map(|e| classify_curve_type(&e.curve))
                 .collect();
 
-            // Compute tolerance from geometric extents without a coarse triangulation pass.
-            let mut bounds: BoundingBox<Point3> = compressed.vertices.iter().collect();
+            // Compute tolerance from geometric extents without a coarse
+            // triangulation pass.
+            let mut bounds: BoundingBox<Point3> =
+                compressed.vertices.iter().collect();
             for edge in &compressed.edges {
                 let (start, end) = edge.curve.range_tuple();
                 // Sample a few points per edge to capture curved extents.
@@ -218,7 +233,9 @@ pub fn load_step_file_with_progress(
                     bounds.push(face.surface.subs(u1, v0));
                     bounds.push(face.surface.subs(u0, v1));
                     bounds.push(face.surface.subs(u1, v1));
-                    bounds.push(face.surface.subs((u0 + u1) * 0.5, (v0 + v1) * 0.5));
+                    bounds.push(
+                        face.surface.subs((u0 + u1) * 0.5, (v0 + v1) * 0.5),
+                    );
                 }
             }
             let diameter = bounds.diameter();
@@ -236,7 +253,8 @@ pub fn load_step_file_with_progress(
                 .iter()
                 .enumerate()
                 .map(|(i, edge)| {
-                    let points = edge.curve.iter().map(|p| [p.x, p.y, p.z]).collect();
+                    let points =
+                        edge.curve.iter().map(|p| [p.x, p.y, p.z]).collect();
                     StepEdge {
                         id: i,
                         curve_type: curve_types
@@ -270,7 +288,10 @@ pub fn load_step_file_with_progress(
                             .iter()
                             .enumerate()
                             .map(|(loop_idx, loop_edges)| StepBoundaryLoop {
-                                edge_indices: loop_edges.iter().map(|ei| ei.index).collect(),
+                                edge_indices: loop_edges
+                                    .iter()
+                                    .map(|ei| ei.index)
+                                    .collect(),
                                 is_outer: loop_idx == 0,
                             })
                             .collect();
@@ -335,13 +356,18 @@ pub enum LoadMessage {
     Error(String),
 }
 
-/// Start loading a STEP file in a background thread, streaming results via channel.
-/// `tolerance_factor` controls tessellation density (smaller = more triangles, default 0.005).
-pub fn load_step_file_streaming(path: PathBuf, tolerance_factor: f64) -> Receiver<LoadMessage> {
+/// Start loading a STEP file in a background thread, streaming results via
+/// channel. `tolerance_factor` controls tessellation density (smaller = more
+/// triangles, default 0.005).
+pub fn load_step_file_streaming(
+    path: PathBuf,
+    tolerance_factor: f64,
+) -> Receiver<LoadMessage> {
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        if let Err(e) = load_step_streaming_inner(&path, &tx, tolerance_factor) {
+        if let Err(e) = load_step_streaming_inner(&path, &tx, tolerance_factor)
+        {
             let _ = tx.send(LoadMessage::Error(e.to_string()));
         }
     });
@@ -354,8 +380,9 @@ fn load_step_streaming_inner(
     tx: &Sender<LoadMessage>,
     tolerance_factor: f64,
 ) -> anyhow::Result<()> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read STEP file {}", path.display()))?;
+    let raw = std::fs::read_to_string(path).with_context(|| {
+        format!("Failed to read STEP file {}", path.display())
+    })?;
 
     // Parse colors from raw STEP content.
     let entity_colors = parse_step_colors(&raw);
@@ -416,13 +443,12 @@ fn load_step_streaming_inner(
     // Track progress with atomic counter.
     let completed = Arc::new(AtomicUsize::new(0));
 
-    // Process shells in parallel, sending each as it completes (true streaming).
+    // Process shells in parallel, sending each as it completes (true
+    // streaming).
     let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    shell_entries
-        .into_par_iter()
-        .enumerate()
-        .for_each(|(local_idx, (shell_id, shell_holder))| {
+    shell_entries.into_par_iter().enumerate().for_each(
+        |(local_idx, (shell_id, shell_holder))| {
             // Skip if we already encountered an error.
             if error.lock().is_some() {
                 return;
@@ -443,21 +469,25 @@ fn load_step_streaming_inner(
             let compressed = match table.to_compressed_shell(shell_holder) {
                 Ok(c) => c,
                 Err(e) => {
-                    *error.lock() =
-                        Some(format!("Failed to convert STEP shell into topology: {e}"));
+                    *error.lock() = Some(format!(
+                        "Failed to convert STEP shell into topology: {e}"
+                    ));
                     return;
                 }
             };
 
-            // Classify curve types from original geometry (before tessellation).
+            // Classify curve types from original geometry (before
+            // tessellation).
             let curve_types: Vec<String> = compressed
                 .edges
                 .iter()
                 .map(|e| classify_curve_type(&e.curve))
                 .collect();
 
-            // Compute tolerance from geometric extents without a coarse triangulation pass.
-            let mut bounds: BoundingBox<Point3> = compressed.vertices.iter().collect();
+            // Compute tolerance from geometric extents without a coarse
+            // triangulation pass.
+            let mut bounds: BoundingBox<Point3> =
+                compressed.vertices.iter().collect();
             for edge in &compressed.edges {
                 let (start, end) = edge.curve.range_tuple();
                 // Sample a few points per edge to capture curved extents.
@@ -473,7 +503,9 @@ fn load_step_streaming_inner(
                     bounds.push(face.surface.subs(u1, v0));
                     bounds.push(face.surface.subs(u0, v1));
                     bounds.push(face.surface.subs(u1, v1));
-                    bounds.push(face.surface.subs((u0 + u1) * 0.5, (v0 + v1) * 0.5));
+                    bounds.push(
+                        face.surface.subs((u0 + u1) * 0.5, (v0 + v1) * 0.5),
+                    );
                 }
             }
             let bbox_diameter = bounds.diameter();
@@ -533,12 +565,16 @@ fn load_step_streaming_inner(
                             false => surface.inverse(),
                         };
 
-                        // Extract boundary edges from this face's mesh (before transform is applied to mesh).
-                        // Pass transform to extract_mesh_edges so edges are in world coords.
-                        let face_edges = extract_mesh_edges(&mesh, transform.as_ref());
+                        // Extract boundary edges from this face's mesh (before
+                        // transform is applied to mesh).
+                        // Pass transform to extract_mesh_edges so edges are in
+                        // world coords.
+                        let face_edges =
+                            extract_mesh_edges(&mesh, transform.as_ref());
                         all_edges.extend(face_edges);
 
-                        // Apply assembly transform to mesh vertices and normals.
+                        // Apply assembly transform to mesh vertices and
+                        // normals.
                         if let Some(xform) = transform {
                             apply_transform_to_mesh(&mut mesh, &xform);
                         }
@@ -549,7 +585,10 @@ fn load_step_streaming_inner(
                             .iter()
                             .enumerate()
                             .map(|(loop_idx, loop_edges)| StepBoundaryLoop {
-                                edge_indices: loop_edges.iter().map(|ei| ei.index).collect(),
+                                edge_indices: loop_edges
+                                    .iter()
+                                    .map(|ei| ei.index)
+                                    .collect(),
                                 is_outer: loop_idx == 0,
                             })
                             .collect();
@@ -565,7 +604,8 @@ fn load_step_streaming_inner(
                 .collect();
 
             // Count total triangles for debugging.
-            let total_tris: usize = faces.iter().map(|f| f.mesh.tri_faces().len()).sum();
+            let total_tris: usize =
+                faces.iter().map(|f| f.mesh.tri_faces().len()).sum();
             log::info!(
                 "Shell {}: {} faces, {} triangles (tol={:.6})",
                 local_idx,
@@ -592,7 +632,8 @@ fn load_step_streaming_inner(
             // Update and report progress.
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             let _ = tx.send(LoadMessage::Progress(done, total));
-        });
+        },
+    );
 
     // Check for errors.
     if let Some(err) = error.lock().take() {
@@ -604,8 +645,9 @@ fn load_step_streaming_inner(
 }
 
 /// Re-tessellate a single face with modified boundaries.
-/// `active_boundaries` contains the loop indices (into the original face's boundaries) that should remain active.
-/// If empty, the face is tessellated with no trim boundaries (full surface domain).
+/// `active_boundaries` contains the loop indices (into the original face's
+/// boundaries) that should remain active. If empty, the face is tessellated
+/// with no trim boundaries (full surface domain).
 pub fn retessellate_face(
     shell_data: &CompressedShellData,
     face_idx: usize,

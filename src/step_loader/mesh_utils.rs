@@ -6,8 +6,13 @@ use rayon::prelude::*;
 use super::transform::Transform;
 
 /// Apply a transform to all vertices and normals in a mesh.
-pub(crate) fn apply_transform_to_mesh(mesh: &mut PolygonMesh, transform: &Transform) {
-    use monstertruck::meshing::prelude::{Faces, Point3, StandardAttributes, Vector3};
+pub(crate) fn apply_transform_to_mesh(
+    mesh: &mut PolygonMesh,
+    transform: &Transform,
+) {
+    use monstertruck::meshing::prelude::{
+        Faces, Point3, StandardAttributes, Vector3,
+    };
 
     // Transform positions.
     let positions: Vec<_> = mesh
@@ -57,7 +62,8 @@ pub(crate) fn apply_transform_to_mesh(mesh: &mut PolygonMesh, transform: &Transf
 }
 
 /// Extract boundary edges from a tessellated polygon mesh.
-/// Returns edges as pairs of 3D points. Boundary edges appear in only one triangle.
+/// Returns edges as pairs of 3D points. Boundary edges appear in only one
+/// triangle.
 pub(crate) fn extract_mesh_edges(
     mesh: &PolygonMesh,
     transform: Option<&Transform>,
@@ -65,8 +71,10 @@ pub(crate) fn extract_mesh_edges(
     let positions = mesh.positions();
     let tri_faces = mesh.tri_faces();
 
-    // Count how many times each edge appears (using sorted vertex indices as key).
-    let mut edge_counts: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
+    // Count how many times each edge appears (using sorted vertex indices as
+    // key).
+    let mut edge_counts: HashMap<(usize, usize), Vec<(usize, usize)>> =
+        HashMap::new();
 
     for tri in tri_faces {
         let indices = [tri[0].pos, tri[1].pos, tri[2].pos];
