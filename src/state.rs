@@ -246,6 +246,19 @@ pub(crate) struct FaceMesh {
     pub face_id: usize,
 }
 
+/// Marker for the translucent 3D quad that visualises a clip plane.
+#[derive(Component, Debug)]
+pub(crate) struct ClipPlaneHandle {
+    pub axis: usize, // 0=X, 1=Y, 2=Z
+}
+
+/// Resource tracking whether a clip-plane handle is being dragged.
+/// While active the `PanOrbitCamera` is disabled.
+#[derive(Resource, Default, Debug)]
+pub(crate) struct ClipPlaneDragState {
+    pub dragging: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct LoadJob {
     pub path: PathBuf,

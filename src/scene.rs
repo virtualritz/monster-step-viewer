@@ -11,10 +11,10 @@ use rayon::prelude::*;
 use std::sync::mpsc::TryRecvError;
 
 use crate::state::{
-    AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, EdgeRecord, FaceMesh,
-    FaceRecord, KEY_LIGHT_ILLUMINANCE, LoadJob, LoopRecord, MATERIAL_METALLIC,
-    MATERIAL_ROUGHNESS, MainCamera, NEUTRAL_GRAY, Selection, ShellRecord,
-    ViewerState,
+    AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, ClipPlaneDragState,
+    ClipPlaneHandle, EdgeRecord, FaceMesh, FaceRecord, KEY_LIGHT_ILLUMINANCE,
+    LoadJob, LoopRecord, MATERIAL_METALLIC, MATERIAL_ROUGHNESS, MainCamera,
+    NEUTRAL_GRAY, Selection, ShellRecord, ViewerState,
 };
 use crate::viewer_material::{ViewerMaterial, ViewerMaterialExt};
 
@@ -96,10 +96,15 @@ pub(crate) fn process_load_requests(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ViewerMaterial>>,
     existing_meshes: Query<Entity, With<FaceMesh>>,
+    clip_handles: Query<Entity, With<ClipPlaneHandle>>,
 ) {
     // Start a new load if requested.
     if let Some(path) = state.pending_path.take() {
         for entity in existing_meshes.iter() {
+            commands.entity(entity).despawn();
+        }
+        // Also remove clip-plane handles — they'll be re-created if needed.
+        for entity in clip_handles.iter() {
             commands.entity(entity).despawn();
         }
         state.shells.clear();
@@ -804,10 +809,11 @@ pub(crate) fn recompute_colors_for_mesh(
 }
 
 /// Disable PanOrbitCamera when egui wants pointer input (e.g., during panel
-/// resize).
+/// resize) or when a clip-plane handle is being dragged.
 pub(crate) fn disable_camera_when_egui_wants_input(
     mut contexts: EguiContexts,
     mut camera_query: Query<&mut PanOrbitCamera, With<MainCamera>>,
+    drag_state: Res<ClipPlaneDragState>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -817,7 +823,7 @@ pub(crate) fn disable_camera_when_egui_wants_input(
         ctx.wants_pointer_input() || ctx.is_pointer_over_area();
 
     if let Ok(mut pan_orbit) = camera_query.single_mut() {
-        pan_orbit.enabled = !egui_wants_input;
+        pan_orbit.enabled = !egui_wants_input && !drag_state.dragging;
     }
 }
 
@@ -1177,5 +1183,243 @@ pub(crate) fn on_mesh_click(
     if let Ok(face_mesh) = face_query.get(click.entity) {
         state.selection = Some(Selection::Face(face_mesh.face_id));
         state.selection_from_viewport = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clip-plane 3D handles: spawn / despawn / reposition translucent quads
+// ---------------------------------------------------------------------------
+
+/// Axis colours for clip-plane handles (translucent).
+const CLIP_PLANE_COLORS: [Color; 3] = [
+    Color::linear_rgba(1.0, 0.2, 0.2, 0.15), // X — red
+    Color::linear_rgba(0.2, 1.0, 0.2, 0.15), // Y — green
+    Color::linear_rgba(0.2, 0.2, 1.0, 0.15), // Z — blue
+];
+
+/// Margin factor – the handle quad extends a little beyond the bounding box so
+/// that it remains visible even when the clip position is at the extremes.
+const HANDLE_MARGIN: f32 = 1.05;
+
+/// System that spawns, despawns and repositions clip-plane handle quads.
+pub(crate) fn manage_clip_plane_visuals(
+    mut commands: Commands,
+    state: Res<ViewerState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut std_materials: ResMut<Assets<StandardMaterial>>,
+    mut handle_q: Query<(Entity, &ClipPlaneHandle, &mut Transform)>,
+) {
+    let Some(bounds) = state.current_bounds else {
+        // No scene loaded — despawn any lingering handles.
+        for (entity, _, _) in handle_q.iter() {
+            commands.entity(entity).despawn();
+        }
+        return;
+    };
+
+    let bounds_min = [bounds.min.x, bounds.min.y, bounds.min.z];
+    let bounds_max = [bounds.max.x, bounds.max.y, bounds.max.z];
+    let bounds_size = [
+        bounds.max.x - bounds.min.x,
+        bounds.max.y - bounds.min.y,
+        bounds.max.z - bounds.min.z,
+    ];
+
+    for axis in 0..3 {
+        let cp = &state.clip_planes[axis];
+
+        // Find existing entity for this axis.
+        let existing = handle_q
+            .iter_mut()
+            .find(|(_, h, _)| h.axis == axis);
+
+        if !cp.enabled {
+            // Despawn if present.
+            if let Some((entity, _, _)) = existing {
+                commands.entity(entity).despawn();
+            }
+            continue;
+        }
+
+        // World position along clip axis.
+        let pos =
+            bounds_min[axis] + cp.position_f32() * (bounds_max[axis] - bounds_min[axis]);
+
+        if let Some((_, _, mut transform)) = existing {
+            // Update position only — the transform orientation & scale stay.
+            match axis {
+                0 => transform.translation.x = pos,
+                1 => transform.translation.y = pos,
+                _ => transform.translation.z = pos,
+            }
+        } else {
+            // Spawn a new handle quad.
+            // The quad size covers the two non-clip axes of the bbox.
+            let (size_a, size_b) = match axis {
+                0 => (bounds_size[1], bounds_size[2]), // YZ quad
+                1 => (bounds_size[0], bounds_size[2]), // XZ quad
+                _ => (bounds_size[0], bounds_size[1]), // XY quad
+            };
+
+            let mesh_handle = meshes.add(
+                Plane3d::new(Vec3::Y, Vec2::splat(0.5)).mesh().build(),
+            );
+
+            let mat_handle = std_materials.add(StandardMaterial {
+                base_color: CLIP_PLANE_COLORS[axis],
+                alpha_mode: AlphaMode::Blend,
+                unlit: true,
+                cull_mode: None,
+                ..Default::default()
+            });
+
+            // Build transform: translate to `pos` on the clip axis, rotate so
+            // the quad faces along the clip axis, scale to bbox extents.
+            let translation = match axis {
+                0 => Vec3::new(pos, (bounds_min[1] + bounds_max[1]) * 0.5, (bounds_min[2] + bounds_max[2]) * 0.5),
+                1 => Vec3::new((bounds_min[0] + bounds_max[0]) * 0.5, pos, (bounds_min[2] + bounds_max[2]) * 0.5),
+                _ => Vec3::new((bounds_min[0] + bounds_max[0]) * 0.5, (bounds_min[1] + bounds_max[1]) * 0.5, pos),
+            };
+
+            // Plane3d default normal is Y-up, producing an XZ quad.
+            // X-handle needs YZ quad: rotate 90° around Z.
+            // Y-handle needs XZ quad: identity rotation (default).
+            // Z-handle needs XY quad: rotate 90° around X.
+            let rotation = match axis {
+                0 => Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+                1 => Quat::IDENTITY,
+                _ => Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+            };
+
+            // Scale: the base mesh is 1×1 (half_size 0.5 on each side).
+            // We need it to cover size_a × size_b.
+            let scale = match axis {
+                0 => Vec3::new(size_b * HANDLE_MARGIN, 1.0, size_a * HANDLE_MARGIN),
+                1 => Vec3::new(size_a * HANDLE_MARGIN, 1.0, size_b * HANDLE_MARGIN),
+                _ => Vec3::new(size_a * HANDLE_MARGIN, 1.0, size_b * HANDLE_MARGIN),
+            };
+
+            commands.spawn((
+                ClipPlaneHandle { axis },
+                Mesh3d(mesh_handle),
+                MeshMaterial3d(mat_handle),
+                Transform {
+                    translation,
+                    rotation,
+                    scale,
+                },
+            ));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clip-plane drag interaction (observers)
+// ---------------------------------------------------------------------------
+
+/// Observer: drag-start on a clip-plane handle — disable camera orbit.
+pub(crate) fn on_clip_plane_drag_start(
+    event: On<Pointer<DragStart>>,
+    handle_q: Query<&ClipPlaneHandle>,
+    mut drag_state: ResMut<ClipPlaneDragState>,
+) {
+    if event.button != PointerButton::Primary {
+        return;
+    }
+    if handle_q.get(event.entity).is_ok() {
+        drag_state.dragging = true;
+    }
+}
+
+/// Observer: drag on a clip-plane handle — reposition via ray-axis projection.
+pub(crate) fn on_clip_plane_drag(
+    event: On<Pointer<Drag>>,
+    handle_q: Query<&ClipPlaneHandle>,
+    camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+    mut state: ResMut<ViewerState>,
+) {
+    if event.button != PointerButton::Primary {
+        return;
+    }
+    let Ok(handle) = handle_q.get(event.entity) else {
+        return;
+    };
+    let Some(bounds) = state.current_bounds else {
+        return;
+    };
+    let Ok((camera, cam_gt)) = camera_q.single() else {
+        return;
+    };
+
+    // Current pointer position in viewport pixels.
+    let pointer_pos = event.pointer_location.position;
+
+    // Cast ray from camera through pointer.
+    let Ok(ray) = camera.viewport_to_world(cam_gt, pointer_pos) else {
+        return;
+    };
+
+    let axis = handle.axis;
+    let bounds_min = [bounds.min.x, bounds.min.y, bounds.min.z];
+    let bounds_max = [bounds.max.x, bounds.max.y, bounds.max.z];
+    let extent = bounds_max[axis] - bounds_min[axis];
+    if extent.abs() < 1e-8 {
+        return;
+    }
+
+    // Find the point on the ray closest to the clip axis line.
+    // The clip axis line passes through the bbox center along unit axis `axis`.
+    let axis_dir = match axis {
+        0 => Vec3::X,
+        1 => Vec3::Y,
+        _ => Vec3::Z,
+    };
+    let axis_origin = (bounds.min + bounds.max) * 0.5;
+
+    // Closest approach between two lines:
+    //   Line A: P = ray.origin + t * ray.direction
+    //   Line B: Q = axis_origin + s * axis_dir
+    // We want s that gives the closest point on axis_dir to Line A.
+    let d = *ray.direction; // Vec3
+    let w = ray.origin - axis_origin;
+    let a = d.dot(d);
+    let b = d.dot(axis_dir);
+    let c = axis_dir.dot(axis_dir);
+    let d_val = d.dot(w);
+    let e = axis_dir.dot(w);
+    let denom = a * c - b * b;
+    if denom.abs() < 1e-10 {
+        // Lines are parallel — can't determine position.
+        return;
+    }
+    let s = (a * e - b * d_val) / denom;
+    let closest_on_axis = axis_origin + s * axis_dir;
+    let world_pos = match axis {
+        0 => closest_on_axis.x,
+        1 => closest_on_axis.y,
+        _ => closest_on_axis.z,
+    };
+
+    // Map world position back to 0..1 normalised range.
+    let t = ((world_pos - bounds_min[axis]) / extent).clamp(0.0, 1.0);
+    let new_position = (t * 1000.0).round() as u16;
+
+    if state.clip_planes[axis].position != new_position {
+        state.clip_planes[axis].position = new_position;
+        state.clip_planes_dirty = true;
+    }
+}
+
+/// Observer: drag-end on a clip-plane handle — re-enable camera orbit.
+pub(crate) fn on_clip_plane_drag_end(
+    event: On<Pointer<DragEnd>>,
+    handle_q: Query<&ClipPlaneHandle>,
+    mut drag_state: ResMut<ClipPlaneDragState>,
+) {
+    if event.button != PointerButton::Primary {
+        return;
+    }
+    if handle_q.get(event.entity).is_ok() {
+        drag_state.dragging = false;
     }
 }

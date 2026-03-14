@@ -14,7 +14,7 @@ use bevy::{
 };
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass, EguiUserTextures};
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
-use state::{AppMode, BrowserState, ViewerState};
+use state::{AppMode, BrowserState, ClipPlaneDragState, ViewerState};
 use std::{
     env,
     path::PathBuf,
@@ -73,6 +73,7 @@ fn main() {
             thumb_size: 200.0,
         })
         .insert_resource(persistence::SaveTimer::default())
+        .insert_resource(ClipPlaneDragState::default())
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
@@ -109,8 +110,12 @@ fn main() {
         .add_systems(Update, scene::draw_gizmos)
         .add_systems(Update, scene::retessellate_face)
         .add_systems(Update, scene::update_clip_plane_uniforms)
+        .add_systems(Update, scene::manage_clip_plane_visuals)
         .add_systems(Update, persistence::auto_save_system)
         .add_observer(scene::on_mesh_click)
+        .add_observer(scene::on_clip_plane_drag_start)
+        .add_observer(scene::on_clip_plane_drag)
+        .add_observer(scene::on_clip_plane_drag_end)
         .add_systems(
             Update,
             browser::update_turntable_system.run_if(in_browser_mode),
