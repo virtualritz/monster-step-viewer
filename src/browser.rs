@@ -14,6 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
+    time::Duration,
 };
 
 use crate::{
@@ -180,6 +181,11 @@ pub(crate) fn start_preview_loads(state: &mut BrowserState) {
     });
 }
 
+/// Per-message timeout for preview loading. If the tessellator hangs on a
+/// particular tolerance/geometry combo, we bail out instead of blocking the
+/// entire preview pipeline.
+const PREVIEW_RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Load a single STEP file at preview quality.
 fn load_preview(
     path: &Path,
@@ -195,13 +201,19 @@ fn load_preview(
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".to_string());
         }
-        match receiver.recv() {
+        match receiver.recv_timeout(PREVIEW_RECV_TIMEOUT) {
             Ok(monster_step_viewer::LoadMessage::Shell(shell)) => {
                 shells.push(shell);
             }
             Ok(monster_step_viewer::LoadMessage::Done) => break,
             Ok(monster_step_viewer::LoadMessage::Error(e)) => return Err(e),
             Ok(_) => {} // Metadata, Progress, TotalShells — skip.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "tessellation timed out ({}s)",
+                    PREVIEW_RECV_TIMEOUT.as_secs()
+                ));
+            }
             Err(_) => return Err("loader disconnected".to_string()),
         }
     }
