@@ -55,6 +55,8 @@ fn main() {
             tessellation_factor: settings.tessellation_factor,
             applied_tessellation_factor: settings.tessellation_factor,
             mode: settings.mode,
+            clip_planes: settings.clip_planes,
+            shading_mode: settings.shading_mode,
             ..Default::default()
         })
         .insert_resource(BrowserState {

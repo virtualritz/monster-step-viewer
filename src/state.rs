@@ -28,6 +28,45 @@ pub(crate) enum AppMode {
     Browser,
 }
 
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub(crate) struct ClipPlaneState {
+    pub enabled: bool,
+    pub position: u16,
+    pub flip: bool,
+}
+
+impl Default for ClipPlaneState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            position: 500,
+            flip: false,
+        }
+    }
+}
+
+impl ClipPlaneState {
+    /// Get position as f32 in 0.0..=1.0 range.
+    #[allow(dead_code)]
+    pub fn position_f32(&self) -> f32 {
+        self.position as f32 / 1000.0
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub(crate) enum ShadingMode {
+    #[default]
+    Shaded,
+    Flat,
+    Matcap,
+    XRay,
+    Wireframe,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Selection {
     #[allow(dead_code)]
@@ -96,6 +135,15 @@ pub(crate) struct ViewerState {
     pub hover: Option<Selection>,
     /// Previous hover (to detect changes and update materials).
     pub prev_hover: Option<Selection>,
+    /// Clip plane state for X, Y, Z axes.
+    pub clip_planes: [ClipPlaneState; 3],
+    /// Flag indicating clip plane uniforms need updating on materials.
+    pub clip_planes_dirty: bool,
+    /// Current shading mode.
+    pub shading_mode: ShadingMode,
+    /// Flag indicating shading mode changed and materials need updating.
+    #[allow(dead_code)]
+    pub shading_mode_changed: bool,
 }
 
 impl Default for ViewerState {
@@ -135,6 +183,10 @@ impl Default for ViewerState {
             selection_from_viewport: false,
             hover: None,
             prev_hover: None,
+            clip_planes: [ClipPlaneState::default(); 3],
+            clip_planes_dirty: false,
+            shading_mode: ShadingMode::default(),
+            shading_mode_changed: false,
         }
     }
 }

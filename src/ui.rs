@@ -975,6 +975,32 @@ fn viewer_ui(
                                 state.settings_dirty = true;
                             }
                             edge_btn.on_hover_text("Curve edges");
+
+                            ui.separator();
+
+                            let clip_labels = ["X", "Y", "Z"];
+                            let clip_colors = [
+                                egui::Color32::from_rgb(220, 80, 80),
+                                egui::Color32::from_rgb(80, 200, 80),
+                                egui::Color32::from_rgb(80, 120, 220),
+                            ];
+                            for i in 0..3 {
+                                let active = state.clip_planes[i].enabled;
+                                let label = if active {
+                                    egui::RichText::new(clip_labels[i])
+                                        .color(clip_colors[i])
+                                        .strong()
+                                } else {
+                                    egui::RichText::new(clip_labels[i])
+                                };
+                                let clip_btn = ui.selectable_label(active, label);
+                                if clip_btn.clicked() {
+                                    state.clip_planes[i].enabled = !state.clip_planes[i].enabled;
+                                    state.clip_planes_dirty = true;
+                                    state.settings_dirty = true;
+                                }
+                                clip_btn.on_hover_text(format!("Clip {} axis", clip_labels[i]));
+                            }
                         });
                     });
                 });
