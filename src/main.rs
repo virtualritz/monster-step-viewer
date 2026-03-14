@@ -115,6 +115,8 @@ fn main() {
         .add_systems(Update, scene::retessellate_face)
         .add_systems(Update, scene::update_clip_plane_uniforms)
         .add_systems(Update, scene::manage_clip_plane_visuals)
+        .add_systems(Update, scene::start_solidify_clip)
+        .add_systems(Update, scene::poll_solidify_clip)
         .add_systems(Update, persistence::auto_save_system)
         .add_observer(scene::on_mesh_click)
         .add_observer(scene::on_clip_plane_drag_start)

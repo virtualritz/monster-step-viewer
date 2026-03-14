@@ -150,6 +150,10 @@ pub(crate) struct ViewerState {
     /// Whether any loaded shell has solid (manifold_solid_brep) topology,
     /// enabling the "Solidify Clip" feature.
     pub has_solid_topology: bool,
+    /// Active solidify-clip background job.
+    pub solidify_job: Option<SolidifyJob>,
+    /// Flag to trigger solidify-clip computation.
+    pub start_solidify: bool,
 }
 
 impl Default for ViewerState {
@@ -196,6 +200,8 @@ impl Default for ViewerState {
             previous_shading_mode: ShadingMode::default(),
             needs_normal_rebuild: false,
             has_solid_topology: false,
+            solidify_job: None,
+            start_solidify: false,
         }
     }
 }
@@ -274,6 +280,17 @@ pub(crate) struct LoadJob {
     pub receiver: Mutex<Receiver<LoadMessage>>,
     pub current_shell: usize,
     pub total_shells: usize,
+}
+
+/// Background job for solidify-clip boolean operation.
+pub(crate) struct SolidifyJob {
+    pub receiver: Mutex<Receiver<Result<StepScene, String>>>,
+}
+
+impl std::fmt::Debug for SolidifyJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SolidifyJob").finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

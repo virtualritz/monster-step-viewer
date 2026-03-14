@@ -8,7 +8,10 @@ use bevy::{
 };
 use bevy_egui::{EguiContexts, EguiGlobalSettings, PrimaryEguiContext};
 use bevy_panorbit_camera::PanOrbitCamera;
-use monster_step_viewer::{StepScene, StepShell};
+use monster_step_viewer::{
+    CompressedShellData, StepBoundaryLoop, StepEdge, StepFace, StepScene,
+    StepShell, StepTopology,
+};
 use monstertruck::meshing::prelude::PolygonMesh;
 use rayon::prelude::*;
 use std::sync::mpsc::TryRecvError;
@@ -17,7 +20,7 @@ use crate::state::{
     AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, ClipPlaneDragState,
     ClipPlaneHandle, EdgeRecord, FaceMesh, FaceRecord, KEY_LIGHT_ILLUMINANCE,
     LoadJob, LoopRecord, MATERIAL_METALLIC, MATERIAL_ROUGHNESS, MainCamera,
-    NEUTRAL_GRAY, Selection, ShadingMode, ShellRecord, ViewerState,
+    NEUTRAL_GRAY, Selection, ShadingMode, ShellRecord, SolidifyJob, ViewerState,
 };
 use crate::viewer_material::{ViewerMaterial, ViewerMaterialExt};
 
@@ -1691,5 +1694,367 @@ pub(crate) fn on_clip_plane_drag_end(
     }
     if handle_q.get(event.entity).is_ok() {
         drag_state.dragging = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Solidify Clip: boolean-AND with half-space boxes for each active clip plane
+// ---------------------------------------------------------------------------
+
+/// Kick off a background thread that performs the boolean AND operation.
+pub(crate) fn start_solidify_clip(mut state: ResMut<ViewerState>) {
+    if !state.start_solidify {
+        return;
+    }
+    state.start_solidify = false;
+
+    // Gather the first solid topology from scene_data.
+    let scene = match state.scene_data.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Find a shell with solid topology.
+    let (solid_data, tol) = {
+        let mut found = None;
+        for shell in &scene.shells {
+            if let Some(StepTopology::Solid(ref data)) = shell.topology {
+                found = Some((data.clone(), shell.tessellation_tolerance));
+                break;
+            }
+        }
+        match found {
+            Some(v) => v,
+            None => {
+                state.error = Some("No solid topology found".to_string());
+                return;
+            }
+        }
+    };
+
+    // Compute bounds from scene mesh data (world-space, pre-normalization).
+    let bounds = match compute_bounds(scene) {
+        Some(b) => b,
+        None => {
+            state.error = Some("Cannot compute bounds for solidify".to_string());
+            return;
+        }
+    };
+
+    // Collect active clip planes with their world-space positions.
+    let mut active_clips: Vec<(usize, f64, bool)> = Vec::new();
+    for (i, cp) in state.clip_planes.iter().enumerate() {
+        if !cp.enabled {
+            continue;
+        }
+        let t = cp.position as f64 / 1000.0;
+        let axis_min = match i {
+            0 => bounds.min.x as f64,
+            1 => bounds.min.y as f64,
+            _ => bounds.min.z as f64,
+        };
+        let axis_max = match i {
+            0 => bounds.max.x as f64,
+            1 => bounds.max.y as f64,
+            _ => bounds.max.z as f64,
+        };
+        let world_pos = axis_min + t * (axis_max - axis_min);
+        active_clips.push((i, world_pos, cp.flip));
+    }
+
+    if active_clips.is_empty() {
+        return;
+    }
+
+    // Spawn background thread.
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let result = solidify_clip_inner(&solid_data, &active_clips, tol);
+        let _ = tx.send(result);
+    });
+
+    state.solidify_job = Some(SolidifyJob {
+        receiver: parking_lot::Mutex::new(rx),
+    });
+    info!("Started solidify-clip background job");
+}
+
+/// Perform boolean AND of solid with half-space boxes (runs on background thread).
+fn solidify_clip_inner(
+    solid_data: &CompressedShellData,
+    active_clips: &[(usize, f64, bool)],
+    tol: f64,
+) -> Result<StepScene, String> {
+    use monstertruck::meshing::prelude::{BoundingBox, Point3, RobustMeshableShape};
+    use monstertruck::solid::and as solid_and;
+    use monstertruck::step::load::step_geometry::{Curve3D, Surface};
+    use monstertruck::topology::compress::CompressedSolid;
+    use monstertruck::topology::Solid;
+
+    type StepSolid = Solid<Point3, Curve3D, Surface>;
+    type StepCompressedSolid = CompressedSolid<Point3, Curve3D, Surface>;
+
+    // Downcast and extract the solid.
+    let csolid: &StepCompressedSolid = solid_data
+        .downcast_ref::<StepCompressedSolid>()
+        .ok_or_else(|| "Failed to downcast CompressedShellData to CompressedSolid".to_string())?;
+
+    let mut current_solid: StepSolid = StepSolid::extract(csolid.clone())
+        .map_err(|e| format!("Failed to extract solid: {}", e))?;
+
+    // Apply each active clip plane as a boolean AND with a half-space box.
+    let big = 1e6;
+    for &(axis, world_pos, flip) in active_clips {
+        // Build the half-space bounding box.
+        // Default (no flip): keep the positive side (world_pos .. +big).
+        // With flip: keep the negative side (-big .. world_pos).
+        let (min_pt, max_pt) = match axis {
+            0 => {
+                // X axis
+                if flip {
+                    (
+                        Point3::new(-big, -big, -big),
+                        Point3::new(world_pos, big, big),
+                    )
+                } else {
+                    (
+                        Point3::new(world_pos, -big, -big),
+                        Point3::new(big, big, big),
+                    )
+                }
+            }
+            1 => {
+                // Y axis
+                if flip {
+                    (
+                        Point3::new(-big, -big, -big),
+                        Point3::new(big, world_pos, big),
+                    )
+                } else {
+                    (
+                        Point3::new(-big, world_pos, -big),
+                        Point3::new(big, big, big),
+                    )
+                }
+            }
+            _ => {
+                // Z axis
+                if flip {
+                    (
+                        Point3::new(-big, -big, -big),
+                        Point3::new(big, big, world_pos),
+                    )
+                } else {
+                    (
+                        Point3::new(-big, -big, world_pos),
+                        Point3::new(big, big, big),
+                    )
+                }
+            }
+        };
+
+        let bbox = BoundingBox::from_iter([min_pt, max_pt]);
+        let halfspace: StepSolid = monstertruck::modeling::primitive::cuboid(bbox);
+
+        current_solid = solid_and(&current_solid, &halfspace, tol)
+            .map_err(|e| format!("Boolean AND failed on axis {}: {:?}", axis, e))?;
+    }
+
+    // Compress the result and re-tessellate.
+    let compressed = current_solid.compress();
+    let clipped_solid_data = CompressedShellData::new(compressed.clone());
+
+    // Tessellate each boundary shell of the solid.
+    let mut all_shells: Vec<StepShell> = Vec::new();
+    for (boundary_idx, boundary) in compressed.boundaries.iter().enumerate() {
+        let poly_shell = boundary.robust_triangulation(tol);
+
+        // Extract faces from the tessellated shell.
+        let mut all_edges: Vec<([f64; 3], [f64; 3])> = Vec::new();
+        let faces: Vec<StepFace> = poly_shell
+            .faces
+            .iter()
+            .enumerate()
+            .filter_map(|(face_idx, face)| {
+                face.surface.as_ref().map(|surface| {
+                    let mesh = match face.orientation {
+                        true => surface.clone(),
+                        false => surface.inverse(),
+                    };
+
+                    // Extract boundary loop topology.
+                    let boundary_loops: Vec<StepBoundaryLoop> = face
+                        .boundaries
+                        .iter()
+                        .enumerate()
+                        .map(|(loop_idx, loop_edges)| StepBoundaryLoop {
+                            edge_indices: loop_edges
+                                .iter()
+                                .map(|ei| ei.index)
+                                .collect(),
+                            is_outer: loop_idx == 0,
+                        })
+                        .collect();
+
+                    StepFace {
+                        id: face_idx,
+                        name: format!("Face {}", face_idx + 1),
+                        mesh,
+                        boundary_loops,
+                    }
+                })
+            })
+            .collect();
+
+        // Extract curve edges.
+        let curve_edges: Vec<StepEdge> = poly_shell
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(i, edge)| {
+                let points = edge.curve.iter().map(|p| [p.x, p.y, p.z]).collect();
+                StepEdge {
+                    id: i,
+                    curve_type: "Unknown".to_string(),
+                    points,
+                }
+            })
+            .collect();
+
+        all_shells.push(StepShell {
+            id: boundary_idx,
+            name: format!("Shell {} (clipped)", boundary_idx + 1),
+            faces,
+            color: None,
+            transform: None,
+            edges: all_edges,
+            curve_edges,
+            original_shell: None,
+            topology: Some(StepTopology::Solid(clipped_solid_data.clone())),
+            tessellation_tolerance: tol,
+        });
+    }
+
+    if all_shells.is_empty() {
+        return Err("Boolean clipping produced no shells".to_string());
+    }
+
+    Ok(StepScene {
+        metadata: monster_step_viewer::StepMetadata::default(),
+        shells: all_shells,
+    })
+}
+
+/// Poll for solidify-clip completion and apply the result.
+pub(crate) fn poll_solidify_clip(
+    mut state: ResMut<ViewerState>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ViewerMaterial>>,
+    existing_meshes: Query<Entity, With<FaceMesh>>,
+    clip_handles: Query<Entity, With<ClipPlaneHandle>>,
+) {
+    let job = match state.solidify_job.as_ref() {
+        Some(j) => j,
+        None => return,
+    };
+
+    let result = {
+        let receiver = job.receiver.lock();
+        match receiver.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                state.solidify_job = None;
+                state.error =
+                    Some("Solidify job thread terminated unexpectedly".to_string());
+                return;
+            }
+        }
+    };
+
+    // Clear the job.
+    state.solidify_job = None;
+
+    match result {
+        Ok(new_scene) => {
+            info!(
+                "Solidify-clip completed: {} shells, {} total faces",
+                new_scene.shells.len(),
+                new_scene.shells.iter().map(|s| s.faces.len()).sum::<usize>(),
+            );
+
+            // Despawn all existing face mesh entities.
+            for entity in existing_meshes.iter() {
+                commands.entity(entity).despawn();
+            }
+            // Remove clip-plane handles — they'll be re-created if needed.
+            for entity in clip_handles.iter() {
+                commands.entity(entity).despawn();
+            }
+
+            // Clear records.
+            state.shells.clear();
+            state.faces.clear();
+            state.edges.clear();
+            state.loops.clear();
+            state.selection = None;
+            state.prev_selection = None;
+
+            // Compute bounds for the new scene and spawn meshes.
+            let bounds = compute_bounds(&new_scene);
+            if let Some(bounds) = bounds {
+                let size = bounds.max - bounds.min;
+                let max_dim = size.x.max(size.y).max(size.z);
+                let scale = if max_dim > 0.0 { 1.0 / max_dim } else { 1.0 };
+
+                state.scene_center = bounds.center;
+                state.scene_scale = scale;
+
+                for shell in &new_scene.shells {
+                    spawn_shell_faces_normalized(
+                        shell,
+                        &mut commands,
+                        &mut meshes,
+                        &mut materials,
+                        &mut state,
+                        bounds.center,
+                        scale,
+                    );
+                }
+
+                state.current_bounds = Some(Bounds {
+                    center: Vec3::ZERO,
+                    min: (bounds.min - bounds.center) * scale,
+                    max: (bounds.max - bounds.center) * scale,
+                });
+            }
+
+            // Update scene_data.
+            state.scene_data = Some(new_scene);
+
+            // Update solid topology flag.
+            state.has_solid_topology = state
+                .scene_data
+                .as_ref()
+                .is_some_and(|scene| {
+                    scene.shells.iter().any(|s| {
+                        matches!(
+                            s.topology,
+                            Some(StepTopology::Solid(_))
+                        )
+                    })
+                });
+
+            // Trigger material updates.
+            state.clip_planes_dirty = true;
+            state.shading_mode_changed = true;
+            state.visibility_changed = true;
+        }
+        Err(err) => {
+            error!("Solidify-clip failed: {}", err);
+            state.error = Some(format!("Solidify failed: {}", err));
+        }
     }
 }

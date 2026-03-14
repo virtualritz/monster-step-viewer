@@ -1030,6 +1030,39 @@ fn viewer_ui(
                                 }
                                 clip_btn.on_hover_text(format!("Clip {} axis", clip_labels[i]));
                             }
+
+                            ui.separator();
+
+                            // Solidify Clip button.
+                            let any_clip_active = state.clip_planes.iter().any(|c| c.enabled);
+                            let is_processing = state.solidify_job.is_some();
+                            let can_solidify = state.has_solid_topology && any_clip_active && !is_processing;
+
+                            if is_processing {
+                                ui.spinner();
+                                ui.label(
+                                    egui::RichText::new("Processing...")
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                );
+                            } else {
+                                let solidify_btn = ui.add_enabled(
+                                    can_solidify,
+                                    egui::Button::new(
+                                        egui::RichText::new("Solidify").strong(),
+                                    ),
+                                );
+                                if solidify_btn.clicked() {
+                                    state.start_solidify = true;
+                                }
+                                if !state.has_solid_topology {
+                                    solidify_btn.on_hover_text("Only for STEP solids");
+                                } else if !any_clip_active {
+                                    solidify_btn.on_hover_text("Enable clip planes first");
+                                } else {
+                                    solidify_btn.on_hover_text("Boolean-clip the solid using active clip planes");
+                                }
+                            }
                         });
                     });
                 });
