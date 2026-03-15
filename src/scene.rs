@@ -14,6 +14,7 @@ use monster_step_viewer::{
 };
 use monstertruck::meshing::prelude::PolygonMesh;
 use rayon::prelude::*;
+use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
 
 use crate::state::{
@@ -104,8 +105,25 @@ pub(crate) fn process_load_requests(
     existing_meshes: Query<Entity, With<FaceMesh>>,
     clip_handles: Query<Entity, With<ClipPlaneHandle>>,
 ) {
-    // Start a new load if requested.
-    if let Some(path) = state.pending_path.take() {
+    // Determine the load source: local file path or fetched URL data.
+    let load_source = if let Some(path) = state.pending_path.take() {
+        let receiver = monster_step_viewer::load_step_file_streaming(
+            path.clone(),
+            state.tessellation_factor,
+        );
+        Some((path, receiver))
+    } else if let Some(data) = state.pending_url_data.take() {
+        let path = PathBuf::from("(URL)");
+        let receiver = monster_step_viewer::load_step_from_string_streaming(
+            data,
+            state.tessellation_factor,
+        );
+        Some((path, receiver))
+    } else {
+        None
+    };
+
+    if let Some((path, receiver)) = load_source {
         for entity in existing_meshes.iter() {
             commands.entity(entity).despawn();
         }
@@ -124,10 +142,6 @@ pub(crate) fn process_load_requests(
         state.error = None;
         state.scene_data = None;
 
-        let receiver = monster_step_viewer::load_step_file_streaming(
-            path.clone(),
-            state.tessellation_factor,
-        );
         state.loading_job = Some(LoadJob {
             path,
             receiver: parking_lot::Mutex::new(receiver),
@@ -1798,12 +1812,12 @@ fn solidify_clip_inner(
     use monstertruck::modeling::Surface as ModelingSurface;
     use monstertruck::modeling::Invertible;
     use monstertruck::solid::and as solid_and;
-    use monstertruck::step::load::step_geometry::{Curve3D, Surface};
-    use monstertruck::topology::compress::CompressedSolid;
+    use monstertruck::step::load::step_geometry::{Curve3D, Surface, Pcurve};
+    use monstertruck::topology::compress::CompressedTrimmedSolid;
     use monstertruck::topology::Solid;
 
     type StepSolid = Solid<Point3, Curve3D, Surface>;
-    type StepCompressedSolid = CompressedSolid<Point3, Curve3D, Surface>;
+    type StepCompressedSolid = CompressedTrimmedSolid<Point3, Curve3D, Surface, Pcurve>;
     type ModelingSolid = Solid<Point3, ModelingCurve, ModelingSurface>;
 
     // Downcast and extract the solid.
@@ -1811,7 +1825,7 @@ fn solidify_clip_inner(
         .downcast_ref::<StepCompressedSolid>()
         .ok_or_else(|| "Failed to downcast CompressedShellData to CompressedSolid".to_string())?;
 
-    let current_solid: StepSolid = StepSolid::extract(csolid.clone())
+    let current_solid: StepSolid = StepSolid::extract(csolid.clone().erase_trims())
         .map_err(|e| format!("Failed to extract solid: {}", e))?;
 
     let mut current_solid: ModelingSolid = current_solid.try_mapped(
@@ -1888,7 +1902,7 @@ fn solidify_clip_inner(
         let poly_shell = boundary.robust_triangulation(tol);
 
         // Extract faces from the tessellated shell.
-        let mut all_edges: Vec<([f64; 3], [f64; 3])> = Vec::new();
+        let all_edges: Vec<([f64; 3], [f64; 3])> = Vec::new();
         let faces: Vec<StepFace> = poly_shell
             .faces
             .iter()

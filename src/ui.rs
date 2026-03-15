@@ -21,6 +21,33 @@ use bevy_egui::{EguiContextSettings, EguiContexts, PrimaryEguiContext, egui};
 use monster_step_viewer::Parameter;
 use std::cell::Cell;
 
+/// Clickable collapse/expand arrow drawn with the painter (font-independent).
+fn collapse_arrow(ui: &mut egui::Ui, is_open: bool) -> egui::Response {
+    let size = egui::vec2(ui.spacing().indent, ui.spacing().interact_size.y);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let center = rect.center();
+        let half = 4.0;
+        let color = ui.visuals().text_color();
+        let points = if is_open {
+            vec![
+                egui::pos2(center.x - half, center.y - half * 0.5),
+                egui::pos2(center.x + half, center.y - half * 0.5),
+                egui::pos2(center.x, center.y + half * 0.5),
+            ]
+        } else {
+            vec![
+                egui::pos2(center.x - half * 0.5, center.y - half),
+                egui::pos2(center.x + half * 0.5, center.y),
+                egui::pos2(center.x - half * 0.5, center.y + half),
+            ]
+        };
+        ui.painter()
+            .add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+    }
+    resp
+}
+
 /// Check if a Parameter is a leaf (non-recursive) value.
 fn is_leaf_param(p: &Parameter) -> bool {
     matches!(
@@ -185,6 +212,10 @@ pub(crate) fn ui_system(
                     }
                     ui.close();
                 }
+                if ui.button("Open URL\u{2026}").clicked() {
+                    state.show_url_dialog = true;
+                    ui.close();
+                }
             });
 
             if state.mode == AppMode::Browser {
@@ -260,6 +291,81 @@ pub(crate) fn ui_system(
             );
         });
     });
+
+    // --- Open URL dialog ---
+    if state.show_url_dialog {
+        let mut open = true;
+        let mut submit = false;
+        egui::Window::new("Open URL")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("URL:");
+                    let resp = ui.text_edit_singleline(&mut state.url_input);
+                    if resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        submit = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Fetch").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        state.show_url_dialog = false;
+                    }
+                });
+            });
+        if submit {
+            let url = state.url_input.trim().to_string();
+            if !url.is_empty() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let request = ehttp::Request::get(&url);
+                ehttp::fetch(request, move |result| {
+                    let msg = match result {
+                        Ok(resp) if resp.ok => match resp.text() {
+                            Some(text) => Ok(text.to_string()),
+                            None => Err(
+                                "Response is not valid UTF-8 text".to_string(),
+                            ),
+                        },
+                        Ok(resp) => Err(format!(
+                            "HTTP {} {}",
+                            resp.status, resp.status_text
+                        )),
+                        Err(e) => Err(e),
+                    };
+                    let _ = tx.send(msg);
+                });
+                state.url_fetch = Some(parking_lot::Mutex::new(rx));
+                state.show_url_dialog = false;
+            }
+        }
+        if !open {
+            state.show_url_dialog = false;
+        }
+    }
+
+    // --- Poll URL fetch result ---
+    if let Some(ref fetch) = state.url_fetch {
+        let receiver = fetch.lock();
+        if let Ok(result) = receiver.try_recv() {
+            drop(receiver);
+            state.url_fetch = None;
+            match result {
+                Ok(step_text) => {
+                    state.pending_url_data = Some(step_text);
+                }
+                Err(e) => {
+                    state.error = Some(format!("URL fetch failed: {e}"));
+                }
+            }
+        }
+    }
 
     match state.mode {
         AppMode::Viewer => {
@@ -466,7 +572,7 @@ fn viewer_ui(
                                 header = header.open(Some(true));
                             }
 
-                            header.show(ui, |ui| {
+                            let shell_resp = header.show(ui, |ui| {
                                 if !shell_visible {
                                     ui.disable();
                                 }
@@ -485,6 +591,13 @@ fn viewer_ui(
 
                                     if has_loops {
                                         // Collapsible face with loops/edges.
+                                        // Arrow toggles collapse, label text selects.
+                                        let face_sel =
+                                            current_selection == Some(Selection::Face(face_id));
+                                        let face_state_id = ui.make_persistent_id(format!("face_{}", face_id));
+                                        let mut face_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                                            ui.ctx(), face_state_id, false,
+                                        );
                                         ui.horizontal(|ui| {
                                             let mut fvis = face.visible;
                                             if ui.checkbox(&mut fvis, "").changed() {
@@ -495,26 +608,75 @@ fn viewer_ui(
                                             }
                                             ui.colored_label(color, "\u{25a0}");
 
-                                            let face_sel =
-                                                current_selection == Some(Selection::Face(face_id));
-                                            let face_header_text = if face_sel {
-                                                egui::RichText::new(format!(
-                                                    "{} ({} tris)",
-                                                    face.name, face.triangles
-                                                ))
-                                                .color(egui::Color32::from_rgb(255, 217, 0))
-                                            } else {
-                                                egui::RichText::new(format!(
-                                                    "{} ({} tris)",
-                                                    face.name, face.triangles
-                                                ))
-                                            };
-                                            let face_resp = egui::CollapsingHeader::new(
-                                                face_header_text,
-                                            )
-                                            .id_salt(format!("face_{}", face_id))
-                                            .default_open(false)
-                                            .show(ui, |ui| {
+                                            // Arrow button for collapse/expand.
+                                            if collapse_arrow(ui, face_state.is_open()).clicked() {
+                                                face_state.toggle(ui);
+                                            }
+
+                                            // Selectable label for selection.
+                                            let face_text = format!(
+                                                "{} ({} tris)",
+                                                face.name, face.triangles
+                                            );
+                                            let label = ui.selectable_label(face_sel, face_text);
+                                            if label.clicked() {
+                                                new_selection.set(Some(if face_sel {
+                                                    None
+                                                } else {
+                                                    Some(Selection::Face(face_id))
+                                                }));
+                                            }
+                                            if label.hovered() {
+                                                new_hover.set(Some(Selection::Face(face_id)));
+                                            }
+                                            if viewport_selected && face_sel {
+                                                label.scroll_to_me(Some(egui::Align::Center));
+                                            }
+                                            // RMB context menu for edge visibility.
+                                            let face_loop_ids = face.loop_ids.clone();
+                                            label.context_menu(|ui| {
+                                                let all_edge_ids: Vec<usize> = face_loop_ids.iter()
+                                                    .flat_map(|lid| {
+                                                        loop_snaps.iter()
+                                                            .find(|l| l.id == *lid)
+                                                            .map(|l| l.edge_ids.clone())
+                                                            .unwrap_or_default()
+                                                    })
+                                                    .collect();
+                                                let all_vis = all_edge_ids.iter().all(|eid| {
+                                                    edge_snaps.iter().find(|e| e.id == *eid).is_some_and(|e| e.visible)
+                                                });
+                                                let none_vis = all_edge_ids.iter().all(|eid| {
+                                                    edge_snaps.iter().find(|e| e.id == *eid).is_some_and(|e| !e.visible)
+                                                });
+                                                if ui.add_enabled(!all_vis, egui::Button::new("Show All Edges")).clicked() {
+                                                    edge_vis_changed.set(true);
+                                                    let mut changes = edge_vis_changes.take();
+                                                    for &eid in &all_edge_ids { changes.push((eid, true)); }
+                                                    edge_vis_changes.set(changes);
+                                                    ui.close();
+                                                }
+                                                if ui.add_enabled(!none_vis, egui::Button::new("Hide All Edges")).clicked() {
+                                                    edge_vis_changed.set(true);
+                                                    let mut changes = edge_vis_changes.take();
+                                                    for &eid in &all_edge_ids { changes.push((eid, false)); }
+                                                    edge_vis_changes.set(changes);
+                                                    ui.close();
+                                                }
+                                                if ui.button("Invert Edge Visibility").clicked() {
+                                                    edge_vis_changed.set(true);
+                                                    let mut changes = edge_vis_changes.take();
+                                                    for &eid in &all_edge_ids {
+                                                        let cur = edge_snaps.iter().find(|e| e.id == eid).is_some_and(|e| e.visible);
+                                                        changes.push((eid, !cur));
+                                                    }
+                                                    edge_vis_changes.set(changes);
+                                                    ui.close();
+                                                }
+                                            });
+                                        });
+                                        face_state.show_body_unindented(ui, |ui| {
+                                            ui.indent(face_state_id, |ui| {
                                                 for &loop_id in &face.loop_ids {
                                                     let Some(loop_rec) =
                                                         loop_snaps.iter().find(|l| l.id == loop_id)
@@ -535,13 +697,10 @@ fn viewer_ui(
 
                                                     let loop_sel = current_selection
                                                         == Some(Selection::Loop(loop_id));
-                                                    let loop_header_text = if loop_sel {
-                                                        egui::RichText::new(&loop_label).color(
-                                                            egui::Color32::from_rgb(255, 217, 0),
-                                                        )
-                                                    } else {
-                                                        egui::RichText::new(&loop_label)
-                                                    };
+                                                    let loop_state_id = ui.make_persistent_id(format!("loop_{}", loop_id));
+                                                    let mut loop_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                                                        ui.ctx(), loop_state_id, false,
+                                                    );
                                                     ui.horizontal(|ui| {
                                                         let mut trim = loop_rec.trimming_active;
                                                         if ui.checkbox(&mut trim, "").changed() {
@@ -550,101 +709,124 @@ fn viewer_ui(
                                                             changes.push((loop_id, trim));
                                                             loop_trim_changes.set(changes);
                                                         }
-                                                        let loop_resp =
-                                                            egui::CollapsingHeader::new(
-                                                                loop_header_text,
-                                                            )
-                                                            .id_salt(format!("loop_{}", loop_id))
-                                                            .default_open(false)
-                                                            .show(ui, |ui| {
-                                                                // Edge entries.
-                                                                for &edge_id in &loop_rec.edge_ids {
-                                                                    let Some(edge) = edge_snaps
-                                                                        .iter()
-                                                                        .find(|e| e.id == edge_id)
-                                                                    else {
-                                                                        continue;
-                                                                    };
-                                                                    ui.horizontal(|ui| {
-                                                                        let mut evis = edge.visible;
-                                                                        if ui
-                                                                            .checkbox(&mut evis, "")
-                                                                            .changed()
-                                                                        {
-                                                                            edge_vis_changed
-                                                                                .set(true);
-                                                                            let mut changes =
-                                                                                edge_vis_changes
-                                                                                    .take();
-                                                                            changes.push((
-                                                                                edge_id, evis,
-                                                                            ));
-                                                                            edge_vis_changes
-                                                                                .set(changes);
-                                                                        }
-                                                                        let is_sel =
-                                                                            current_selection
-                                                                                == Some(
-                                                                                    Selection::Edge(
-                                                                                        edge_id,
-                                                                                    ),
-                                                                                );
-                                                                        let edge_resp = ui
-                                                                            .selectable_label(
-                                                                                is_sel,
-                                                                                format!(
-                                                                                "{} ({} pts)",
-                                                                                edge.name,
-                                                                                edge.point_count
-                                                                            ),
-                                                                            );
-                                                                        if edge_resp.clicked()
-                                                                        {
-                                                                            new_selection.set(
-                                                                                Some(if is_sel {
-                                                                                    None
-                                                                                } else {
-                                                                                    Some(
-                                                                                    Selection::Edge(
-                                                                                        edge_id,
-                                                                                    ),
-                                                                                )
-                                                                                }),
-                                                                            );
-                                                                        }
-                                                                        if edge_resp.hovered() {
-                                                                            new_hover.set(Some(Selection::Edge(edge_id)));
-                                                                        }
-                                                                    });
-                                                                }
-                                                            });
-                                                        if loop_resp.header_response.clicked() {
+
+                                                        // Arrow button for collapse/expand.
+                                                        if collapse_arrow(ui, loop_state.is_open()).clicked() {
+                                                            loop_state.toggle(ui);
+                                                        }
+
+                                                        // Selectable label for selection.
+                                                        let label = ui.selectable_label(loop_sel, &loop_label);
+                                                        if label.clicked() {
                                                             new_selection.set(Some(if loop_sel {
                                                                 None
                                                             } else {
                                                                 Some(Selection::Loop(loop_id))
                                                             }));
                                                         }
-                                                        if loop_resp.header_response.hovered() {
+                                                        if label.hovered() {
                                                             new_hover.set(Some(Selection::Loop(loop_id)));
                                                         }
-                                                    }); // close ui.horizontal for loop
+                                                        // RMB context menu for edge visibility in this loop.
+                                                        let loop_edge_ids = loop_rec.edge_ids.clone();
+                                                        label.context_menu(|ui| {
+                                                            let all_vis = loop_edge_ids.iter().all(|eid| {
+                                                                edge_snaps.iter().find(|e| e.id == *eid).is_some_and(|e| e.visible)
+                                                            });
+                                                            let none_vis = loop_edge_ids.iter().all(|eid| {
+                                                                edge_snaps.iter().find(|e| e.id == *eid).is_some_and(|e| !e.visible)
+                                                            });
+                                                            if ui.add_enabled(!all_vis, egui::Button::new("Show All")).clicked() {
+                                                                edge_vis_changed.set(true);
+                                                                let mut changes = edge_vis_changes.take();
+                                                                for &eid in &loop_edge_ids { changes.push((eid, true)); }
+                                                                edge_vis_changes.set(changes);
+                                                                ui.close();
+                                                            }
+                                                            if ui.add_enabled(!none_vis, egui::Button::new("Hide All")).clicked() {
+                                                                edge_vis_changed.set(true);
+                                                                let mut changes = edge_vis_changes.take();
+                                                                for &eid in &loop_edge_ids { changes.push((eid, false)); }
+                                                                edge_vis_changes.set(changes);
+                                                                ui.close();
+                                                            }
+                                                            if ui.button("Invert").clicked() {
+                                                                edge_vis_changed.set(true);
+                                                                let mut changes = edge_vis_changes.take();
+                                                                for &eid in &loop_edge_ids {
+                                                                    let cur = edge_snaps.iter().find(|e| e.id == eid).is_some_and(|e| e.visible);
+                                                                    changes.push((eid, !cur));
+                                                                }
+                                                                edge_vis_changes.set(changes);
+                                                                ui.close();
+                                                            }
+                                                        });
+                                                    });
+                                                    loop_state.show_body_unindented(ui, |ui| {
+                                                        ui.indent(loop_state_id, |ui| {
+                                                            for &edge_id in &loop_rec.edge_ids {
+                                                                let Some(edge) = edge_snaps
+                                                                    .iter()
+                                                                    .find(|e| e.id == edge_id)
+                                                                else {
+                                                                    continue;
+                                                                };
+                                                                ui.horizontal(|ui| {
+                                                                    let mut evis = edge.visible;
+                                                                    if ui
+                                                                        .checkbox(&mut evis, "")
+                                                                        .changed()
+                                                                    {
+                                                                        edge_vis_changed
+                                                                            .set(true);
+                                                                        let mut changes =
+                                                                            edge_vis_changes
+                                                                                .take();
+                                                                        changes.push((
+                                                                            edge_id, evis,
+                                                                        ));
+                                                                        edge_vis_changes
+                                                                            .set(changes);
+                                                                    }
+                                                                    let is_sel =
+                                                                        current_selection
+                                                                            == Some(
+                                                                                Selection::Edge(
+                                                                                    edge_id,
+                                                                                ),
+                                                                            );
+                                                                    let edge_resp = ui
+                                                                        .selectable_label(
+                                                                            is_sel,
+                                                                            format!(
+                                                                            "{} ({} pts)",
+                                                                            edge.name,
+                                                                            edge.point_count
+                                                                        ),
+                                                                        );
+                                                                    if edge_resp.clicked()
+                                                                    {
+                                                                        new_selection.set(
+                                                                            Some(if is_sel {
+                                                                                None
+                                                                            } else {
+                                                                                Some(
+                                                                                Selection::Edge(
+                                                                                    edge_id,
+                                                                                ),
+                                                                            )
+                                                                            }),
+                                                                        );
+                                                                    }
+                                                                    if edge_resp.hovered() {
+                                                                        new_hover.set(Some(Selection::Edge(edge_id)));
+                                                                    }
+                                                                });
+                                                            }
+                                                        });
+                                                    });
                                                 }
                                             });
-                                            if face_resp.header_response.clicked() {
-                                                new_selection.set(Some(if face_sel {
-                                                    None
-                                                } else {
-                                                    Some(Selection::Face(face_id))
-                                                }));
-                                            }
-                                            if face_resp.header_response.hovered() {
-                                                new_hover.set(Some(Selection::Face(face_id)));
-                                            }
-                                            // Scroll to this face when selected from viewport.
-                                            if viewport_selected && face_sel {
-                                                face_resp.header_response.scroll_to_me(Some(egui::Align::Center));
-                                            }
                                         });
                                     } else {
                                         // Simple face label (no loops).
@@ -729,6 +911,43 @@ fn viewer_ui(
                                             });
                                         }
                                     });
+                                }
+                            });
+                            // Right-click context menu on shell header.
+                            shell_resp.header_response.context_menu(|ui| {
+                                let all_visible = face_ids.iter().all(|fid| {
+                                    face_snaps.iter().find(|f| f.id == *fid).is_some_and(|f| f.visible)
+                                });
+                                let none_visible = face_ids.iter().all(|fid| {
+                                    face_snaps.iter().find(|f| f.id == *fid).is_some_and(|f| !f.visible)
+                                });
+                                if ui.add_enabled(!all_visible, egui::Button::new("Show All")).clicked() {
+                                    vis_changed.set(true);
+                                    let mut changes = face_vis_changes.take();
+                                    for &fid in &face_ids {
+                                        changes.push((fid, true));
+                                    }
+                                    face_vis_changes.set(changes);
+                                    ui.close();
+                                }
+                                if ui.add_enabled(!none_visible, egui::Button::new("Hide All")).clicked() {
+                                    vis_changed.set(true);
+                                    let mut changes = face_vis_changes.take();
+                                    for &fid in &face_ids {
+                                        changes.push((fid, false));
+                                    }
+                                    face_vis_changes.set(changes);
+                                    ui.close();
+                                }
+                                if ui.button("Invert").clicked() {
+                                    vis_changed.set(true);
+                                    let mut changes = face_vis_changes.take();
+                                    for &fid in &face_ids {
+                                        let cur = face_snaps.iter().find(|f| f.id == fid).is_some_and(|f| f.visible);
+                                        changes.push((fid, !cur));
+                                    }
+                                    face_vis_changes.set(changes);
+                                    ui.close();
                                 }
                             });
                         });

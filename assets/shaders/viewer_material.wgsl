@@ -50,21 +50,21 @@ fn fragment(
 ) -> FragmentOutput {
     // --- Clip plane discard ---
     let world_pos = in.world_position.xyz;
-    let active = viewer_ext.clip_active.x;
+    let clip_mask = viewer_ext.clip_active.x;
 
-    if (active & 1u) != 0u {
+    if (clip_mask & 1u) != 0u {
         let plane = viewer_ext.clip_plane_0;
         if dot(plane.xyz, world_pos) + plane.w > 0.0 {
             discard;
         }
     }
-    if (active & 2u) != 0u {
+    if (clip_mask & 2u) != 0u {
         let plane = viewer_ext.clip_plane_1;
         if dot(plane.xyz, world_pos) + plane.w > 0.0 {
             discard;
         }
     }
-    if (active & 4u) != 0u {
+    if (clip_mask & 4u) != 0u {
         let plane = viewer_ext.clip_plane_2;
         if dot(plane.xyz, world_pos) + plane.w > 0.0 {
             discard;

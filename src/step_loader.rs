@@ -7,16 +7,16 @@ use monstertruck::{
     meshing::prelude::*,
     step::load::{
         Table,
-        step_geometry::{Curve3D, Surface},
+        step_geometry::{Curve3D, Surface, Pcurve},
     },
-    topology::compress::CompressedShell,
+    topology::compress::CompressedTrimmedShell,
 };
 use monstertruck::step::load::ruststep::{
     ast::Name,
     parser::parse,
     tables::PlaceHolder,
 };
-type OriginalShell = CompressedShell<Point3, Curve3D, Surface>;
+type OriginalShell = CompressedTrimmedShell<Point3, Curve3D, Surface, Pcurve>;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::{
@@ -91,10 +91,10 @@ impl std::fmt::Debug for CompressedShellData {
 #[derive(Clone, Debug)]
 pub enum StepTopology {
     /// From `manifold_solid_brep` — watertight, suitable for boolean ops.
-    /// Wraps a `CompressedSolid<Point3, Curve3D, Surface>`.
+    /// Wraps a `CompressedTrimmedSolid<Point3, Curve3D, Surface, Pcurve>`.
     Solid(CompressedShellData),
     /// From `shell_based_surface_model` or standalone shell — open surface.
-    /// Wraps a `CompressedShell<Point3, Curve3D, Surface>`.
+    /// Wraps a `CompressedTrimmedShell<Point3, Curve3D, Surface, Pcurve>`.
     Shell(CompressedShellData),
 }
 
@@ -236,7 +236,7 @@ fn build_topology_for_shell(
         } else {
             // Convert the solid.
             let solid_holder = table.manifold_solid_brep.get(&solid_id)?;
-            match table.to_compressed_solid(solid_holder) {
+            match table.to_compressed_trimmed_solid(solid_holder) {
                 Ok(solid) => {
                     let data = CompressedShellData::new(solid);
                     cache.insert(solid_id, data.clone());
@@ -312,7 +312,7 @@ pub fn load_step_file_with_progress(
         .enumerate()
         .map(|(local_idx, (shell_id, shell_holder))| {
             let compressed =
-                table.to_compressed_shell(shell_holder).map_err(|e| {
+                table.to_compressed_trimmed_shell(shell_holder).map_err(|e| {
                     anyhow::anyhow!(
                         "Failed to convert STEP shell into topology: {e}"
                     )
@@ -488,7 +488,17 @@ pub fn load_step_file_streaming(
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        if let Err(e) = load_step_streaming_inner(&path, &tx, tolerance_factor)
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(LoadMessage::Error(format!(
+                    "Failed to read STEP file {}: {e}",
+                    path.display()
+                )));
+                return;
+            }
+        };
+        if let Err(e) = load_step_from_string_inner(raw, &tx, tolerance_factor)
         {
             let _ = tx.send(LoadMessage::Error(e.to_string()));
         }
@@ -497,14 +507,30 @@ pub fn load_step_file_streaming(
     rx
 }
 
-fn load_step_streaming_inner(
-    path: &Path,
+/// Start loading STEP data from a string in a background thread, streaming
+/// results via channel.
+pub fn load_step_from_string_streaming(
+    data: String,
+    tolerance_factor: f64,
+) -> Receiver<LoadMessage> {
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        if let Err(e) = load_step_from_string_inner(data, &tx, tolerance_factor)
+        {
+            let _ = tx.send(LoadMessage::Error(e.to_string()));
+        }
+    });
+
+    rx
+}
+
+fn load_step_from_string_inner(
+    raw: String,
     tx: &Sender<LoadMessage>,
     tolerance_factor: f64,
 ) -> anyhow::Result<()> {
-    let raw = std::fs::read_to_string(path).with_context(|| {
-        format!("Failed to read STEP file {}", path.display())
-    })?;
+    let raw = &raw;
 
     // Parse colors from raw STEP content.
     let entity_colors = parse_step_colors(&raw);
@@ -593,7 +619,7 @@ fn load_step_streaming_inner(
                 transform.map(|t| [t.cols[3][0], t.cols[3][1], t.cols[3][2]])
             );
 
-            let compressed = match table.to_compressed_shell(shell_holder) {
+            let compressed = match table.to_compressed_trimmed_shell(shell_holder) {
                 Ok(c) => c,
                 Err(e) => {
                     *error.lock() = Some(format!(

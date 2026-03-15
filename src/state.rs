@@ -153,6 +153,14 @@ pub(crate) struct ViewerState {
     pub solidify_job: Option<SolidifyJob>,
     /// Flag to trigger solidify-clip computation.
     pub start_solidify: bool,
+    /// Whether the "Open URL" dialog is shown.
+    pub show_url_dialog: bool,
+    /// Text input for the URL dialog.
+    pub url_input: String,
+    /// In-flight URL fetch receiver.
+    pub url_fetch: Option<Mutex<Receiver<Result<String, String>>>>,
+    /// Downloaded STEP data ready to load.
+    pub pending_url_data: Option<String>,
 }
 
 impl Default for ViewerState {
@@ -201,6 +209,10 @@ impl Default for ViewerState {
             has_solid_topology: false,
             solidify_job: None,
             start_solidify: false,
+            show_url_dialog: false,
+            url_input: String::new(),
+            url_fetch: None,
+            pending_url_data: None,
         }
     }
 }
