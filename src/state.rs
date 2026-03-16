@@ -89,7 +89,7 @@ pub(crate) struct ViewerState {
     // Viewport overlay toggles.
     pub show_random_colors: bool,
     pub show_bounding_box: bool,
-    pub show_wireframe: bool,
+    pub show_polygon_edges: bool,
     pub scene_data: Option<StepScene>,
     pub needs_mesh_rebuild: bool,
     pub current_bounds: Option<Bounds>,
@@ -117,8 +117,8 @@ pub(crate) struct ViewerState {
     pub edges: Vec<EdgeRecord>,
     /// Loop records for face boundary loops.
     pub loops: Vec<LoopRecord>,
-    /// Global toggle for showing STEP curve edges.
-    pub show_edges: bool,
+    /// Global toggle for showing STEP curve wireframe.
+    pub show_wireframe: bool,
     /// Flag to trigger edge visibility update.
     pub edge_visibility_changed: bool,
     /// Face ID needing re-tessellation (loop trim changed).
@@ -177,7 +177,7 @@ impl Default for ViewerState {
             panel_width: DEFAULT_PANEL_WIDTH,
             show_random_colors: false,
             show_bounding_box: false,
-            show_wireframe: false,
+            show_polygon_edges: false,
             scene_data: None,
             needs_mesh_rebuild: false,
             current_bounds: None,
@@ -192,7 +192,7 @@ impl Default for ViewerState {
             mode: AppMode::default(),
             edges: Vec::new(),
             loops: Vec::new(),
-            show_edges: true,
+            show_wireframe: true,
             edge_visibility_changed: false,
             retessellate_face: None,
             selection: None,

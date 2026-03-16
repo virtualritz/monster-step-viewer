@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Instant};
 
 use crate::state::{
-    AppMode, BrowserState, ClipPlaneState, DEFAULT_PANEL_WIDTH,
-    DEFAULT_TESSELLATION_FACTOR, ShadingMode, ViewerState,
+    AppMode, BrowserState, ClipPlaneState, ShadingMode, ViewerState,
+    DEFAULT_PANEL_WIDTH, DEFAULT_TESSELLATION_FACTOR,
 };
 
 const APP_NAME: &str = "monster-step-viewer";
@@ -19,14 +19,15 @@ pub(crate) struct PersistentSettings {
     pub right_panel_width: f32,
     pub show_random_colors: bool,
     pub show_bounding_box: bool,
-    pub show_wireframe: bool,
+    #[serde(default)]
+    pub show_polygon_edges: bool,
     pub tessellation_factor: f64,
     #[serde(default)]
     pub mode: AppMode,
     #[serde(default)]
     pub last_browser_dir: Option<PathBuf>,
-    #[serde(default = "default_true")]
-    pub show_edges: bool,
+    #[serde(default = "default_true", alias = "show_edges")]
+    pub show_wireframe: bool,
     #[serde(default)]
     pub clip_planes: [ClipPlaneState; 3],
     #[serde(default)]
@@ -45,11 +46,11 @@ impl Default for PersistentSettings {
             right_panel_width: 380.0,
             show_random_colors: false,
             show_bounding_box: false,
-            show_wireframe: false,
+            show_polygon_edges: false,
             tessellation_factor: DEFAULT_TESSELLATION_FACTOR,
             mode: AppMode::default(),
             last_browser_dir: None,
-            show_edges: true,
+            show_wireframe: true,
             clip_planes: [ClipPlaneState::default(); 3],
             shading_mode: ShadingMode::default(),
         }
@@ -114,8 +115,8 @@ pub(crate) fn auto_save_system(
         right_panel_width: state.right_panel_width,
         show_random_colors: state.show_random_colors,
         show_bounding_box: state.show_bounding_box,
+        show_polygon_edges: state.show_polygon_edges,
         show_wireframe: state.show_wireframe,
-        show_edges: state.show_edges,
         tessellation_factor: state.tessellation_factor,
         mode: state.mode,
         last_browser_dir: browser.selected_dir.clone(),

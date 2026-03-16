@@ -1209,20 +1209,20 @@ fn viewer_ui(
                             bbox_btn.on_hover_text("Bounding box");
 
                             let wire_btn = ui
-                                .selectable_label(state.show_wireframe, icon_text(ICON_WIREFRAME));
+                                .selectable_label(state.show_polygon_edges, icon_text(ICON_WIREFRAME));
                             if wire_btn.clicked() {
+                                state.show_polygon_edges = !state.show_polygon_edges;
+                                state.settings_dirty = true;
+                            }
+                            wire_btn.on_hover_text("Polygon edges");
+
+                            let edge_btn =
+                                ui.selectable_label(state.show_wireframe, icon_text(ICON_EDGES));
+                            if edge_btn.clicked() {
                                 state.show_wireframe = !state.show_wireframe;
                                 state.settings_dirty = true;
                             }
-                            wire_btn.on_hover_text("Wireframe edges");
-
-                            let edge_btn =
-                                ui.selectable_label(state.show_edges, icon_text(ICON_EDGES));
-                            if edge_btn.clicked() {
-                                state.show_edges = !state.show_edges;
-                                state.settings_dirty = true;
-                            }
-                            edge_btn.on_hover_text("Curve edges");
+                            edge_btn.on_hover_text("Wireframe");
 
                             ui.separator();
 

@@ -50,8 +50,8 @@ fn main() {
             right_panel_width: settings.right_panel_width,
             show_random_colors: settings.show_random_colors,
             show_bounding_box: settings.show_bounding_box,
+            show_polygon_edges: settings.show_polygon_edges,
             show_wireframe: settings.show_wireframe,
-            show_edges: settings.show_edges,
             tessellation_factor: settings.tessellation_factor,
             applied_tessellation_factor: settings.tessellation_factor,
             mode: settings.mode,
@@ -100,6 +100,7 @@ fn main() {
         .add_plugins(PanOrbitCameraPlugin)
         .insert_resource(WinitSettings::desktop_app())
         .add_systems(Startup, scene::setup_scene)
+        .add_systems(Startup, scene::configure_gizmos)
         .add_systems(Startup, viewer_material::setup_matcap_texture)
         .add_systems(Startup, setup_browser_render_slots)
         .add_systems(Update, scene::process_load_requests)

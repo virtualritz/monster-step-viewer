@@ -869,39 +869,58 @@ pub(crate) fn disable_camera_when_egui_wants_input(
     }
 }
 
-/// Draw bounding box and wireframe gizmos when enabled.
-pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
-    // Draw wireframe edges (STEP geometry boundary edges stored in scene_data).
-    if state.show_wireframe
-        && let Some(scene) = &state.scene_data
-    {
-        let color = Color::srgba(0.0, 0.0, 0.0, 0.4);
-        let center = state.scene_center;
-        let scale = state.scene_scale;
+/// Configure gizmo rendering with depth bias so lines draw on top of meshes.
+pub(crate) fn configure_gizmos(mut config_store: ResMut<GizmoConfigStore>) {
+    let (config, _) = config_store.config_mut::<DefaultGizmoConfigGroup>();
+    config.depth_bias = -0.001;
+}
 
-        for shell in &scene.shells {
-            for (p0_arr, p1_arr) in &shell.edges {
-                // Apply same normalization as mesh vertices: (pos - center) *
-                // scale.
-                let p0_raw = Vec3::new(
-                    p0_arr[0] as f32,
-                    p0_arr[1] as f32,
-                    p0_arr[2] as f32,
-                );
-                let p1_raw = Vec3::new(
-                    p1_arr[0] as f32,
-                    p1_arr[1] as f32,
-                    p1_arr[2] as f32,
-                );
-                let p0 = (p0_raw - center) * scale;
-                let p1 = (p1_raw - center) * scale;
-                gizmos.line(p0, p1, color);
+/// Draw bounding box and wireframe gizmos when enabled.
+pub(crate) fn draw_gizmos(
+    state: Res<ViewerState>,
+    mut gizmos: Gizmos,
+    mesh_assets: Res<Assets<Mesh>>,
+) {
+    // Draw polygon edges (all triangle edges from tessellated meshes).
+    if state.show_polygon_edges {
+        let color = Color::srgba(0.0, 0.0, 0.0, 0.4);
+
+        for face in &state.faces {
+            if !face.visible {
+                continue;
+            }
+            let Some(mesh) = mesh_assets.get(&face.mesh_handle) else {
+                continue;
+            };
+            let Some(positions) = mesh
+                .attribute(Mesh::ATTRIBUTE_POSITION)
+                .and_then(|attr| attr.as_float3())
+            else {
+                continue;
+            };
+            // Read triangle indices from the mesh index buffer.
+            let indices: Vec<usize> = match mesh.indices() {
+                Some(idx) => idx.iter().collect(),
+                None => (0..positions.len()).collect(),
+            };
+            for tri in indices.chunks(3) {
+                if tri.len() < 3 {
+                    continue;
+                }
+                let verts = [
+                    Vec3::from(positions[tri[0]]),
+                    Vec3::from(positions[tri[1]]),
+                    Vec3::from(positions[tri[2]]),
+                ];
+                gizmos.line(verts[0], verts[1], color);
+                gizmos.line(verts[1], verts[2], color);
+                gizmos.line(verts[2], verts[0], color);
             }
         }
     }
 
     // Draw STEP curve edges as blue polylines (highlighted if selected).
-    if state.show_edges
+    if state.show_wireframe
         && let Some(scene) = &state.scene_data
     {
         let edge_color = Color::srgba(0.2, 0.6, 1.0, 0.9);
@@ -1231,7 +1250,7 @@ pub(crate) fn apply_shading_mode(
                 if let Some(mat) = materials.get_mut(&face.material_handle) {
                     mat.base.alpha_mode = AlphaMode::Blend;
                     mat.base.base_color = Color::srgba(0.0, 0.0, 0.0, 0.02);
-                    mat.base.cull_mode = if state.show_edges {
+                    mat.base.cull_mode = if state.show_wireframe {
                         None
                     } else {
                         Some(bevy::render::render_resource::Face::Back)
@@ -1833,25 +1852,45 @@ fn solidify_clip_inner(
         |c: &Curve3D| ModelingCurve::try_from(c).ok(),
         |s: &Surface| ModelingSurface::try_from(s).ok(),
     ).ok_or_else(|| "Failed to convert STEP solid to modeling types".to_string())?;
+    let bounds = BoundingBox::from_iter(
+        current_solid.vertex_iter().map(|vertex| vertex.point()),
+    );
+    let margin = bounds.diameter().max(100.0 * tol);
 
     // Apply each active clip plane as a boolean AND with a half-space box.
     // The shader discards fragments where dot(normal, pos) + d > 0, which for
     // no-flip (normal = +axis, d = -pos) keeps the NEGATIVE side (x <= pos).
-    // The solidify box must match: no-flip keeps (-big .. world_pos).
-    let big = 1e6;
+    // The solidify box must match that clip, but it only needs to cover the
+    // model bounds plus a margin -- not an artificial global half-space scale.
     for &(axis, world_pos, flip) in active_clips {
         let (min_pt, max_pt) = match axis {
             0 => {
                 // X axis
                 if flip {
                     (
-                        Point3::new(world_pos, -big, -big),
-                        Point3::new(big, big, big),
+                        Point3::new(
+                            world_pos,
+                            bounds.min().y - margin,
+                            bounds.min().z - margin,
+                        ),
+                        Point3::new(
+                            bounds.max().x + margin,
+                            bounds.max().y + margin,
+                            bounds.max().z + margin,
+                        ),
                     )
                 } else {
                     (
-                        Point3::new(-big, -big, -big),
-                        Point3::new(world_pos, big, big),
+                        Point3::new(
+                            bounds.min().x - margin,
+                            bounds.min().y - margin,
+                            bounds.min().z - margin,
+                        ),
+                        Point3::new(
+                            world_pos,
+                            bounds.max().y + margin,
+                            bounds.max().z + margin,
+                        ),
                     )
                 }
             }
@@ -1859,13 +1898,29 @@ fn solidify_clip_inner(
                 // Y axis
                 if flip {
                     (
-                        Point3::new(-big, world_pos, -big),
-                        Point3::new(big, big, big),
+                        Point3::new(
+                            bounds.min().x - margin,
+                            world_pos,
+                            bounds.min().z - margin,
+                        ),
+                        Point3::new(
+                            bounds.max().x + margin,
+                            bounds.max().y + margin,
+                            bounds.max().z + margin,
+                        ),
                     )
                 } else {
                     (
-                        Point3::new(-big, -big, -big),
-                        Point3::new(big, world_pos, big),
+                        Point3::new(
+                            bounds.min().x - margin,
+                            bounds.min().y - margin,
+                            bounds.min().z - margin,
+                        ),
+                        Point3::new(
+                            bounds.max().x + margin,
+                            world_pos,
+                            bounds.max().z + margin,
+                        ),
                     )
                 }
             }
@@ -1873,13 +1928,29 @@ fn solidify_clip_inner(
                 // Z axis
                 if flip {
                     (
-                        Point3::new(-big, -big, world_pos),
-                        Point3::new(big, big, big),
+                        Point3::new(
+                            bounds.min().x - margin,
+                            bounds.min().y - margin,
+                            world_pos,
+                        ),
+                        Point3::new(
+                            bounds.max().x + margin,
+                            bounds.max().y + margin,
+                            bounds.max().z + margin,
+                        ),
                     )
                 } else {
                     (
-                        Point3::new(-big, -big, -big),
-                        Point3::new(big, big, world_pos),
+                        Point3::new(
+                            bounds.min().x - margin,
+                            bounds.min().y - margin,
+                            bounds.min().z - margin,
+                        ),
+                        Point3::new(
+                            bounds.max().x + margin,
+                            bounds.max().y + margin,
+                            world_pos,
+                        ),
                     )
                 }
             }

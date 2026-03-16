@@ -9,7 +9,7 @@ use monstertruck::{
         Table,
         step_geometry::{Curve3D, Surface, Pcurve},
     },
-    topology::compress::CompressedTrimmedShell,
+    topology::compress::{CompressedShell, CompressedTrimmedShell},
 };
 use monstertruck::step::load::ruststep::{
     ast::Name,
@@ -17,6 +17,17 @@ use monstertruck::step::load::ruststep::{
     tables::PlaceHolder,
 };
 type OriginalShell = CompressedTrimmedShell<Point3, Curve3D, Surface, Pcurve>;
+type LegacyShell = CompressedShell<Point3, Curve3D, Surface>;
+
+fn has_face_trims(shell: &OriginalShell) -> bool {
+    shell.faces.iter().any(|face| {
+        face.boundaries
+            .iter()
+            .flatten()
+            .any(|edge_use| edge_use.trim_curve.is_some())
+    })
+}
+
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::{
@@ -366,16 +377,20 @@ pub fn load_step_file_with_progress(
             }
 
             let original_shell = CompressedShellData::new(compressed.clone());
-            let poly_shell = compressed.robust_triangulation(tol);
+            let poly_shell = if has_face_trims(&compressed) {
+                compressed.clone().robust_triangulation(tol)
+            } else {
+                let legacy: LegacyShell = compressed.clone().erase_trims();
+                legacy.robust_triangulation(tol)
+            };
 
-            // Extract tessellated curve edges.
+            // Extract tessellated curve edges from the meshed shell edges.
             let curve_edges: Vec<StepEdge> = poly_shell
                 .edges
                 .iter()
                 .enumerate()
                 .map(|(i, edge)| {
-                    let points =
-                        edge.curve.iter().map(|p| [p.x, p.y, p.z]).collect();
+                    let points = edge.curve.iter().map(|p| [p.x, p.y, p.z]).collect();
                     StepEdge {
                         id: i,
                         curve_type: curve_types
@@ -683,7 +698,12 @@ fn load_step_from_string_inner(
             );
 
             let original_shell = CompressedShellData::new(compressed.clone());
-            let poly_shell = compressed.robust_triangulation(tol);
+            let poly_shell = if has_face_trims(&compressed) {
+                compressed.clone().robust_triangulation(tol)
+            } else {
+                let legacy: LegacyShell = compressed.clone().erase_trims();
+                legacy.robust_triangulation(tol)
+            };
 
             // Extract tessellated curve edges (with transform applied).
             let curve_edges: Vec<StepEdge> = poly_shell
@@ -833,7 +853,12 @@ pub fn retessellate_face(
     }
 
     // Re-tessellate the entire shell (necessary because edges are shared).
-    let poly_shell = modified.robust_triangulation(tolerance);
+    let poly_shell = if has_face_trims(&modified) {
+        modified.robust_triangulation(tolerance)
+    } else {
+        let legacy: LegacyShell = modified.erase_trims();
+        legacy.robust_triangulation(tolerance)
+    };
 
     // Extract the target face's mesh.
     let poly_face = poly_shell.faces.get(face_idx)?;
