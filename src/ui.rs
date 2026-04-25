@@ -19,7 +19,7 @@ use bevy::{
 };
 use bevy_egui::{EguiContextSettings, EguiContexts, PrimaryEguiContext, egui};
 use monster_step_viewer::Parameter;
-use std::cell::Cell;
+use std::{cell::Cell, sync::atomic::Ordering};
 
 /// Clickable collapse/expand arrow drawn with the painter (font-independent).
 fn collapse_arrow(ui: &mut egui::Ui, is_open: bool) -> egui::Response {
@@ -42,8 +42,11 @@ fn collapse_arrow(ui: &mut egui::Ui, is_open: bool) -> egui::Response {
                 egui::pos2(center.x - half * 0.5, center.y + half),
             ]
         };
-        ui.painter()
-            .add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+        ui.painter().add(egui::Shape::convex_polygon(
+            points,
+            color,
+            egui::Stroke::NONE,
+        ));
     }
     resp
 }
@@ -326,19 +329,19 @@ pub(crate) fn ui_system(
                 let (tx, rx) = std::sync::mpsc::channel();
                 let request = ehttp::Request::get(&url);
                 ehttp::fetch(request, move |result| {
-                    let msg = match result {
-                        Ok(resp) if resp.ok => match resp.text() {
-                            Some(text) => Ok(text.to_string()),
-                            None => Err(
-                                "Response is not valid UTF-8 text".to_string(),
-                            ),
-                        },
-                        Ok(resp) => Err(format!(
-                            "HTTP {} {}",
-                            resp.status, resp.status_text
-                        )),
-                        Err(e) => Err(e),
-                    };
+                    let msg =
+                        match result {
+                            Ok(resp) if resp.ok => match resp.text() {
+                                Some(text) => Ok(text.to_string()),
+                                None => Err("Response is not valid UTF-8 text"
+                                    .to_string()),
+                            },
+                            Ok(resp) => Err(format!(
+                                "HTTP {} {}",
+                                resp.status, resp.status_text
+                            )),
+                            Err(e) => Err(e),
+                        };
                     let _ = tx.send(msg);
                 });
                 state.url_fetch = Some(parking_lot::Mutex::new(rx));
@@ -472,6 +475,7 @@ fn viewer_ui(
                                 s.name.clone(),
                                 s.expanded,
                                 s.visible,
+                                s.failed_faces,
                                 s.face_ids.clone(),
                                 s.standalone_edge_ids.clone(),
                             )
@@ -542,6 +546,7 @@ fn viewer_ui(
                         shell_name,
                         expanded,
                         shell_visible,
+                        failed_faces,
                         face_ids,
                         standalone_edge_ids,
                     ) in shell_data
@@ -561,10 +566,15 @@ fn viewer_ui(
                                 shell_vis_changes.set(changes);
                             }
 
-                            let mut header = egui::CollapsingHeader::new(format!(
-                                "{} ({} faces)",
-                                shell_name, face_count
-                            ))
+                            let header_text = if failed_faces > 0 {
+                                format!(
+                                    "{} ({} faces, {} failed)",
+                                    shell_name, face_count, failed_faces
+                                )
+                            } else {
+                                format!("{} ({} faces)", shell_name, face_count)
+                            };
+                            let mut header = egui::CollapsingHeader::new(header_text)
                             .id_salt(format!("shell_{}", shell_id))
                             .default_open(expanded);
 
@@ -1233,21 +1243,37 @@ fn viewer_ui(
                                 egui::Color32::from_rgb(80, 120, 220),
                             ];
                             for i in 0..3 {
-                                let active = state.clip_planes[i].enabled;
-                                let label = if active {
-                                    egui::RichText::new(clip_labels[i])
+                                let cp = &state.clip_planes[i];
+                                let (label_str, tooltip) = if !cp.enabled {
+                                    (clip_labels[i].to_string(), format!("Clip +{} axis (click to enable)", clip_labels[i]))
+                                } else if !cp.flip {
+                                    (format!("+{}", clip_labels[i]), format!("Clip +{} (click for −{})", clip_labels[i], clip_labels[i]))
+                                } else {
+                                    (format!("−{}", clip_labels[i]), format!("Clip −{} (click to disable)", clip_labels[i]))
+                                };
+                                let label = if cp.enabled {
+                                    egui::RichText::new(&label_str)
                                         .color(clip_colors[i])
                                         .strong()
                                 } else {
-                                    egui::RichText::new(clip_labels[i])
+                                    egui::RichText::new(&label_str)
                                 };
-                                let clip_btn = ui.selectable_label(active, label);
+                                let clip_btn = ui.selectable_label(cp.enabled, label);
                                 if clip_btn.clicked() {
-                                    state.clip_planes[i].enabled = !state.clip_planes[i].enabled;
+                                    // Cycle: Off → +axis → −axis → Off
+                                    if !state.clip_planes[i].enabled {
+                                        state.clip_planes[i].enabled = true;
+                                        state.clip_planes[i].flip = false;
+                                    } else if !state.clip_planes[i].flip {
+                                        state.clip_planes[i].flip = true;
+                                    } else {
+                                        state.clip_planes[i].enabled = false;
+                                        state.clip_planes[i].flip = false;
+                                    }
                                     state.clip_planes_dirty = true;
                                     state.settings_dirty = true;
                                 }
-                                clip_btn.on_hover_text(format!("Clip {} axis", clip_labels[i]));
+                                clip_btn.on_hover_text(tooltip);
                             }
 
                             ui.separator();
@@ -1259,11 +1285,25 @@ fn viewer_ui(
 
                             if is_processing {
                                 ui.spinner();
-                                ui.label(
-                                    egui::RichText::new("Processing...")
-                                        .small()
-                                        .color(egui::Color32::GRAY),
+                                if ui.button("Cancel").clicked()
+                                    && let Some(ref job) = state.solidify_job
+                                {
+                                    job.cancel.store(true, Ordering::Relaxed);
+                                }
+                            } else if state.pre_solidify_scene.is_some() {
+                                let solidify_btn = ui.add_enabled(
+                                    can_solidify,
+                                    egui::Button::new(
+                                        egui::RichText::new("Re-solidify").strong(),
+                                    ),
                                 );
+                                if solidify_btn.clicked() {
+                                    state.start_solidify = true;
+                                }
+                                solidify_btn.on_hover_text("Re-run boolean clip with current planes");
+                                if ui.button("Revert").clicked() {
+                                    state.restore_original = true;
+                                }
                             } else {
                                 let solidify_btn = ui.add_enabled(
                                     can_solidify,
@@ -1319,11 +1359,30 @@ fn viewer_ui(
                         egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
                     );
 
-                    if fraction > 0.0 {
-                        let progress_rect = egui::Rect::from_min_size(
-                            rect.min,
-                            egui::vec2(viewport_width * fraction, bar_height),
-                        );
+                    let progress_rect = if total > 0 {
+                        (fraction > 0.0).then(|| {
+                            egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(
+                                    viewport_width * fraction,
+                                    bar_height,
+                                ),
+                            )
+                        })
+                    } else {
+                        let segment_width = (viewport_width * 0.28)
+                            .max(32.0)
+                            .min(viewport_width);
+                        let offset = (ctx.input(|i| i.time) as f32 * 0.75)
+                            .fract()
+                            * (viewport_width - segment_width);
+                        Some(egui::Rect::from_min_size(
+                            egui::pos2(rect.min.x + offset, rect.min.y),
+                            egui::vec2(segment_width, bar_height),
+                        ))
+                    };
+
+                    if let Some(progress_rect) = progress_rect {
                         ui.painter().rect_filled(
                             progress_rect,
                             4.0,
@@ -1331,15 +1390,17 @@ fn viewer_ui(
                         );
                     }
 
+                    let phase_label = job.phase.label();
                     let text = if total > 0 {
                         format!(
-                            "Tessellating shell {}/{} ({:.0}%)",
+                            "{} {}/{} ({:.0}%)",
+                            phase_label,
                             current,
                             total,
                             fraction * 100.0
                         )
                     } else {
-                        "Parsing STEP file...".to_string()
+                        format!("{}...", phase_label)
                     };
 
                     ui.painter().text(
@@ -1566,7 +1627,7 @@ fn browser_ui(
                                 .collect();
                             painter.add(egui::Shape::line(
                                 points,
-                                egui::Stroke::new(2.5, egui::Color32::GRAY),
+                                egui::Stroke::new(2.5_f32, egui::Color32::GRAY),
                             ));
                         }
                         PreviewStatus::Failed(err) => {
@@ -1612,7 +1673,7 @@ fn browser_ui(
                             thumb_rect,
                             4.0,
                             egui::Stroke::new(
-                                2.0,
+                                2.0_f32,
                                 egui::Color32::from_rgb(100, 149, 237),
                             ),
                             egui::epaint::StrokeKind::Outside,

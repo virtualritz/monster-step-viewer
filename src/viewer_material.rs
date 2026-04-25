@@ -3,12 +3,15 @@ use bevy::{
     image::ImageSampler,
     pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
-    render::render_resource::{AsBindGroup, Extent3d, TextureDimension, TextureFormat},
+    render::render_resource::{
+        AsBindGroup, Extent3d, TextureDimension, TextureFormat,
+    },
     shader::ShaderRef,
 };
 
 /// Type alias for the viewer's extended material.
-pub(crate) type ViewerMaterial = ExtendedMaterial<StandardMaterial, ViewerMaterialExt>;
+pub(crate) type ViewerMaterial =
+    ExtendedMaterial<StandardMaterial, ViewerMaterialExt>;
 
 /// Fragment shader path (relative to `assets/`).
 const SHADER_PATH: &str = "shaders/viewer_material.wgsl";

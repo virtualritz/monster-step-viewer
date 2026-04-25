@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Instant};
 
 use crate::state::{
-    AppMode, BrowserState, ClipPlaneState, ShadingMode, ViewerState,
-    DEFAULT_PANEL_WIDTH, DEFAULT_TESSELLATION_FACTOR,
+    AppMode, BrowserState, ClipPlaneState, DEFAULT_PANEL_WIDTH,
+    DEFAULT_TESSELLATION_FACTOR, ShadingMode, ViewerState,
 };
 
 const APP_NAME: &str = "monster-step-viewer";

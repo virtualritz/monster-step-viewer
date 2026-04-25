@@ -1,5 +1,6 @@
-/// Simple test to verify STEP file parsing without GUI
-use std::path::PathBuf;
+/// Simple test to verify STEP file parsing without GUI.
+use monstertruck::step::load::ruststep::parser::parse;
+use std::{cmp::Reverse, collections::HashMap, fs, path::PathBuf, process};
 
 fn main() {
     env_logger::init();
@@ -9,31 +10,21 @@ fn main() {
     println!("Testing STEP parser with: {:?}", file_path);
     println!("═══════════════════════════════════════");
 
-    // Read the STEP file
-    let file_content = match std::fs::read_to_string(&file_path) {
-        Ok(content) => {
-            println!("✓ File read successfully ({} bytes)", content.len());
-            content
-        }
-        Err(e) => {
-            eprintln!("✗ Failed to read file: {}", e);
-            return;
-        }
-    };
+    // Read the STEP file.
+    let file_content = fs::read_to_string(&file_path).unwrap_or_else(|e| {
+        eprintln!("✗ Failed to read file: {}", e);
+        process::exit(1);
+    });
+    println!("✓ File read successfully ({} bytes)", file_content.len());
 
-    // Parse using ruststep
-    let exchange = match ruststep::parser::parse(&file_content) {
-        Ok(exchange) => {
-            println!("✓ STEP file parsed successfully");
-            exchange
-        }
-        Err(e) => {
-            eprintln!("✗ Failed to parse STEP file: {:?}", e);
-            return;
-        }
-    };
+    // Parse using ruststep.
+    let exchange = parse(&file_content).unwrap_or_else(|e| {
+        eprintln!("✗ Failed to parse STEP file: {:?}", e);
+        process::exit(1);
+    });
+    println!("✓ STEP file parsed successfully");
 
-    // Extract metadata
+    // Extract metadata.
     println!("\nHeader Information:");
     println!("───────────────────────────────────────");
 
@@ -41,7 +32,7 @@ fn main() {
         println!("  {}: {:?}", record.name, record.parameter);
     }
 
-    // Count entities
+    // Count entities.
     let entity_count: usize = exchange
         .data
         .iter()
@@ -53,7 +44,7 @@ fn main() {
     println!("  Total entities: {}", entity_count);
     println!("  Data sections: {}", exchange.data.len());
 
-    // Sample first few entities
+    // Sample first few entities.
     println!("\nSample Entities (first 10):");
     println!("───────────────────────────────────────");
 
@@ -74,11 +65,11 @@ fn main() {
         println!("  #{}: {} - {}", idx, entity_type, display);
     }
 
-    // Count entity types
+    // Count entity types.
     println!("\nEntity Type Distribution:");
     println!("───────────────────────────────────────");
 
-    let mut type_counts = std::collections::HashMap::new();
+    let mut type_counts = HashMap::new();
 
     for entity in exchange
         .data
@@ -95,7 +86,7 @@ fn main() {
     }
 
     let mut sorted_types: Vec<_> = type_counts.iter().collect();
-    sorted_types.sort_by_key(|&(_, count)| std::cmp::Reverse(*count));
+    sorted_types.sort_by_key(|&(_, count)| Reverse(*count));
 
     for (entity_type, count) in sorted_types.iter().take(15) {
         println!("  {:<30} {}", entity_type, count);

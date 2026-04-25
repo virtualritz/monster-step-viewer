@@ -1,5 +1,7 @@
 use bevy::prelude::*;
-use monster_step_viewer::{LoadMessage, StepMetadata, StepScene, StepShell};
+use monster_step_viewer::{
+    LoadMessage, LoadPhase, StepMetadata, StepScene, StepShell,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,9 +30,7 @@ pub(crate) enum AppMode {
     Browser,
 }
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ClipPlaneState {
     pub enabled: bool,
     pub position: u16,
@@ -153,6 +153,10 @@ pub(crate) struct ViewerState {
     pub solidify_job: Option<SolidifyJob>,
     /// Flag to trigger solidify-clip computation.
     pub start_solidify: bool,
+    /// Original scene data saved before solidify (for restoring on unclip).
+    pub pre_solidify_scene: Option<StepScene>,
+    /// Flag to trigger restore of pre-solidify scene.
+    pub restore_original: bool,
     /// Whether the "Open URL" dialog is shown.
     pub show_url_dialog: bool,
     /// Text input for the URL dialog.
@@ -209,6 +213,8 @@ impl Default for ViewerState {
             has_solid_topology: false,
             solidify_job: None,
             start_solidify: false,
+            pre_solidify_scene: None,
+            restore_original: false,
             show_url_dialog: false,
             url_input: String::new(),
             url_fetch: None,
@@ -261,6 +267,8 @@ pub(crate) struct ShellRecord {
     pub expanded: bool,
     /// Master visibility toggle for the entire shell.
     pub visible: bool,
+    /// Number of faces that failed to tessellate.
+    pub failed_faces: usize,
     // Indices into ViewerState.faces.
     pub face_ids: Vec<usize>,
     /// Edge IDs not referenced by any face boundary (standalone curves).
@@ -289,6 +297,7 @@ pub(crate) struct ClipPlaneDragState {
 pub(crate) struct LoadJob {
     pub path: PathBuf,
     pub receiver: Mutex<Receiver<LoadMessage>>,
+    pub phase: LoadPhase,
     pub current_shell: usize,
     pub total_shells: usize,
 }
@@ -296,6 +305,7 @@ pub(crate) struct LoadJob {
 /// Background job for solidify-clip boolean operation.
 pub(crate) struct SolidifyJob {
     pub receiver: Mutex<Receiver<Result<StepScene, String>>>,
+    pub cancel: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SolidifyJob {
