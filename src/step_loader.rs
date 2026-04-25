@@ -2,7 +2,7 @@ mod mesh_utils;
 mod parsing;
 pub mod transform;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use monstertruck::{
     meshing::prelude::*,
     step::load::{
@@ -428,23 +428,31 @@ fn compute_shell_bounds(
         .for_each(|point| push_point(*point));
     for edge in &compressed.edges {
         let (start, end) = edge.curve.range_tuple();
-        for idx in 0..=4 {
-            let t = start + (end - start) * idx as f64 / 4.0;
+        for idx in 0..=16 {
+            let t = start + (end - start) * idx as f64 / 16.0;
             push_point(edge.curve.subs(t));
-        }
-    }
-    for face in &compressed.faces {
-        let (urange, vrange) = face.surface.try_range_tuple();
-        if let (Some((u0, u1)), Some((v0, v1))) = (urange, vrange) {
-            push_point(face.surface.subs(u0, v0));
-            push_point(face.surface.subs(u1, v0));
-            push_point(face.surface.subs(u0, v1));
-            push_point(face.surface.subs(u1, v1));
-            push_point(face.surface.subs((u0 + u1) * 0.5, (v0 + v1) * 0.5));
         }
     }
 
     bounds.finish()
+}
+
+fn mesh_fits_shell_bounds(
+    mesh: &PolygonMesh,
+    bounds: Option<StepBounds>,
+    tolerance: f64,
+) -> bool {
+    bounds.is_none_or(|bounds| {
+        let margin = f64::max(bounds.diameter() * 0.25, tolerance * 10.0);
+        mesh.positions().iter().all(|point| {
+            point.x >= bounds.min[0] - margin
+                && point.x <= bounds.max[0] + margin
+                && point.y >= bounds.min[1] - margin
+                && point.y <= bounds.max[1] + margin
+                && point.z >= bounds.min[2] - margin
+                && point.z <= bounds.max[2] + margin
+        })
+    })
 }
 
 /// Load and tessellate a STEP file into polygon meshes with progress reporting.
@@ -524,31 +532,9 @@ pub fn load_step_file_with_progress(
                 .map(|e| classify_curve_type(&e.curve))
                 .collect();
 
-            // Compute tolerance from geometric extents without a coarse
-            // triangulation pass.
-            let mut bounds: BoundingBox<Point3> =
-                compressed.vertices.iter().collect();
-            for edge in &compressed.edges {
-                let (start, end) = edge.curve.range_tuple();
-                // Sample a few points per edge to capture curved extents.
-                for idx in 0..=4 {
-                    let t = start + (end - start) * idx as f64 / 4.0;
-                    bounds.push(edge.curve.subs(t));
-                }
-            }
-            for face in &compressed.faces {
-                let (urange, vrange) = face.surface.try_range_tuple();
-                if let (Some((u0, u1)), Some((v0, v1))) = (urange, vrange) {
-                    bounds.push(face.surface.subs(u0, v0));
-                    bounds.push(face.surface.subs(u1, v0));
-                    bounds.push(face.surface.subs(u0, v1));
-                    bounds.push(face.surface.subs(u1, v1));
-                    bounds.push(
-                        face.surface.subs((u0 + u1) * 0.5, (v0 + v1) * 0.5),
-                    );
-                }
-            }
-            let diameter = bounds.diameter();
+            let shell_bounds = compute_shell_bounds(&compressed, None);
+            let diameter =
+                shell_bounds.map(StepBounds::diameter).unwrap_or_default();
             let mut tol = f64::max(diameter * 0.001, TOLERANCE);
             if !tol.is_finite() {
                 tol = 0.01;
@@ -557,15 +543,7 @@ pub fn load_step_file_with_progress(
             let has_boundaries = shell_requires_trimmed_meshing(&compressed);
             let original_shell = CompressedShellData::new(compressed.clone());
             let poly_shell = compressed.clone().robust_triangulation(tol);
-            let failed_faces = count_failed_face_meshes(&poly_shell);
-            if failed_faces > 0 {
-                log::warn!(
-                    "Shell {}: {} face meshes failed (has_boundaries={})",
-                    local_idx,
-                    failed_faces,
-                    has_boundaries
-                );
-            }
+            let mut failed_faces = count_failed_face_meshes(&poly_shell);
 
             // Extract tessellated curve edges from the meshed shell edges.
             let curve_edges: Vec<StepEdge> = poly_shell
@@ -593,38 +571,53 @@ pub fn load_step_file_with_progress(
                 .iter()
                 .enumerate()
                 .filter_map(|(face_idx, face)| {
-                    face.surface.as_ref().map(|surface| {
+                    face.surface.as_ref().and_then(|surface| {
                         let mesh = match face.orientation {
                             true => surface.clone(),
                             false => surface.inverse(),
                         };
-                        // Extract boundary edges from this face's mesh.
-                        let face_edges = extract_mesh_edges(&mesh, None);
-                        all_edges.extend(face_edges);
+                        if !mesh_fits_shell_bounds(&mesh, shell_bounds, tol) {
+                            failed_faces += 1;
+                            None
+                        } else {
+                            // Extract boundary edges from this face's mesh.
+                            let face_edges = extract_mesh_edges(&mesh, None);
+                            all_edges.extend(face_edges);
 
-                        // Extract boundary loop topology.
-                        let boundary_loops: Vec<StepBoundaryLoop> = face
-                            .boundaries
-                            .iter()
-                            .enumerate()
-                            .map(|(loop_idx, loop_edges)| StepBoundaryLoop {
-                                edge_indices: loop_edges
-                                    .iter()
-                                    .map(|ei| ei.index)
-                                    .collect(),
-                                is_outer: loop_idx == 0,
+                            // Extract boundary loop topology.
+                            let boundary_loops: Vec<StepBoundaryLoop> = face
+                                .boundaries
+                                .iter()
+                                .enumerate()
+                                .map(|(loop_idx, loop_edges)| {
+                                    StepBoundaryLoop {
+                                        edge_indices: loop_edges
+                                            .iter()
+                                            .map(|ei| ei.index)
+                                            .collect(),
+                                        is_outer: loop_idx == 0,
+                                    }
+                                })
+                                .collect();
+
+                            Some(StepFace {
+                                id: face_idx,
+                                name: format!("Face {}", face_idx + 1),
+                                mesh,
+                                boundary_loops,
                             })
-                            .collect();
-
-                        StepFace {
-                            id: face_idx,
-                            name: format!("Face {}", face_idx + 1),
-                            mesh,
-                            boundary_loops,
                         }
                     })
                 })
                 .collect();
+            if failed_faces > 0 {
+                log::warn!(
+                    "Shell {}: {} face meshes failed (has_boundaries={})",
+                    local_idx,
+                    failed_faces,
+                    has_boundaries
+                );
+            }
 
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             progress.set(done as u16, total as u16);
@@ -693,6 +686,7 @@ struct PreparedShell {
     curve_types: Vec<String>,
     color: Option<[f32; 3]>,
     transform: Option<Transform>,
+    bounds: Option<StepBounds>,
     tolerance: f64,
 }
 
@@ -893,6 +887,7 @@ fn load_step_from_string_inner(
                     curve_types,
                     color,
                     transform,
+                    bounds,
                     tolerance: tol,
                 })
             })
@@ -919,21 +914,14 @@ fn load_step_from_string_inner(
                 curve_types,
                 color,
                 transform,
+                bounds: shell_bounds,
                 tolerance: tol,
             } = prepared;
 
             let has_boundaries = shell_requires_trimmed_meshing(&compressed);
             let original_shell = CompressedShellData::new(compressed.clone());
             let poly_shell = compressed.clone().robust_triangulation(tol);
-            let failed_faces = count_failed_face_meshes(&poly_shell);
-            if failed_faces > 0 {
-                log::warn!(
-                    "Shell {}: {} face meshes failed (has_boundaries={})",
-                    local_idx,
-                    failed_faces,
-                    has_boundaries
-                );
-            }
+            let mut failed_faces = count_failed_face_meshes(&poly_shell);
 
             // Extract tessellated curve edges (with transform applied).
             let curve_edges: Vec<StepEdge> = poly_shell
@@ -971,19 +959,11 @@ fn load_step_from_string_inner(
                 .iter()
                 .enumerate()
                 .filter_map(|(face_idx, face)| {
-                    face.surface.as_ref().map(|surface| {
+                    face.surface.as_ref().and_then(|surface| {
                         let mut mesh = match face.orientation {
                             true => surface.clone(),
                             false => surface.inverse(),
                         };
-
-                        // Extract boundary edges from this face's mesh (before
-                        // transform is applied to mesh).
-                        // Pass transform to extract_mesh_edges so edges are in
-                        // world coords.
-                        let face_edges =
-                            extract_mesh_edges(&mesh, transform.as_ref());
-                        all_edges.extend(face_edges);
 
                         // Apply assembly transform to mesh vertices and
                         // normals.
@@ -991,29 +971,47 @@ fn load_step_from_string_inner(
                             apply_transform_to_mesh(&mut mesh, &xform);
                         }
 
-                        // Extract boundary loop topology.
-                        let boundary_loops: Vec<StepBoundaryLoop> = face
-                            .boundaries
-                            .iter()
-                            .enumerate()
-                            .map(|(loop_idx, loop_edges)| StepBoundaryLoop {
-                                edge_indices: loop_edges
-                                    .iter()
-                                    .map(|ei| ei.index)
-                                    .collect(),
-                                is_outer: loop_idx == 0,
-                            })
-                            .collect();
+                        if !mesh_fits_shell_bounds(&mesh, shell_bounds, tol) {
+                            failed_faces += 1;
+                            None
+                        } else {
+                            let face_edges = extract_mesh_edges(&mesh, None);
+                            all_edges.extend(face_edges);
 
-                        StepFace {
-                            id: face_idx,
-                            name: format!("Face {}", face_idx + 1),
-                            mesh,
-                            boundary_loops,
+                            // Extract boundary loop topology.
+                            let boundary_loops: Vec<StepBoundaryLoop> = face
+                                .boundaries
+                                .iter()
+                                .enumerate()
+                                .map(|(loop_idx, loop_edges)| {
+                                    StepBoundaryLoop {
+                                        edge_indices: loop_edges
+                                            .iter()
+                                            .map(|ei| ei.index)
+                                            .collect(),
+                                        is_outer: loop_idx == 0,
+                                    }
+                                })
+                                .collect();
+
+                            Some(StepFace {
+                                id: face_idx,
+                                name: format!("Face {}", face_idx + 1),
+                                mesh,
+                                boundary_loops,
+                            })
                         }
                     })
                 })
                 .collect();
+            if failed_faces > 0 {
+                log::warn!(
+                    "Shell {}: {} face meshes failed (has_boundaries={})",
+                    local_idx,
+                    failed_faces,
+                    has_boundaries
+                );
+            }
 
             let total_tris: usize =
                 faces.iter().map(|f| f.mesh.tri_faces().len()).sum();
@@ -1054,9 +1052,11 @@ fn load_step_from_string_inner(
         tx.send(LoadMessage::Bounds(bounds))?;
     }
 
-    shells
-        .into_iter()
-        .try_for_each(|shell| tx.send(LoadMessage::Shell(shell)))?;
+    for shell in shells {
+        tx.send(LoadMessage::Shell(shell)).map_err(|_| {
+            anyhow!("load receiver dropped while sending STEP shell")
+        })?;
+    }
 
     tx.send(LoadMessage::Done)?;
     Ok(())
@@ -1121,9 +1121,13 @@ fn classify_curve_type(curve: &Curve3D) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use monstertruck::topology::compress::{
-        CompressedEdge, CompressedEdgeUse, CompressedFace,
-        CompressedTrimmedFace, CompressedTrimmedShell,
+    use monstertruck::{
+        geometry::prelude::{Line, Processor, RevolutionSurface},
+        step::load::step_geometry::ElementarySurface,
+        topology::compress::{
+            CompressedEdge, CompressedEdgeUse, CompressedFace,
+            CompressedTrimmedFace, CompressedTrimmedShell,
+        },
     };
 
     #[test]
@@ -1202,6 +1206,63 @@ mod tests {
 
         assert_eq!(bounds.center, [3.0, 3.0, 5.0]);
         assert_eq!(bounds.normalization_scale(), 0.25);
+    }
+
+    #[test]
+    fn shell_bounds_ignore_untrimmed_surface_parameter_rectangle() {
+        let profile = Line(
+            Point3::new(1000.0, 0.0, 0.0),
+            Point3::new(1000.0, 0.0, 1000.0),
+        );
+        let cylinder = Processor::new(RevolutionSurface::by_revolution(
+            profile,
+            Point3::origin(),
+            Vector3::unit_z(),
+        ));
+        let shell = CompressedTrimmedShell {
+            vertices: vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+            ],
+            edges: Vec::new(),
+            faces: vec![CompressedTrimmedFace {
+                boundaries: Vec::new(),
+                orientation: true,
+                surface: Surface::ElementarySurface(
+                    ElementarySurface::CylindricalSurface(cylinder),
+                ),
+            }],
+        };
+
+        let bounds = compute_shell_bounds(&shell, None)
+            .expect("bounds should use vertices");
+
+        assert_eq!(bounds.min, [0.0, 0.0, 0.0]);
+        assert_eq!(bounds.max, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn mesh_bounds_rejects_far_outlier_vertices() {
+        let mesh = PolygonMesh::new(
+            StandardAttributes {
+                positions: vec![
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(1.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                ],
+                normals: vec![Vector3::new(0.0, 0.0, 1.0)],
+                ..Default::default()
+            },
+            Faces::from_iter([[
+                (0, None, Some(0)),
+                (1, None, Some(0)),
+                (2, None, Some(0)),
+            ]]),
+        );
+        let bounds =
+            StepBounds::from_points([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]);
+
+        assert!(!mesh_fits_shell_bounds(&mesh, bounds, 0.01));
     }
 
     #[test]
