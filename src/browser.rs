@@ -19,7 +19,7 @@ use std::{
 
 use crate::{
     scene::{
-        bevy_mesh_from_polygon_normalized, color_for_index, compute_bounds,
+        bevy_mesh_from_polygon_normalized, compute_bounds, face_display_color,
     },
     state::{
         BrowserState, DirectoryEntry, MATERIAL_METALLIC, MATERIAL_ROUGHNESS,
@@ -302,15 +302,16 @@ fn spawn_preview_scene(
 
     // Spawn meshes for all faces in all shells.
     for (shell_idx, shell) in preview_data.shells.iter().enumerate() {
-        let step_color = shell.color;
         for (face_idx, face) in shell.faces.iter().enumerate() {
             let global_idx = shell_idx * 100 + face_idx;
-            let ui_rgb = step_color.unwrap_or_else(|| {
-                let (_, rgb) = color_for_index(global_idx);
-                rgb
-            });
+            let (ui_rgb, apply_colors) =
+                face_display_color(global_idx, shell.color, true);
             let (mesh, _) = bevy_mesh_from_polygon_normalized(
-                &face.mesh, ui_rgb, true, center, scale,
+                &face.mesh,
+                ui_rgb,
+                apply_colors,
+                center,
+                scale,
             );
             let mesh_handle = meshes.add(mesh);
             let material = materials.add(StandardMaterial {
