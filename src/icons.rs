@@ -5,13 +5,13 @@ use std::sync::Arc;
 const ICON_FONT_FAMILY: &str = "material_symbols";
 
 /// Random colors toggle (casino).
-pub(crate) const ICON_CASINO: &str = "\u{e53f}";
+pub(crate) const ICON_CASINO: &str = "\u{eb40}";
 /// STEP colors toggle (palette).
 pub(crate) const ICON_PALETTE: &str = "\u{e40a}";
 /// Bounding box toggle (view_in_ar).
-pub(crate) const ICON_BOUNDING_BOX: &str = "\u{e97a}";
+pub(crate) const ICON_BOUNDING_BOX: &str = "\u{efc9}";
 /// Wireframe toggle (deployed_code).
-pub(crate) const ICON_WIREFRAME: &str = "\u{e1af}";
+pub(crate) const ICON_WIREFRAME: &str = "\u{f720}";
 /// Edge curves toggle (timeline).
 pub(crate) const ICON_EDGES: &str = "\u{e922}";
 
