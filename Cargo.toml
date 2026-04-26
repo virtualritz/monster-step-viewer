@@ -18,7 +18,7 @@ bevy = { version = "0.18", default-features = false, features = [
     "picking",
 ] }
 bevy_egui = "0.39"
-bevy_panorbit_camera = "0.34"
+bevy_editor_cam = "0.8"
 futures-lite = "2"
 env_logger = "0.11"
 glam = "0.32"

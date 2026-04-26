@@ -289,7 +289,7 @@ pub(crate) struct ClipPlaneHandle {
 }
 
 /// Resource tracking whether a clip-plane handle is being dragged.
-/// While active the `PanOrbitCamera` is disabled.
+/// While active the editor camera is disabled.
 #[derive(Resource, Default, Debug)]
 pub(crate) struct ClipPlaneDragState {
     pub dragging: bool,

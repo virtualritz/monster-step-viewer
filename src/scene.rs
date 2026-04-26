@@ -1,10 +1,18 @@
 use bevy::{
-    asset::RenderAssetUsages, camera::visibility::RenderLayers,
-    pbr::wireframe::Wireframe, picking::pointer::PointerButton, prelude::*,
+    asset::RenderAssetUsages,
+    camera::{RenderTarget, visibility::RenderLayers},
+    input::mouse::MouseWheel,
+    pbr::wireframe::Wireframe,
+    picking::pointer::{PointerButton, PointerId, PointerLocation},
+    prelude::*,
     render::render_resource::PrimitiveTopology,
+    window::PrimaryWindow,
+};
+use bevy_editor_cam::{
+    input::{CameraPointerMap, EditorCamInputMessage, MotionKind},
+    prelude::{EditorCam, EnabledMotion},
 };
 use bevy_egui::{EguiContexts, EguiGlobalSettings, PrimaryEguiContext};
-use bevy_panorbit_camera::PanOrbitCamera;
 use monster_step_viewer::{
     CompressedShellData, LoadPhase, StepBoundaryLoop, StepBounds, StepEdge,
     StepFace, StepScene, StepShell, StepTopology,
@@ -52,11 +60,7 @@ pub(crate) fn setup_scene(
             MainCamera,
             Camera3d::default(),
             Transform::from_xyz(1.5, 1.0, 1.5).looking_at(Vec3::ZERO, Vec3::Y),
-            PanOrbitCamera {
-                focus: Vec3::ZERO,
-                radius: Some(2.0),
-                ..Default::default()
-            },
+            EditorCam::default().with_initial_anchor_depth(2.0),
         ))
         .with_children(|parent| {
             // Key light - main directional light from top-left (relative to
@@ -101,6 +105,89 @@ pub(crate) fn setup_scene(
             ..Default::default()
         },
     ));
+}
+
+pub(crate) fn editor_cam_mouse_inputs(
+    pointers: Query<(&PointerId, &PointerLocation)>,
+    pointer_map: Res<CameraPointerMap>,
+    mut controller: MessageWriter<EditorCamInputMessage>,
+    mut mouse_wheel: MessageReader<MouseWheel>,
+    mouse_input: Res<ButtonInput<MouseButton>>,
+    cameras: Query<
+        (Entity, &Camera, &RenderTarget, &EditorCam),
+        With<MainCamera>,
+    >,
+    primary_window: Query<Entity, With<PrimaryWindow>>,
+) {
+    let orbit_start = MouseButton::Right;
+    let pan_start = MouseButton::Middle;
+    let zoom_stop = 0.0;
+
+    if let Some(&camera) = pointer_map.get(&PointerId::Mouse) {
+        let camera_query = cameras.get(camera).ok();
+        let is_in_zoom_mode = camera_query
+            .map(|(.., editor_cam)| editor_cam.current_motion.is_zooming_only())
+            .unwrap_or_default();
+        let zoom_amount_abs = camera_query
+            .and_then(|(.., editor_cam)| {
+                editor_cam.current_motion.inputs().map(|inputs| {
+                    inputs.zoom_velocity_abs(
+                        editor_cam.smoothing.zoom.mul_f32(2.0),
+                    )
+                })
+            })
+            .unwrap_or(0.0);
+        let should_zoom_end = is_in_zoom_mode && zoom_amount_abs <= zoom_stop;
+
+        if mouse_input.any_just_released([orbit_start, pan_start])
+            || should_zoom_end
+        {
+            controller.write(EditorCamInputMessage::End { camera });
+        }
+    }
+
+    for (&pointer, pointer_location) in pointers
+        .iter()
+        .filter_map(|(id, loc)| loc.location().map(|loc| (id, loc)))
+    {
+        if !matches!(pointer, PointerId::Mouse) {
+            continue;
+        }
+
+        let Some((camera, ..)) =
+            cameras.iter().find(|(_, camera, render_target, _)| {
+                pointer_location.is_in_viewport(
+                    camera,
+                    render_target,
+                    &primary_window,
+                )
+            })
+        else {
+            continue;
+        };
+
+        if mouse_input.just_pressed(orbit_start) {
+            controller.write(EditorCamInputMessage::Start {
+                kind: MotionKind::OrbitZoom,
+                camera,
+                pointer,
+            });
+        } else if mouse_input.just_pressed(pan_start) {
+            controller.write(EditorCamInputMessage::Start {
+                kind: MotionKind::PanZoom,
+                camera,
+                pointer,
+            });
+        } else if mouse_wheel.read().map(|mw| mw.y.abs()).sum::<f32>() > 0.0 {
+            controller.write(EditorCamInputMessage::Start {
+                kind: MotionKind::Zoom,
+                camera,
+                pointer,
+            });
+        }
+    }
+
+    mouse_wheel.clear();
 }
 
 pub(crate) fn process_load_requests(
@@ -815,10 +902,7 @@ pub(crate) fn apply_selection_highlight(
 
 pub(crate) fn normalize_scene_and_setup_camera(
     mut state: ResMut<ViewerState>,
-    mut camera_query: Query<
-        (&mut Transform, &mut PanOrbitCamera),
-        With<MainCamera>,
-    >,
+    mut camera_query: Query<(&mut Transform, &mut EditorCam), With<MainCamera>>,
     mesh_query: Query<&Transform, (With<FaceMesh>, Without<MainCamera>)>,
 ) {
     let Some(bounds) = state.pending_bounds else {
@@ -854,17 +938,7 @@ pub(crate) fn normalize_scene_and_setup_camera(
     // Set up camera to view the scene from appropriate distance.
     // Use ~1.5x the max dimension for good framing.
     let camera_distance = max_dim * 1.5;
-    if let Ok((mut transform, mut pan_orbit)) = camera_query.single_mut() {
-        pan_orbit.focus = bounds.center;
-        pan_orbit.radius = Some(camera_distance);
-        // 45 degrees.
-        pan_orbit.yaw = Some(std::f32::consts::FRAC_PI_4);
-        // 30 degrees.
-        pan_orbit.pitch = Some(std::f32::consts::FRAC_PI_6);
-        pan_orbit.force_update = true;
-        // Force re-initialization.
-        pan_orbit.initialized = false;
-
+    if let Ok((mut transform, mut editor_cam)) = camera_query.single_mut() {
         // Set initial transform position.
         let yaw = std::f32::consts::FRAC_PI_4;
         let pitch = std::f32::consts::FRAC_PI_6;
@@ -875,6 +949,8 @@ pub(crate) fn normalize_scene_and_setup_camera(
         );
         transform.translation = bounds.center + offset;
         *transform = transform.looking_at(bounds.center, Vec3::Y);
+        editor_cam.last_anchor_depth = -(camera_distance as f64).abs();
+        editor_cam.current_motion = Default::default();
 
         log::info!(
             "Camera setup: focus=({:.2}, {:.2}, {:.2}), distance={:.2}",
@@ -1027,11 +1103,11 @@ pub(crate) fn recompute_colors_for_mesh(
     vec![color; vertex_count]
 }
 
-/// Disable PanOrbitCamera when egui wants pointer input (e.g., during panel
-/// resize) or when a clip-plane handle is being dragged.
+/// Disable the editor camera when egui wants pointer input or a handle is being
+/// dragged.
 pub(crate) fn disable_camera_when_egui_wants_input(
     mut contexts: EguiContexts,
-    mut camera_query: Query<&mut PanOrbitCamera, With<MainCamera>>,
+    mut camera_query: Query<&mut EditorCam, With<MainCamera>>,
     drag_state: Res<ClipPlaneDragState>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -1041,8 +1117,16 @@ pub(crate) fn disable_camera_when_egui_wants_input(
     let egui_wants_input =
         ctx.wants_pointer_input() || ctx.is_pointer_over_area();
 
-    if let Ok(mut pan_orbit) = camera_query.single_mut() {
-        pan_orbit.enabled = !egui_wants_input && !drag_state.dragging;
+    if let Ok(mut editor_cam) = camera_query.single_mut() {
+        let enabled = !egui_wants_input && !drag_state.dragging;
+        editor_cam.enabled_motion = EnabledMotion {
+            pan: enabled,
+            orbit: enabled,
+            zoom: enabled,
+        };
+        if !enabled {
+            editor_cam.current_motion = Default::default();
+        }
     }
 }
 

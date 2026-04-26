@@ -12,8 +12,12 @@ use bevy::{
     window::{PresentMode, WindowTheme},
     winit::WinitSettings,
 };
+use bevy_editor_cam::{
+    controller::MinimalEditorCamPlugin,
+    input::{CameraPointerMap, EditorCamInputMessage},
+    prelude::EditorCam,
+};
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass, EguiUserTextures};
-use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use state::{AppMode, BrowserState, ClipPlaneDragState, ViewerState};
 use std::{
     env,
@@ -98,7 +102,20 @@ fn main() {
         .add_plugins(bevy::pbr::wireframe::WireframePlugin::default())
         .add_plugins(EguiPlugin::default())
         .add_plugins(MeshPickingPlugin)
-        .add_plugins(PanOrbitCameraPlugin)
+        .add_plugins(MinimalEditorCamPlugin)
+        .add_message::<EditorCamInputMessage>()
+        .init_resource::<CameraPointerMap>()
+        .add_systems(
+            PreUpdate,
+            (
+                scene::editor_cam_mouse_inputs,
+                EditorCamInputMessage::receive_messages,
+                EditorCamInputMessage::send_pointer_inputs,
+            )
+                .chain()
+                .after(bevy::picking::PickingSystems::Last)
+                .before(EditorCam::update_camera_positions),
+        )
         .insert_resource(WinitSettings::desktop_app())
         .add_systems(Startup, scene::setup_scene)
         .add_systems(Startup, scene::configure_gizmos)
