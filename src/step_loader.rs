@@ -1316,6 +1316,35 @@ mod tests {
     }
 
     #[test]
+    fn ap224_conical_ring_face_stays_in_expected_z_band() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/ap224_995277945.stp");
+        let scene = load_step_file(&path).expect("STEP file should load");
+        let face = scene
+            .shells
+            .first()
+            .and_then(|shell| shell.faces.get(16))
+            .expect("one-based face 17 should be present");
+        let (min_z, max_z) = face
+            .mesh
+            .positions()
+            .iter()
+            .map(|point| point.z)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), z| {
+                (min.min(z), max.max(z))
+            });
+
+        assert!(
+            min_z > 0.58,
+            "face 17 should remain on the lower conical ring, got min_z={min_z}"
+        );
+        assert!(
+            max_z < 0.68,
+            "face 17 should remain on the lower conical ring, got max_z={max_z}"
+        );
+    }
+
+    #[test]
     fn step_shell_bounds_use_tessellated_mesh_positions() {
         let mesh = PolygonMesh::new(
             StandardAttributes {
