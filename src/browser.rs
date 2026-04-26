@@ -304,8 +304,12 @@ fn spawn_preview_scene(
     for (shell_idx, shell) in preview_data.shells.iter().enumerate() {
         for (face_idx, face) in shell.faces.iter().enumerate() {
             let global_idx = shell_idx * 100 + face_idx;
-            let (ui_rgb, apply_colors) =
-                face_display_color(global_idx, shell.color, true);
+            let (ui_rgb, apply_colors) = face_display_color(
+                global_idx,
+                face.color.or(shell.color),
+                true,
+                true,
+            );
             let (mesh, _) = bevy_mesh_from_polygon_normalized(
                 &face.mesh,
                 ui_rgb,

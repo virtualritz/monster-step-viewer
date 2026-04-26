@@ -18,6 +18,8 @@ pub(crate) struct PersistentSettings {
     pub panel_width: f32,
     pub right_panel_width: f32,
     pub show_random_colors: bool,
+    #[serde(default)]
+    pub show_step_colors: bool,
     pub show_bounding_box: bool,
     #[serde(default)]
     pub show_polygon_edges: bool,
@@ -45,6 +47,7 @@ impl Default for PersistentSettings {
             panel_width: DEFAULT_PANEL_WIDTH,
             right_panel_width: 380.0,
             show_random_colors: false,
+            show_step_colors: false,
             show_bounding_box: false,
             show_polygon_edges: false,
             tessellation_factor: DEFAULT_TESSELLATION_FACTOR,
@@ -114,6 +117,7 @@ pub(crate) fn auto_save_system(
         panel_width: state.panel_width,
         right_panel_width: state.right_panel_width,
         show_random_colors: state.show_random_colors,
+        show_step_colors: state.show_step_colors,
         show_bounding_box: state.show_bounding_box,
         show_polygon_edges: state.show_polygon_edges,
         show_wireframe: state.show_wireframe,

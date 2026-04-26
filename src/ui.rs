@@ -4,8 +4,8 @@ use crate::{
         start_preview_loads,
     },
     icons::{
-        ICON_BOUNDING_BOX, ICON_CASINO, ICON_EDGES, ICON_WIREFRAME,
-        configure_fonts, icon_text,
+        ICON_BOUNDING_BOX, ICON_CASINO, ICON_EDGES, ICON_PALETTE,
+        ICON_WIREFRAME, configure_fonts, icon_text,
     },
     state::{
         AppMode, BrowserState, DirectoryEntry, MainCamera, PreviewStatus,
@@ -1207,6 +1207,17 @@ fn viewer_ui(
                                 state.settings_dirty = true;
                             }
                             colors_btn.on_hover_text("Random colors");
+
+                            let step_colors_btn = ui.selectable_label(
+                                state.show_step_colors,
+                                icon_text(ICON_PALETTE),
+                            );
+                            if step_colors_btn.clicked() {
+                                state.show_step_colors = !state.show_step_colors;
+                                state.needs_mesh_rebuild = true;
+                                state.settings_dirty = true;
+                            }
+                            step_colors_btn.on_hover_text("STEP colors");
 
                             let bbox_btn = ui.selectable_label(
                                 state.show_bounding_box,

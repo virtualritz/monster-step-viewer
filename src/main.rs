@@ -49,6 +49,7 @@ fn main() {
             panel_width: settings.panel_width,
             right_panel_width: settings.right_panel_width,
             show_random_colors: settings.show_random_colors,
+            show_step_colors: settings.show_step_colors,
             show_bounding_box: settings.show_bounding_box,
             show_polygon_edges: settings.show_polygon_edges,
             show_wireframe: settings.show_wireframe,

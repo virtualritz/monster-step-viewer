@@ -404,7 +404,7 @@ pub(crate) fn parse_step_float(s: &str) -> Option<f64> {
 }
 
 /// Parse colors from raw STEP file content.
-/// Returns a map from shell entity ID to RGB color.
+/// Returns a map from styled entity ID to RGB color.
 pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
     let mut colours: HashMap<u64, [f32; 3]> = HashMap::new();
     // (style_refs, target_id).
@@ -455,9 +455,14 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
                     }
                 }
             }
-        } else if rest.starts_with("STYLED_ITEM")
-            || rest.starts_with("OVER_RIDING_STYLED_ITEM")
-        {
+        } else if rest.starts_with("OVER_RIDING_STYLED_ITEM") {
+            let refs = parse_hash_refs(rest);
+            if refs.len() >= 3 {
+                let target_id = refs[refs.len() - 2];
+                let style_refs: Vec<u64> = refs[..refs.len() - 2].to_vec();
+                styled_items.push((style_refs, target_id));
+            }
+        } else if rest.starts_with("STYLED_ITEM") {
             // STYLED_ITEM('name',(#style_refs),#target).
             let refs = parse_hash_refs(rest);
             if refs.len() >= 2 {
@@ -565,7 +570,7 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
         }
     }
 
-    // STYLED_ITEM targets -> shell colors.
+    // STYLED_ITEM targets -> entity colors.
     let mut shell_colors: HashMap<u64, [f32; 3]> = HashMap::new();
     for (style_refs, target_id) in &styled_items {
         // Find color through style refs.
@@ -582,7 +587,7 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
             if let Some(&shell_id) = manifold_to_shell.get(target_id) {
                 shell_colors.insert(shell_id, rgb);
             } else {
-                // Target might be the shell directly.
+                // Target might be a shell or face directly.
                 shell_colors.insert(*target_id, rgb);
             }
         }
@@ -591,10 +596,10 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
     log::info!("Color parsing:");
     log::info!("  {} COLOUR_RGB entries", colours.len());
     log::info!("  {} STYLED_ITEM entries", styled_items.len());
-    log::info!("  {} shell colors found", shell_colors.len());
+    log::info!("  {} entity colors found", shell_colors.len());
     for (&id, &rgb) in &shell_colors {
         log::info!(
-            "  Shell #{}: RGB({:.2}, {:.2}, {:.2})",
+            "  Entity #{}: RGB({:.2}, {:.2}, {:.2})",
             id,
             rgb[0],
             rgb[1],
@@ -603,4 +608,79 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
     }
 
     shell_colors
+}
+
+/// Parse shell face entity references from raw STEP file content.
+pub(crate) fn parse_shell_face_refs(raw: &str) -> HashMap<u64, Vec<u64>> {
+    let joined = preprocess_step_entities(raw);
+    let mut shell_faces = HashMap::new();
+
+    for entity in joined.split(';') {
+        let entity = entity.trim();
+        let Some(rest) = entity.strip_prefix('#') else {
+            continue;
+        };
+        let Some((id_str, rest)) = rest.split_once('=') else {
+            continue;
+        };
+        let Ok(id) = id_str.trim().parse::<u64>() else {
+            continue;
+        };
+        let rest = rest.trim();
+
+        if rest.starts_with("CLOSED_SHELL") || rest.starts_with("OPEN_SHELL") {
+            shell_faces.insert(id, parse_hash_refs(rest));
+        }
+    }
+
+    shell_faces
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overriding_styled_item_targets_overridden_face() {
+        let raw = "
+            #10 = MANIFOLD_SOLID_BREP('',#11);
+            #11 = CLOSED_SHELL('',(#12,#137));
+            #1068 = STYLED_ITEM('color',(#1069),#10);
+            #1069 = PRESENTATION_STYLE_ASSIGNMENT((#1070));
+            #1070 = SURFACE_STYLE_USAGE(.BOTH.,#1071);
+            #1071 = SURFACE_SIDE_STYLE('',(#1072));
+            #1072 = SURFACE_STYLE_FILL_AREA(#1073);
+            #1073 = FILL_AREA_STYLE('',(#1074));
+            #1074 = FILL_AREA_STYLE_COLOUR('',#1075);
+            #1075 = COLOUR_RGB('',1.,1.,0.);
+            #1076 = OVER_RIDING_STYLED_ITEM('overriding color',(#1077),#137,#1068);
+            #1077 = PRESENTATION_STYLE_ASSIGNMENT((#1078));
+            #1078 = SURFACE_STYLE_USAGE(.BOTH.,#1079);
+            #1079 = SURFACE_SIDE_STYLE('',(#1080));
+            #1080 = SURFACE_STYLE_FILL_AREA(#1081);
+            #1081 = FILL_AREA_STYLE('',(#1082));
+            #1082 = FILL_AREA_STYLE_COLOUR('',#1083);
+            #1083 = COLOUR_RGB('',1.,0.,0.);
+        ";
+
+        let colors = parse_step_colors(raw);
+
+        assert_eq!(colors.get(&11), Some(&[1.0, 1.0, 0.0]));
+        assert_eq!(colors.get(&137), Some(&[1.0, 0.0, 0.0]));
+        assert!(!colors.contains_key(&1068));
+    }
+
+    #[test]
+    fn shell_face_refs_preserve_step_shell_order() {
+        let raw = "
+            #11 = CLOSED_SHELL('',(#12,#86,
+                #137));
+            #20 = OPEN_SHELL('',(#21,#22));
+        ";
+
+        let shell_faces = parse_shell_face_refs(raw);
+
+        assert_eq!(shell_faces.get(&11), Some(&vec![12, 86, 137]));
+        assert_eq!(shell_faces.get(&20), Some(&vec![21, 22]));
+    }
 }

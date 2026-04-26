@@ -88,6 +88,7 @@ pub(crate) struct ViewerState {
     pub panel_width: f32,
     // Viewport overlay toggles.
     pub show_random_colors: bool,
+    pub show_step_colors: bool,
     pub show_bounding_box: bool,
     pub show_polygon_edges: bool,
     pub scene_data: Option<StepScene>,
@@ -180,6 +181,7 @@ impl Default for ViewerState {
             pending_bounds: None,
             panel_width: DEFAULT_PANEL_WIDTH,
             show_random_colors: false,
+            show_step_colors: false,
             show_bounding_box: false,
             show_polygon_edges: false,
             scene_data: None,

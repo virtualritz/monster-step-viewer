@@ -450,10 +450,12 @@ pub(crate) fn spawn_shell_faces_normalized(
 
     for (idx, face) in shell.faces.iter().enumerate() {
         let global_face_id = base_face_id + idx;
+        let step_color = face.color.or(shell.color);
         let (ui_rgb, apply_colors) = face_display_color(
             global_face_id,
-            shell.color,
+            step_color,
             state.show_random_colors,
+            state.show_step_colors,
         );
 
         let (mesh, tri_count) = bevy_mesh_from_polygon_normalized(
@@ -900,6 +902,7 @@ pub(crate) fn rebuild_meshes_on_toggle(
     };
 
     let use_random_colors = state.show_random_colors;
+    let use_step_colors = state.show_step_colors;
     let updates = {
         let mut updates = Vec::new();
         for shell in &scene.shells {
@@ -910,8 +913,9 @@ pub(crate) fn rebuild_meshes_on_toggle(
                     let face_record = &state.faces[face_index];
                     let (ui_color, apply_colors) = face_display_color(
                         face_record.id,
-                        shell.color,
+                        step_face.color.or(shell.color),
                         use_random_colors,
+                        use_step_colors,
                     );
                     let colors = recompute_colors_for_mesh(
                         &step_face.mesh,
@@ -972,17 +976,24 @@ pub(crate) fn face_display_color(
     face_id: usize,
     step_color: Option<[f32; 3]>,
     use_random_colors: bool,
+    use_step_colors: bool,
 ) -> ([f32; 3], bool) {
-    if use_random_colors {
-        let (_, random_color) = color_for_index(face_id);
-        let rgb = step_color
-            .map(|step_color| {
-                mix_step_and_random_color(step_color, random_color)
-            })
-            .unwrap_or(random_color);
-        (rgb, true)
-    } else {
-        (neutral_rgb(), false)
+    match (use_random_colors, use_step_colors, step_color) {
+        (false, false, _) => (neutral_rgb(), false),
+        (false, true, Some(step_color)) => (step_color, true),
+        (false, true, None) => (neutral_rgb(), false),
+        (true, false, _) => {
+            let (_, random_color) = color_for_index(face_id);
+            (random_color, true)
+        }
+        (true, true, Some(step_color)) => {
+            let (_, random_color) = color_for_index(face_id);
+            (mix_step_and_random_color(step_color, random_color), true)
+        }
+        (true, true, None) => {
+            let (_, random_color) = color_for_index(face_id);
+            (random_color, true)
+        }
     }
 }
 
@@ -1278,6 +1289,11 @@ pub(crate) fn retessellate_face(
 
     let tolerance = shell.tessellation_tolerance;
     let transform = shell.transform.as_ref();
+    let step_color = shell
+        .faces
+        .get(local_face_idx)
+        .and_then(|step_face| step_face.color)
+        .or(shell.color);
 
     // Determine actual boundary indices from the original compressed face.
     // Loop records are in order of the original boundaries. We need the indices
@@ -1308,8 +1324,12 @@ pub(crate) fn retessellate_face(
     };
 
     // Build the Bevy mesh from the new polygon mesh.
-    let (ui_color, apply_colors) =
-        face_display_color(face_id, shell.color, state.show_random_colors);
+    let (ui_color, apply_colors) = face_display_color(
+        face_id,
+        step_color,
+        state.show_random_colors,
+        state.show_step_colors,
+    );
     let (bevy_mesh, tri_count) = bevy_mesh_from_polygon_normalized(
         &polygon_mesh,
         ui_color,
@@ -1472,6 +1492,7 @@ pub(crate) fn rebuild_normals(
     let center = state.scene_center;
     let scale = state.scene_scale;
     let use_random_colors = state.show_random_colors;
+    let use_step_colors = state.show_step_colors;
 
     let updates = {
         let mut updates = Vec::new();
@@ -1485,8 +1506,9 @@ pub(crate) fn rebuild_normals(
                 let face_record = &state.faces[face_index];
                 let (ui_color, apply_colors) = face_display_color(
                     face_record.id,
-                    shell.color,
+                    step_face.color.or(shell.color),
                     use_random_colors,
+                    use_step_colors,
                 );
 
                 // Rebuild the entire mesh geometry (positions + normals +
@@ -2258,6 +2280,7 @@ fn solidify_clip_inner(
                         name: format!("Face {}", face_idx + 1),
                         mesh,
                         boundary_loops,
+                        color: None,
                     }
                 })
             })
@@ -2436,9 +2459,9 @@ mod tests {
     }
 
     #[test]
-    fn face_display_color_is_gray_when_random_colors_are_off() {
+    fn face_display_color_is_gray_without_random_or_step_colors() {
         let (rgb, apply_colors) =
-            face_display_color(7, Some([1.0, 0.8, 0.1]), false);
+            face_display_color(7, Some([1.0, 0.8, 0.1]), false, false);
 
         assert_rgb_near(
             rgb,
@@ -2448,9 +2471,19 @@ mod tests {
     }
 
     #[test]
+    fn face_display_color_uses_step_color_when_step_colors_are_on() {
+        let step_color = [1.0, 0.0, 0.0];
+        let (rgb, apply_colors) =
+            face_display_color(7, Some(step_color), false, true);
+
+        assert_rgb_near(rgb, step_color);
+        assert!(apply_colors);
+    }
+
+    #[test]
     fn face_display_color_randomizes_faces_without_step_color() {
         let (_, expected) = color_for_index(7);
-        let (rgb, apply_colors) = face_display_color(7, None, true);
+        let (rgb, apply_colors) = face_display_color(7, None, true, false);
 
         assert_rgb_near(rgb, expected);
         assert!(apply_colors);
@@ -2459,8 +2492,10 @@ mod tests {
     #[test]
     fn face_display_color_mixes_step_color_with_random_face_color() {
         let step_color = [1.0, 0.8, 0.1];
-        let (face_7, apply_7) = face_display_color(7, Some(step_color), true);
-        let (face_8, apply_8) = face_display_color(8, Some(step_color), true);
+        let (face_7, apply_7) =
+            face_display_color(7, Some(step_color), true, true);
+        let (face_8, apply_8) =
+            face_display_color(8, Some(step_color), true, true);
 
         assert!(apply_7);
         assert!(apply_8);

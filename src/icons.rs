@@ -4,8 +4,10 @@ use std::sync::Arc;
 /// Material Symbols font family name.
 const ICON_FONT_FAMILY: &str = "material_symbols";
 
-/// Random colors toggle (palette).
-pub(crate) const ICON_CASINO: &str = "\u{e40a}";
+/// Random colors toggle (casino).
+pub(crate) const ICON_CASINO: &str = "\u{e53f}";
+/// STEP colors toggle (palette).
+pub(crate) const ICON_PALETTE: &str = "\u{e40a}";
 /// Bounding box toggle (view_in_ar).
 pub(crate) const ICON_BOUNDING_BOX: &str = "\u{e97a}";
 /// Wireframe toggle (deployed_code).

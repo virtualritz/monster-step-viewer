@@ -36,6 +36,7 @@ fn count_failed_face_meshes<P, C>(
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -48,7 +49,9 @@ pub use monstertruck::step::load::ruststep::ast::Parameter;
 pub use transform::Transform;
 
 use mesh_utils::{apply_transform_to_mesh, extract_mesh_edges};
-use parsing::{parse_assembly_transforms, parse_step_colors};
+use parsing::{
+    parse_assembly_transforms, parse_shell_face_refs, parse_step_colors,
+};
 
 /// A named header entry from the STEP file.
 #[derive(Clone, Debug)]
@@ -121,6 +124,8 @@ pub struct StepFace {
     pub name: String,
     pub mesh: PolygonMesh,
     pub boundary_loops: Vec<StepBoundaryLoop>,
+    /// RGB color from STEP file (if any).
+    pub color: Option<[f32; 3]>,
 }
 
 /// A STEP shell containing multiple faces.
@@ -362,6 +367,32 @@ fn build_shell_to_solid_map(
     shell_to_solid
 }
 
+fn face_colors_for_shell(
+    shell_id: &u64,
+    shell_face_refs: &HashMap<u64, Vec<u64>>,
+    entity_colors: &HashMap<u64, [f32; 3]>,
+) -> Vec<Option<[f32; 3]>> {
+    shell_face_refs
+        .get(shell_id)
+        .map(|face_refs| {
+            face_refs
+                .iter()
+                .map(|face_id| entity_colors.get(face_id).copied())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn face_color_at(
+    face_colors: &[Option<[f32; 3]>],
+    face_idx: usize,
+) -> Option<[f32; 3]> {
+    match face_colors.get(face_idx) {
+        Some(color) => *color,
+        None => None,
+    }
+}
+
 /// Build the `StepTopology` for a shell, given the shell-to-solid mapping.
 ///
 /// If the shell belongs to a solid, call `to_compressed_solid` and wrap as
@@ -471,6 +502,8 @@ pub fn load_step_file_with_progress(
             .first()
             .context("STEP file has no data sections")?,
     );
+    let entity_colors = parse_step_colors(&raw);
+    let shell_face_refs = parse_shell_face_refs(&raw);
 
     // Extract metadata.
     let metadata = StepMetadata {
@@ -507,6 +540,12 @@ pub fn load_step_file_with_progress(
         .into_par_iter()
         .enumerate()
         .map(|(local_idx, (shell_id, shell_holder))| {
+            let color = entity_colors.get(shell_id).copied();
+            let face_colors = face_colors_for_shell(
+                shell_id,
+                &shell_face_refs,
+                &entity_colors,
+            );
             let compressed = table
                 .to_compressed_trimmed_shell(shell_holder)
                 .map_err(|e| {
@@ -605,6 +644,7 @@ pub fn load_step_file_with_progress(
                                 name: format!("Face {}", face_idx + 1),
                                 mesh,
                                 boundary_loops,
+                                color: face_color_at(&face_colors, face_idx),
                             })
                         }
                     })
@@ -626,7 +666,7 @@ pub fn load_step_file_with_progress(
                 id: local_idx,
                 name: format!("Shell {}", local_idx + 1),
                 faces,
-                color: None,
+                color,
                 transform: None,
                 edges: all_edges,
                 curve_edges,
@@ -685,6 +725,7 @@ struct PreparedShell {
     topology: Option<StepTopology>,
     curve_types: Vec<String>,
     color: Option<[f32; 3]>,
+    face_colors: Vec<Option<[f32; 3]>>,
     transform: Option<Transform>,
     bounds: Option<StepBounds>,
     tolerance: f64,
@@ -762,6 +803,7 @@ fn load_step_from_string_inner(
             rgb[2]
         );
     }
+    let shell_face_refs = parse_shell_face_refs(raw);
 
     // Parse assembly transforms.
     let assembly_transforms = parse_assembly_transforms(raw);
@@ -820,6 +862,11 @@ fn load_step_from_string_inner(
             .map(|(local_idx, (shell_id, shell_holder))| {
                 // Look up color for this shell's entity ID.
                 let color = entity_colors.get(shell_id).copied();
+                let face_colors = face_colors_for_shell(
+                    shell_id,
+                    &shell_face_refs,
+                    &entity_colors,
+                );
                 // Look up assembly transform for this shell.
                 let transform = assembly_transforms.get(shell_id).copied();
                 log::info!(
@@ -886,6 +933,7 @@ fn load_step_from_string_inner(
                     topology,
                     curve_types,
                     color,
+                    face_colors,
                     transform,
                     bounds,
                     tolerance: tol,
@@ -913,6 +961,7 @@ fn load_step_from_string_inner(
                 topology,
                 curve_types,
                 color,
+                face_colors,
                 transform,
                 bounds: shell_bounds,
                 tolerance: tol,
@@ -999,6 +1048,7 @@ fn load_step_from_string_inner(
                                 name: format!("Face {}", face_idx + 1),
                                 mesh,
                                 boundary_loops,
+                                color: face_color_at(&face_colors, face_idx),
                             })
                         }
                     })
@@ -1291,6 +1341,7 @@ mod tests {
                 name: "face".to_string(),
                 mesh,
                 boundary_loops: Vec::new(),
+                color: None,
             }],
             color: None,
             transform: None,
