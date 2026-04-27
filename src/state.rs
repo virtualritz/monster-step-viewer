@@ -78,6 +78,9 @@ pub(crate) enum Selection {
 #[derive(Debug, Resource)]
 pub(crate) struct ViewerState {
     pub pending_path: Option<PathBuf>,
+    /// When set, re-tessellate the cached `scene_data` at this tolerance
+    /// factor instead of re-parsing the source file.
+    pub pending_retessellate: Option<f64>,
     pub loaded_path: Option<PathBuf>,
     pub metadata: Option<StepMetadata>,
     pub shells: Vec<ShellRecord>,
@@ -172,6 +175,7 @@ impl Default for ViewerState {
     fn default() -> Self {
         Self {
             pending_path: None,
+            pending_retessellate: None,
             loaded_path: None,
             metadata: None,
             shells: Vec::new(),
@@ -293,6 +297,14 @@ pub(crate) struct ClipPlaneHandle {
 #[derive(Resource, Default, Debug)]
 pub(crate) struct ClipPlaneDragState {
     pub dragging: bool,
+}
+
+/// Tracks left-mouse clicks in the viewport so that clicking empty space
+/// (no face mesh hit) clears the current selection.
+#[derive(Resource, Default, Debug)]
+pub(crate) struct ViewportClickGuard {
+    pub press_pos: Option<Vec2>,
+    pub mesh_consumed: bool,
 }
 
 #[derive(Debug)]

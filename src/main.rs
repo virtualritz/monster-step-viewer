@@ -18,7 +18,9 @@ use bevy_editor_cam::{
     prelude::EditorCam,
 };
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass, EguiUserTextures};
-use state::{AppMode, BrowserState, ClipPlaneDragState, ViewerState};
+use state::{
+    AppMode, BrowserState, ClipPlaneDragState, ViewerState, ViewportClickGuard,
+};
 use std::{
     env,
     path::PathBuf,
@@ -79,6 +81,7 @@ fn main() {
         })
         .insert_resource(persistence::SaveTimer::default())
         .insert_resource(ClipPlaneDragState::default())
+        .insert_resource(ViewportClickGuard::default())
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
@@ -130,6 +133,7 @@ fn main() {
         .add_systems(Update, scene::apply_face_visibility)
         .add_systems(Update, scene::apply_selection_highlight)
         .add_systems(Update, scene::disable_camera_when_egui_wants_input)
+        .add_systems(Update, scene::clear_selection_on_empty_click)
         .add_systems(Update, scene::draw_gizmos)
         .add_systems(Update, scene::retessellate_face)
         .add_systems(Update, scene::update_clip_plane_uniforms)

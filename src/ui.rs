@@ -21,6 +21,19 @@ use bevy_egui::{EguiContextSettings, EguiContexts, PrimaryEguiContext, egui};
 use monster_step_viewer::Parameter;
 use std::{cell::Cell, sync::atomic::Ordering};
 
+const TOOLBAR_ICON_BUTTON_SIZE: f32 = 26.0;
+
+fn toolbar_icon_toggle(
+    ui: &mut egui::Ui,
+    selected: bool,
+    icon: &str,
+) -> egui::Response {
+    ui.add_sized(
+        egui::vec2(TOOLBAR_ICON_BUTTON_SIZE, TOOLBAR_ICON_BUTTON_SIZE),
+        egui::Button::selectable(selected, icon_text(icon)),
+    )
+}
+
 /// Clickable collapse/expand arrow drawn with the painter (font-independent).
 fn collapse_arrow(ui: &mut egui::Ui, is_open: bool) -> egui::Response {
     let size = egui::vec2(ui.spacing().indent, ui.spacing().interact_size.y);
@@ -628,7 +641,10 @@ fn viewer_ui(
                                                 "{} ({} tris)",
                                                 face.name, face.triangles
                                             );
-                                            let label = ui.selectable_label(face_sel, face_text);
+                                            let label = ui.add(
+                                                egui::Button::selectable(face_sel, face_text)
+                                                    .truncate(),
+                                            );
                                             if label.clicked() {
                                                 new_selection.set(Some(if face_sel {
                                                     None
@@ -726,7 +742,10 @@ fn viewer_ui(
                                                         }
 
                                                         // Selectable label for selection.
-                                                        let label = ui.selectable_label(loop_sel, &loop_label);
+                                                        let label = ui.add(
+                                                            egui::Button::selectable(loop_sel, &loop_label)
+                                                                .truncate(),
+                                                        );
                                                         if label.clicked() {
                                                             new_selection.set(Some(if loop_sel {
                                                                 None
@@ -805,15 +824,17 @@ fn viewer_ui(
                                                                                     edge_id,
                                                                                 ),
                                                                             );
-                                                                    let edge_resp = ui
-                                                                        .selectable_label(
+                                                                    let edge_resp = ui.add(
+                                                                        egui::Button::selectable(
                                                                             is_sel,
                                                                             format!(
                                                                             "{} ({} pts)",
                                                                             edge.name,
                                                                             edge.point_count
                                                                         ),
-                                                                        );
+                                                                        )
+                                                                        .truncate(),
+                                                                    );
                                                                     if edge_resp.clicked()
                                                                     {
                                                                         new_selection.set(
@@ -851,12 +872,15 @@ fn viewer_ui(
                                             ui.colored_label(color, "\u{25a0}");
                                             let face_sel =
                                                 current_selection == Some(Selection::Face(face_id));
-                                            let face_label = ui.selectable_label(
-                                                face_sel,
-                                                format!(
-                                                    "{} ({} tris)",
-                                                    face.name, face.triangles
-                                                ),
+                                            let face_label = ui.add(
+                                                egui::Button::selectable(
+                                                    face_sel,
+                                                    format!(
+                                                        "{} ({} tris)",
+                                                        face.name, face.triangles
+                                                    ),
+                                                )
+                                                .truncate(),
                                             );
                                             if face_label.clicked() {
                                                 new_selection.set(Some(if face_sel {
@@ -901,12 +925,15 @@ fn viewer_ui(
                                                 }
                                                 let is_sel = current_selection
                                                     == Some(Selection::Edge(edge_id));
-                                                let sa_edge_resp = ui.selectable_label(
-                                                    is_sel,
-                                                    format!(
-                                                        "{} ({} pts)",
-                                                        edge.name, edge.point_count
-                                                    ),
+                                                let sa_edge_resp = ui.add(
+                                                    egui::Button::selectable(
+                                                        is_sel,
+                                                        format!(
+                                                            "{} ({} pts)",
+                                                            edge.name, edge.point_count
+                                                        ),
+                                                    )
+                                                    .truncate(),
                                                 );
                                                 if sa_edge_resp.clicked() {
                                                     new_selection.set(Some(if is_sel {
@@ -1186,21 +1213,25 @@ fn viewer_ui(
 
                             if !slider.dragged()
                                 && factor_changed
-                                && state.loaded_path.is_some()
+                                && state.scene_data.is_some()
                                 && state.loading_job.is_none()
                             {
                                 log::info!(
-                                    "Quality changed: reloading with tessellation_factor={:.6}",
+                                    "Quality changed: re-tessellating with tessellation_factor={:.6}",
                                     state.tessellation_factor
                                 );
-                                state.pending_path = state.loaded_path.clone();
+                                state.pending_retessellate =
+                                    Some(state.tessellation_factor);
                             }
                             slider.on_hover_text("Tessellation quality");
 
                             ui.separator();
 
-                            let colors_btn = ui
-                                .selectable_label(state.show_random_colors, icon_text(ICON_CASINO));
+                            let colors_btn = toolbar_icon_toggle(
+                                ui,
+                                state.show_random_colors,
+                                ICON_CASINO,
+                            );
                             if colors_btn.clicked() {
                                 state.show_random_colors = !state.show_random_colors;
                                 state.needs_mesh_rebuild = true;
@@ -1208,9 +1239,10 @@ fn viewer_ui(
                             }
                             colors_btn.on_hover_text("Random colors");
 
-                            let step_colors_btn = ui.selectable_label(
+                            let step_colors_btn = toolbar_icon_toggle(
+                                ui,
                                 state.show_step_colors,
-                                icon_text(ICON_PALETTE),
+                                ICON_PALETTE,
                             );
                             if step_colors_btn.clicked() {
                                 state.show_step_colors = !state.show_step_colors;
@@ -1219,9 +1251,10 @@ fn viewer_ui(
                             }
                             step_colors_btn.on_hover_text("STEP colors");
 
-                            let bbox_btn = ui.selectable_label(
+                            let bbox_btn = toolbar_icon_toggle(
+                                ui,
                                 state.show_bounding_box,
-                                icon_text(ICON_BOUNDING_BOX),
+                                ICON_BOUNDING_BOX,
                             );
                             if bbox_btn.clicked() {
                                 state.show_bounding_box = !state.show_bounding_box;
@@ -1229,16 +1262,22 @@ fn viewer_ui(
                             }
                             bbox_btn.on_hover_text("Bounding box");
 
-                            let wire_btn = ui
-                                .selectable_label(state.show_polygon_edges, icon_text(ICON_WIREFRAME));
+                            let wire_btn = toolbar_icon_toggle(
+                                ui,
+                                state.show_polygon_edges,
+                                ICON_WIREFRAME,
+                            );
                             if wire_btn.clicked() {
                                 state.show_polygon_edges = !state.show_polygon_edges;
                                 state.settings_dirty = true;
                             }
                             wire_btn.on_hover_text("Polygon edges");
 
-                            let edge_btn =
-                                ui.selectable_label(state.show_wireframe, icon_text(ICON_EDGES));
+                            let edge_btn = toolbar_icon_toggle(
+                                ui,
+                                state.show_wireframe,
+                                ICON_EDGES,
+                            );
                             if edge_btn.clicked() {
                                 state.show_wireframe = !state.show_wireframe;
                                 state.settings_dirty = true;

@@ -34,7 +34,7 @@ use crate::{
         ClipPlaneHandle, EdgeRecord, FaceMesh, FaceRecord,
         KEY_LIGHT_ILLUMINANCE, LoadJob, LoopRecord, MATERIAL_METALLIC,
         MATERIAL_ROUGHNESS, MainCamera, NEUTRAL_GRAY, Selection, ShadingMode,
-        ShellRecord, SolidifyJob, ViewerState,
+        ShellRecord, SolidifyJob, ViewerState, ViewportClickGuard,
     },
     viewer_material::{ViewerMaterial, ViewerMaterialExt},
 };
@@ -257,6 +257,53 @@ pub(crate) fn process_load_requests(
         }
     }
 
+    // Re-tessellate the cached scene if the slider was changed (no re-parse).
+    if let Some(factor) = state.pending_retessellate.take()
+        && state.loading_job.is_none()
+        && let Some(scene) = state.scene_data.take()
+    {
+        let StepScene { metadata, shells } = scene;
+        let path = state.loaded_path.clone().unwrap_or_default();
+
+        let receiver = monster_step_viewer::retessellate_scene_streaming(
+            shells,
+            factor,
+        );
+
+        for entity in existing_meshes.iter() {
+            commands.entity(entity).despawn();
+        }
+        for entity in clip_handles.iter() {
+            commands.entity(entity).despawn();
+        }
+        state.shells.clear();
+        state.faces.clear();
+        state.edges.clear();
+        state.loops.clear();
+        state.selection = None;
+        state.prev_selection = None;
+        state.error = None;
+
+        // Keep metadata; shells will be repopulated as messages arrive.
+        state.scene_data = Some(StepScene {
+            metadata,
+            shells: Vec::new(),
+        });
+
+        state.loading_job = Some(LoadJob {
+            path,
+            receiver: parking_lot::Mutex::new(receiver),
+            phase: LoadPhase::Meshing,
+            current_shell: 0,
+            total_shells: 0,
+        });
+        info!(
+            "Re-tessellating scene at factor {:.6} (cached parse reused)",
+            factor
+        );
+        return;
+    }
+
     // Determine the load source: local file path or fetched URL data.
     let load_source = if let Some(path) = state.pending_path.take() {
         let receiver = monster_step_viewer::load_step_file_streaming(
@@ -309,15 +356,31 @@ pub(crate) fn process_load_requests(
         return;
     };
 
-    // Collect all available messages first (to avoid borrow issues).
+    // Drain messages, but cap per-frame Shell processing so a flood of
+    // streamed shells doesn't stall the main thread. Non-Shell messages are
+    // cheap and keep flowing.
+    const MAX_SHELLS_PER_FRAME: usize = 4;
     let (messages, disconnected): (Vec<_>, bool) = {
         let receiver = job.receiver.lock();
         let mut messages = Vec::new();
         let mut disconnected = false;
+        let mut shells_this_frame = 0usize;
 
         loop {
             match receiver.try_recv() {
-                Ok(msg) => messages.push(msg),
+                Ok(msg) => {
+                    let is_shell = matches!(
+                        msg,
+                        monster_step_viewer::LoadMessage::Shell(_)
+                    );
+                    messages.push(msg);
+                    if is_shell {
+                        shells_this_frame += 1;
+                        if shells_this_frame >= MAX_SHELLS_PER_FRAME {
+                            break;
+                        }
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -1779,14 +1842,66 @@ pub(crate) fn on_mesh_click(
     click: On<Pointer<Click>>,
     face_query: Query<&FaceMesh>,
     mut state: ResMut<ViewerState>,
+    mut guard: ResMut<ViewportClickGuard>,
 ) {
     // Only respond to primary (left) button.
     if click.button != PointerButton::Primary {
         return;
     }
+    // Any click that lands on a picked entity (face mesh, clip handle, etc.)
+    // counts as consumed so the empty-viewport-click handler doesn't also
+    // clear the selection.
+    guard.mesh_consumed = true;
     if let Ok(face_mesh) = face_query.get(click.entity) {
         state.selection = Some(Selection::Face(face_mesh.face_id));
         state.selection_from_viewport = true;
+    }
+}
+
+/// Click on empty viewport space (no face mesh hit) clears the selection.
+pub(crate) fn clear_selection_on_empty_click(
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    mut contexts: EguiContexts,
+    drag_state: Res<ClipPlaneDragState>,
+    mut guard: ResMut<ViewportClickGuard>,
+    mut state: ResMut<ViewerState>,
+) {
+    const CLICK_DRAG_THRESHOLD_SQ: f32 = 16.0;
+
+    let cursor_pos =
+        windows.single().ok().and_then(|w| w.cursor_position());
+
+    if mouse.just_pressed(MouseButton::Left) {
+        guard.press_pos = cursor_pos;
+        guard.mesh_consumed = false;
+    }
+
+    if mouse.just_released(MouseButton::Left) {
+        let press = guard.press_pos.take();
+        let consumed = std::mem::take(&mut guard.mesh_consumed);
+
+        if consumed || drag_state.dragging {
+            return;
+        }
+
+        let Ok(ctx) = contexts.ctx_mut() else {
+            return;
+        };
+        if ctx.wants_pointer_input() || ctx.is_pointer_over_area() {
+            return;
+        }
+
+        let (Some(p0), Some(p1)) = (press, cursor_pos) else {
+            return;
+        };
+        if (p1 - p0).length_squared() > CLICK_DRAG_THRESHOLD_SQ {
+            return;
+        }
+
+        if state.selection.is_some() {
+            state.selection = None;
+        }
     }
 }
 

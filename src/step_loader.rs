@@ -2,7 +2,7 @@ mod mesh_utils;
 mod parsing;
 pub mod transform;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use monstertruck::{
     meshing::prelude::*,
     step::load::{
@@ -244,6 +244,7 @@ impl StepBounds {
     }
 }
 
+#[cfg(test)]
 fn bounds_from_step_shells(shells: &[StepShell]) -> Option<StepBounds> {
     StepBounds::from_points(shells.iter().flat_map(|shell| {
         shell.faces.iter().flat_map(|face| {
@@ -950,11 +951,21 @@ fn load_step_from_string_inner(
 
     tx.send(LoadMessage::Phase(LoadPhase::Meshing))?;
 
+    // Send scene bounds before any Shell so the message handler can size and
+    // normalise meshes as they stream in.
+    let scene_bounds = prepared_shells
+        .iter()
+        .filter_map(|p| p.bounds)
+        .reduce(StepBounds::union);
+    if let Some(bounds) = scene_bounds {
+        tx.send(LoadMessage::Bounds(bounds))?;
+    }
+
     let completed = Arc::new(AtomicUsize::new(0));
 
-    let mut shells: Vec<StepShell> = prepared_shells
+    prepared_shells
         .into_par_iter()
-        .map(|prepared| {
+        .for_each_with(tx.clone(), |tx, prepared| {
             let PreparedShell {
                 local_idx,
                 compressed,
@@ -1080,7 +1091,7 @@ fn load_step_from_string_inner(
                 total,
             });
 
-            StepShell {
+            let shell = StepShell {
                 id: local_idx,
                 name: format!("Shell {}", local_idx + 1),
                 faces,
@@ -1092,21 +1103,9 @@ fn load_step_from_string_inner(
                 topology,
                 tessellation_tolerance: tol,
                 failed_faces,
-            }
-        })
-        .collect();
-
-    shells.sort_by_key(|shell| shell.id);
-
-    if let Some(bounds) = bounds_from_step_shells(&shells) {
-        tx.send(LoadMessage::Bounds(bounds))?;
-    }
-
-    for shell in shells {
-        tx.send(LoadMessage::Shell(shell)).map_err(|_| {
-            anyhow!("load receiver dropped while sending STEP shell")
-        })?;
-    }
+            };
+            let _ = tx.send(LoadMessage::Shell(shell));
+        });
 
     tx.send(LoadMessage::Done)?;
     Ok(())
@@ -1152,6 +1151,172 @@ pub fn retessellate_face(
     }
 
     Some(mesh)
+}
+
+/// Re-tessellate every shell in a previously parsed scene at a new tolerance
+/// factor. Streams `Shell`/`Progress`/`Done` messages compatible with
+/// [`load_step_file_streaming`] so the same UI message-loop can drive both.
+///
+/// `shells` are consumed; the returned shells include the same
+/// `original_shell` data so subsequent re-tessellations keep working.
+pub fn retessellate_scene_streaming(
+    shells: Vec<StepShell>,
+    tolerance_factor: f64,
+) -> Receiver<LoadMessage> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = retessellate_scene_inner(shells, tolerance_factor, &tx);
+    });
+    rx
+}
+
+fn retessellate_scene_inner(
+    shells: Vec<StepShell>,
+    tolerance_factor: f64,
+    tx: &Sender<LoadMessage>,
+) -> anyhow::Result<()> {
+    tx.send(LoadMessage::Phase(LoadPhase::Meshing))?;
+    let total = shells.len();
+    tx.send(LoadMessage::TotalShells(total))?;
+
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    // Stream each re-meshed shell as it completes; the existing
+    // scene_center / scene_scale stay valid (geometry hasn't moved), so no
+    // Bounds message is sent.
+    shells.into_par_iter().for_each_with(
+        tx.clone(),
+        |tx, shell| {
+            let new_shell = retessellate_one_shell(&shell, tolerance_factor)
+                .unwrap_or(shell);
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = tx.send(LoadMessage::Progress {
+                phase: LoadPhase::Meshing,
+                current: done,
+                total,
+            });
+            let _ = tx.send(LoadMessage::Shell(new_shell));
+        },
+    );
+
+    tx.send(LoadMessage::Done)?;
+    Ok(())
+}
+
+fn retessellate_one_shell(
+    shell: &StepShell,
+    tolerance_factor: f64,
+) -> Option<StepShell> {
+    let shell_data = shell.original_shell.as_ref()?;
+    let compressed: &OriginalShell = shell_data.downcast_ref()?;
+    let transform = shell.transform;
+
+    let bounds = compute_shell_bounds(compressed, transform.as_ref());
+    let diameter = bounds.map(StepBounds::diameter).unwrap_or_default();
+    let mut tol = f64::max(diameter * tolerance_factor, TOLERANCE);
+    if !tol.is_finite() {
+        tol = 0.01;
+    }
+
+    let poly_shell = compressed.clone().robust_triangulation(tol);
+    let mut failed_faces = count_failed_face_meshes(&poly_shell);
+
+    // Preserve curve_type and per-face colors from the previous tessellation.
+    let curve_types: Vec<String> = shell
+        .curve_edges
+        .iter()
+        .map(|e| e.curve_type.clone())
+        .collect();
+    let face_colors: Vec<Option<[f32; 3]>> =
+        shell.faces.iter().map(|f| f.color).collect();
+
+    let curve_edges: Vec<StepEdge> = poly_shell
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(i, edge)| {
+            let points = edge
+                .curve
+                .iter()
+                .map(|p| {
+                    let mut coord = [p.x, p.y, p.z];
+                    if let Some(xform) = transform.as_ref() {
+                        coord = xform.transform_point(coord);
+                    }
+                    coord
+                })
+                .collect();
+            StepEdge {
+                id: i,
+                curve_type: curve_types
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                points,
+            }
+        })
+        .collect();
+
+    let mut all_edges: Vec<([f64; 3], [f64; 3])> = Vec::new();
+    let faces: Vec<StepFace> = poly_shell
+        .faces
+        .iter()
+        .enumerate()
+        .filter_map(|(face_idx, face)| {
+            face.surface.as_ref().and_then(|surface| {
+                let mut mesh = if face.orientation {
+                    surface.clone()
+                } else {
+                    surface.inverse()
+                };
+                if let Some(xform) = transform.as_ref() {
+                    apply_transform_to_mesh(&mut mesh, xform);
+                }
+                if !mesh_fits_shell_bounds(&mesh, bounds, tol) {
+                    failed_faces += 1;
+                    None
+                } else {
+                    let face_edges = extract_mesh_edges(&mesh, None);
+                    all_edges.extend(face_edges);
+
+                    let boundary_loops: Vec<StepBoundaryLoop> = face
+                        .boundaries
+                        .iter()
+                        .enumerate()
+                        .map(|(loop_idx, loop_edges)| StepBoundaryLoop {
+                            edge_indices: loop_edges
+                                .iter()
+                                .map(|ei| ei.index)
+                                .collect(),
+                            is_outer: loop_idx == 0,
+                        })
+                        .collect();
+
+                    Some(StepFace {
+                        id: face_idx,
+                        name: format!("Face {}", face_idx + 1),
+                        mesh,
+                        boundary_loops,
+                        color: face_color_at(&face_colors, face_idx),
+                    })
+                }
+            })
+        })
+        .collect();
+
+    Some(StepShell {
+        id: shell.id,
+        name: shell.name.clone(),
+        faces,
+        color: shell.color,
+        transform,
+        edges: all_edges,
+        curve_edges,
+        original_shell: shell.original_shell.clone(),
+        topology: shell.topology.clone(),
+        tessellation_tolerance: tol,
+        failed_faces,
+    })
 }
 
 fn classify_curve_type(curve: &Curve3D) -> String {
