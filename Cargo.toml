@@ -39,6 +39,12 @@ monstertruck = { path = "../truck/.worktrees/yang-loops-store-clean-path/monster
     "yang",
 ] }
 
+# meshopt wraps the C++ meshoptimizer library. Keep it native-only for now;
+# the wasm build still gets indexed meshes, just without the
+# vertex-cache/vertex-fetch reordering.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+meshopt = "0.6"
+
 [profile.release]
 opt-level = 2 # fast and small wasm
 

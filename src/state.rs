@@ -279,12 +279,39 @@ pub(crate) struct ShellRecord {
     pub face_ids: Vec<usize>,
     /// Edge IDs not referenced by any face boundary (standalone curves).
     pub standalone_edge_ids: Vec<usize>,
+    /// The merged mesh asset for this shell (one per shell — every face's
+    /// triangles are baked into it). Empty until the shell is spawned.
+    pub mesh_handle: Handle<Mesh>,
+    /// Maps each merged-mesh vertex to a face-local index (0..faces.len()).
+    /// Survives meshopt's vertex-fetch remap, so it stays valid for the life
+    /// of the mesh. Used to update vertex colors per face without rebuilding
+    /// geometry (color toggles, selection tint).
+    pub vertex_face_index: Vec<u32>,
 }
 
 #[derive(Component, Debug)]
 pub(crate) struct FaceMesh {
     pub face_id: usize,
 }
+
+/// Marker on the per-shell merged mesh entity.
+#[derive(Component, Debug)]
+pub(crate) struct ShellMesh {
+    pub shell_id: usize,
+}
+
+/// Marker on the per-shell line-list mesh that draws all polygon (triangle)
+/// edges. Spawned alongside the main shell mesh; visibility tracks
+/// `state.show_polygon_edges` together with the shell's own visibility.
+#[derive(Component, Debug)]
+pub(crate) struct PolygonEdgesMesh {
+    pub shell_id: usize,
+}
+
+/// Shared material handle used by every per-shell polygon-edges line-list
+/// entity. One asset, regardless of shell count.
+#[derive(Resource)]
+pub(crate) struct PolygonEdgesMaterial(pub Handle<bevy::prelude::StandardMaterial>);
 
 /// Marker for the translucent 3D quad that visualises a clip plane.
 #[derive(Component, Debug)]

@@ -20,6 +20,58 @@ const SHADER_PATH: &str = "shaders/viewer_material.wgsl";
 #[derive(Resource)]
 pub(crate) struct MatcapTexture(pub Handle<Image>);
 
+/// Three shared `ViewerMaterial` handles cover every face mesh in the scene:
+/// the default appearance plus selection and hover variants whose only
+/// difference is `base.emissive`. Sharing materials across faces collapses
+/// the draw-call count to roughly one per (mesh, palette-slot) pair so Bevy
+/// can batch instead of submitting one draw per face.
+#[derive(Resource, Clone)]
+pub(crate) struct MaterialPalette {
+    pub default: Handle<ViewerMaterial>,
+    pub selected: Handle<ViewerMaterial>,
+    pub hovered: Handle<ViewerMaterial>,
+}
+
+/// Selection emissive (warm orange) baked into the `selected` palette entry.
+pub(crate) const SELECTION_EMISSIVE: LinearRgba =
+    LinearRgba::new(0.6, 0.45, 0.0, 1.0);
+/// Hover emissive — same hue, dimmer.
+pub(crate) const HOVER_EMISSIVE: LinearRgba =
+    LinearRgba::new(0.2, 0.15, 0.0, 1.0);
+
+fn base_material() -> ViewerMaterial {
+    use bevy::pbr::ExtendedMaterial;
+    ExtendedMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.4,
+            metallic: 0.0,
+            ..Default::default()
+        },
+        extension: ViewerMaterialExt::default(),
+    }
+}
+
+/// Create the three shared face materials.
+pub(crate) fn setup_material_palette(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<ViewerMaterial>>,
+) {
+    let default = materials.add(base_material());
+    let mut sel_mat = base_material();
+    sel_mat.base.emissive = SELECTION_EMISSIVE;
+    let selected = materials.add(sel_mat);
+    let mut hov_mat = base_material();
+    hov_mat.base.emissive = HOVER_EMISSIVE;
+    let hovered = materials.add(hov_mat);
+
+    commands.insert_resource(MaterialPalette {
+        default,
+        selected,
+        hovered,
+    });
+}
+
 /// Material extension carrying clip-plane and shading uniforms.
 ///
 /// Binding slot 100 avoids conflicts with `StandardMaterial` bindings (0-99).

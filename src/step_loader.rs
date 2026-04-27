@@ -963,9 +963,9 @@ fn load_step_from_string_inner(
 
     let completed = Arc::new(AtomicUsize::new(0));
 
-    prepared_shells
-        .into_par_iter()
-        .for_each_with(tx.clone(), |tx, prepared| {
+    prepared_shells.into_par_iter().for_each_with(
+        tx.clone(),
+        |tx, prepared| {
             let PreparedShell {
                 local_idx,
                 compressed,
@@ -1105,7 +1105,8 @@ fn load_step_from_string_inner(
                 failed_faces,
             };
             let _ = tx.send(LoadMessage::Shell(shell));
-        });
+        },
+    );
 
     tx.send(LoadMessage::Done)?;
     Ok(())
@@ -1182,11 +1183,11 @@ fn retessellate_scene_inner(
     let completed = Arc::new(AtomicUsize::new(0));
 
     // Stream each re-meshed shell as it completes; the existing
-    // scene_center / scene_scale stay valid (geometry hasn't moved), so no
+    // scene_center/scene_scale stay valid (geometry hasn't moved), so no
     // Bounds message is sent.
-    shells.into_par_iter().for_each_with(
-        tx.clone(),
-        |tx, shell| {
+    shells
+        .into_par_iter()
+        .for_each_with(tx.clone(), |tx, shell| {
             let new_shell = retessellate_one_shell(&shell, tolerance_factor)
                 .unwrap_or(shell);
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1196,8 +1197,7 @@ fn retessellate_scene_inner(
                 total,
             });
             let _ = tx.send(LoadMessage::Shell(new_shell));
-        },
-    );
+        });
 
     tx.send(LoadMessage::Done)?;
     Ok(())

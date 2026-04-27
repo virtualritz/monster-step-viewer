@@ -103,8 +103,16 @@ fn main() {
         )
         .add_plugins(bevy::pbr::MaterialPlugin::<viewer_material::ViewerMaterial>::default())
         .add_plugins(bevy::pbr::wireframe::WireframePlugin::default())
+        .add_plugins(bevy::pbr::ScreenSpaceAmbientOcclusionPlugin)
         .add_plugins(EguiPlugin::default())
         .add_plugins(MeshPickingPlugin)
+        // Print fps/frame time periodically so we can read the actual frame
+        // budget instead of guessing.
+        .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
+        .add_plugins(bevy::diagnostic::LogDiagnosticsPlugin {
+            wait_duration: std::time::Duration::from_secs(2),
+            ..Default::default()
+        })
         .add_plugins(MinimalEditorCamPlugin)
         .add_message::<EditorCamInputMessage>()
         .init_resource::<CameraPointerMap>()
@@ -119,10 +127,17 @@ fn main() {
                 .after(bevy::picking::PickingSystems::Last)
                 .before(EditorCam::update_camera_positions),
         )
+        .add_systems(
+            PreUpdate,
+            scene::gate_picking_on_primary_button
+                .before(bevy::picking::PickingSystems::Backend),
+        )
         .insert_resource(WinitSettings::desktop_app())
         .add_systems(Startup, scene::setup_scene)
         .add_systems(Startup, scene::configure_gizmos)
         .add_systems(Startup, viewer_material::setup_matcap_texture)
+        .add_systems(Startup, viewer_material::setup_material_palette)
+        .add_systems(Startup, scene::setup_polygon_edges_material)
         .add_systems(Startup, setup_browser_render_slots)
         .add_systems(Update, scene::process_load_requests)
         .add_systems(Update, scene::rebuild_meshes_on_toggle)
@@ -131,6 +146,7 @@ fn main() {
         .add_systems(EguiPrimaryContextPass, ui::ui_system)
         .add_systems(Update, scene::normalize_scene_and_setup_camera)
         .add_systems(Update, scene::apply_face_visibility)
+        .add_systems(Update, scene::apply_polygon_edges_visibility)
         .add_systems(Update, scene::apply_selection_highlight)
         .add_systems(Update, scene::disable_camera_when_egui_wants_input)
         .add_systems(Update, scene::clear_selection_on_empty_click)

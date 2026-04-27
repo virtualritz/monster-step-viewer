@@ -12,8 +12,12 @@ pub(crate) const ICON_PALETTE: &str = "\u{e40a}";
 pub(crate) const ICON_BOUNDING_BOX: &str = "\u{efc9}";
 /// Wireframe toggle (deployed_code).
 pub(crate) const ICON_WIREFRAME: &str = "\u{f720}";
-/// Edge curves toggle (timeline).
+/// Edge curves toggle (timeline). Currently unused after the toolbar icon
+/// swap; kept in case it's reused.
+#[allow(dead_code)]
 pub(crate) const ICON_EDGES: &str = "\u{e922}";
+/// Polygon-edges toggle (details).
+pub(crate) const ICON_DETAILS: &str = "\u{e3c8}";
 
 /// Configure egui fonts with embedded Material Symbols subset.
 pub(crate) fn configure_fonts(ctx: &egui::Context) {

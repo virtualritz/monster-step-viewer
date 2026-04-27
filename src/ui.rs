@@ -4,7 +4,7 @@ use crate::{
         start_preview_loads,
     },
     icons::{
-        ICON_BOUNDING_BOX, ICON_CASINO, ICON_EDGES, ICON_PALETTE,
+        ICON_BOUNDING_BOX, ICON_CASINO, ICON_DETAILS, ICON_PALETTE,
         ICON_WIREFRAME, configure_fonts, icon_text,
     },
     state::{
@@ -455,6 +455,11 @@ fn viewer_ui(
         .resizable(true)
         .width_range(100.0..=800.0)
         .show(ctx, |ui| {
+            // Claim the full panel width so the user can drag the resize
+            // handle wider than the inner content (collapsed-by-default shell
+            // headers are short; without this egui treats the content's tight
+            // rect as the panel's "real" width and snaps back on every frame).
+            ui.set_min_width(ui.available_width());
             if state.shells.is_empty() && state.loading_job.is_none() {
                 ui.label("Load a STEP file to see hierarchy");
             } else if state.shells.is_empty() {
@@ -1262,27 +1267,27 @@ fn viewer_ui(
                             }
                             bbox_btn.on_hover_text("Bounding box");
 
-                            let wire_btn = toolbar_icon_toggle(
+                            let poly_edges_btn = toolbar_icon_toggle(
                                 ui,
                                 state.show_polygon_edges,
-                                ICON_WIREFRAME,
+                                ICON_DETAILS,
                             );
-                            if wire_btn.clicked() {
+                            if poly_edges_btn.clicked() {
                                 state.show_polygon_edges = !state.show_polygon_edges;
                                 state.settings_dirty = true;
                             }
-                            wire_btn.on_hover_text("Polygon edges");
+                            poly_edges_btn.on_hover_text("Polygon edges");
 
-                            let edge_btn = toolbar_icon_toggle(
+                            let wireframe_btn = toolbar_icon_toggle(
                                 ui,
                                 state.show_wireframe,
-                                ICON_EDGES,
+                                ICON_WIREFRAME,
                             );
-                            if edge_btn.clicked() {
+                            if wireframe_btn.clicked() {
                                 state.show_wireframe = !state.show_wireframe;
                                 state.settings_dirty = true;
                             }
-                            edge_btn.on_hover_text("Wireframe");
+                            wireframe_btn.on_hover_text("Wireframe");
 
                             ui.separator();
 
