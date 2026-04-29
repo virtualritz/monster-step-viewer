@@ -131,6 +131,13 @@ pub(crate) struct ViewerState {
     pub selection: Option<Selection>,
     /// Previous selection (to detect changes and update materials).
     pub prev_selection: Option<Selection>,
+    /// Tracked separately by the shader-buffer updater so it can diff
+    /// independently from the highlight bookkeeping.
+    pub prev_face_state_selection: Option<Selection>,
+    pub prev_face_state_hover: Option<Selection>,
+    /// Set when face-visibility changed and the GPU `face_state` buffer
+    /// needs a refresh.
+    pub face_state_visibility_dirty: bool,
     /// When true, selection was set from the viewport (click on mesh) — UI
     /// should expand the parent shell to reveal the selected face.
     pub selection_from_viewport: bool,
@@ -207,6 +214,9 @@ impl Default for ViewerState {
             retessellate_face: None,
             selection: None,
             prev_selection: None,
+            prev_face_state_selection: None,
+            prev_face_state_hover: None,
+            face_state_visibility_dirty: true,
             selection_from_viewport: false,
             hover: None,
             prev_hover: None,
@@ -237,8 +247,6 @@ pub(crate) struct FaceRecord {
     pub triangles: usize,
     pub visible: bool,
     pub ui_color: [f32; 3],
-    pub mesh_handle: Handle<Mesh>,
-    pub material_handle: Handle<crate::viewer_material::ViewerMaterial>,
     /// Global edge IDs belonging to this face's boundary loops.
     pub edge_ids: Vec<usize>,
     /// Global loop IDs for this face.
@@ -282,16 +290,11 @@ pub(crate) struct ShellRecord {
     /// The merged mesh asset for this shell (one per shell — every face's
     /// triangles are baked into it). Empty until the shell is spawned.
     pub mesh_handle: Handle<Mesh>,
-    /// Maps each merged-mesh vertex to a face-local index (0..faces.len()).
-    /// Survives meshopt's vertex-fetch remap, so it stays valid for the life
-    /// of the mesh. Used to update vertex colors per face without rebuilding
-    /// geometry (color toggles, selection tint).
+    /// Maps each merged-mesh vertex to its global face_id. Survives
+    /// meshopt's vertex-fetch remap, so it stays valid for the life of the
+    /// mesh. Used by click picking; the GPU side gets the same data via the
+    /// `ATTRIBUTE_FACE_ID` vertex attribute.
     pub vertex_face_index: Vec<u32>,
-}
-
-#[derive(Component, Debug)]
-pub(crate) struct FaceMesh {
-    pub face_id: usize,
 }
 
 /// Marker on the per-shell merged mesh entity.
@@ -311,7 +314,9 @@ pub(crate) struct PolygonEdgesMesh {
 /// Shared material handle used by every per-shell polygon-edges line-list
 /// entity. One asset, regardless of shell count.
 #[derive(Resource)]
-pub(crate) struct PolygonEdgesMaterial(pub Handle<bevy::prelude::StandardMaterial>);
+pub(crate) struct PolygonEdgesMaterial(
+    pub Handle<bevy::prelude::StandardMaterial>,
+);
 
 /// Marker for the translucent 3D quad that visualises a clip plane.
 #[derive(Component, Debug)]

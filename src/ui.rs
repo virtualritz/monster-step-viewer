@@ -1023,6 +1023,7 @@ fn viewer_ui(
                 state.hover = new_hover.take();
                 if vis_changed.get() {
                     state.visibility_changed = true;
+                    state.face_state_visibility_dirty = true;
                 }
                 if edge_vis_changed.get() {
                     state.edge_visibility_changed = true;
@@ -1267,17 +1268,6 @@ fn viewer_ui(
                             }
                             bbox_btn.on_hover_text("Bounding box");
 
-                            let poly_edges_btn = toolbar_icon_toggle(
-                                ui,
-                                state.show_polygon_edges,
-                                ICON_DETAILS,
-                            );
-                            if poly_edges_btn.clicked() {
-                                state.show_polygon_edges = !state.show_polygon_edges;
-                                state.settings_dirty = true;
-                            }
-                            poly_edges_btn.on_hover_text("Polygon edges");
-
                             let wireframe_btn = toolbar_icon_toggle(
                                 ui,
                                 state.show_wireframe,
@@ -1288,6 +1278,17 @@ fn viewer_ui(
                                 state.settings_dirty = true;
                             }
                             wireframe_btn.on_hover_text("Wireframe");
+
+                            let poly_edges_btn = toolbar_icon_toggle(
+                                ui,
+                                state.show_polygon_edges,
+                                ICON_DETAILS,
+                            );
+                            if poly_edges_btn.clicked() {
+                                state.show_polygon_edges = !state.show_polygon_edges;
+                                state.settings_dirty = true;
+                            }
+                            poly_edges_btn.on_hover_text("Polygon edges");
 
                             ui.separator();
 

@@ -32,10 +32,10 @@ use std::{
 use crate::{
     state::{
         AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, ClipPlaneDragState,
-        ClipPlaneHandle, EdgeRecord, FaceMesh, FaceRecord,
-        KEY_LIGHT_ILLUMINANCE, LoadJob, LoopRecord, MainCamera, NEUTRAL_GRAY,
-        PolygonEdgesMaterial, PolygonEdgesMesh, Selection, ShadingMode,
-        ShellMesh, ShellRecord, SolidifyJob, ViewerState, ViewportClickGuard,
+        ClipPlaneHandle, EdgeRecord, FaceRecord, KEY_LIGHT_ILLUMINANCE,
+        LoadJob, LoopRecord, MainCamera, NEUTRAL_GRAY, PolygonEdgesMaterial,
+        PolygonEdgesMesh, Selection, ShadingMode, ShellMesh, ShellRecord,
+        SolidifyJob, ViewerState, ViewportClickGuard,
     },
     viewer_material::ViewerMaterial,
 };
@@ -62,9 +62,6 @@ pub(crate) fn setup_scene(
             Camera3d::default(),
             Transform::from_xyz(1.5, 1.0, 1.5).looking_at(Vec3::ZERO, Vec3::Y),
             EditorCam::default().with_initial_anchor_depth(2.0),
-            // SSAO improves the read of CAD geometry by darkening tight
-            // creases. Auto-pulls in DepthPrepass + NormalPrepass.
-            bevy::pbr::ScreenSpaceAmbientOcclusion::default(),
         ))
         .with_children(|parent| {
             // Key light - main directional light from top-left (relative to
@@ -194,13 +191,17 @@ pub(crate) fn editor_cam_mouse_inputs(
     mouse_wheel.clear();
 }
 
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn process_load_requests(
     mut commands: Commands,
     mut state: ResMut<ViewerState>,
     mut meshes: ResMut<Assets<Mesh>>,
     palette: Res<crate::viewer_material::MaterialPalette>,
     edges_material: Res<PolygonEdgesMaterial>,
-    existing_meshes: Query<Entity, Or<(With<FaceMesh>, With<ShellMesh>, With<PolygonEdgesMesh>)>>,
+    existing_meshes: Query<
+        Entity,
+        Or<(With<ShellMesh>, With<PolygonEdgesMesh>)>,
+    >,
     clip_handles: Query<Entity, With<ClipPlaneHandle>>,
 ) {
     // Restore pre-solidify scene if requested.
@@ -594,11 +595,7 @@ fn spawn_deferred_scene_after_load(
 
 /// Build the merged mesh for a shell, spawn one entity for it, and register
 /// face/edge/loop records for the UI hierarchy.
-///
-/// Per-face features that depended on each face being its own ECS entity
-/// (per-face click selection, per-face visibility toggle, per-face
-/// emissive highlight) are temporarily inert; they will return once a GPU
-/// face-id pass replaces ray-cast picking.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_shell_faces_normalized(
     shell: &StepShell,
     commands: &mut Commands,
@@ -614,13 +611,13 @@ pub(crate) fn spawn_shell_faces_normalized(
         .map(|idx| base_face_id + idx)
         .collect();
 
-    let (
-        merged_mesh,
+    let ShellBuildResult {
+        mesh: merged_mesh,
         edges_mesh,
         per_face_tri_counts,
         per_face_ui_color,
         vertex_face_index,
-    ) = build_shell_merged_mesh(
+    } = build_shell_merged_mesh(
         shell,
         base_face_id,
         state.show_random_colors,
@@ -670,8 +667,6 @@ pub(crate) fn spawn_shell_faces_normalized(
             triangles: tri_count,
             visible: true,
             ui_color,
-            mesh_handle: Handle::default(),
-            material_handle: material_handle.clone(),
             edge_ids: Vec::new(),
             loop_ids: Vec::new(),
         });
@@ -759,6 +754,9 @@ pub(crate) fn spawn_shell_faces_normalized(
         mesh_handle,
         vertex_face_index,
     });
+    // Trigger a fresh upload of the per-face state buffer so newly-spawned
+    // faces have an entry.
+    state.face_state_visibility_dirty = true;
 }
 
 pub(crate) fn compute_bounds(scene: &StepScene) -> Option<Bounds> {
@@ -927,10 +925,16 @@ pub(crate) fn bevy_mesh_from_polygon_normalized(
 }
 
 /// Build one merged mesh containing every face in the shell. Returns the
-/// merged mesh, per-face triangle counts (in face order), per-face ui_color,
-/// and a `vertex_face_index` mapping each merged-mesh vertex to its
-/// face-local index — used downstream to update vertex colors per face
-/// without rebuilding geometry.
+/// merged mesh, the polygon-edge `LineList` mesh, per-face triangle counts,
+/// per-face ui_color, and the per-vertex global `face_id`.
+pub(crate) struct ShellBuildResult {
+    pub mesh: Mesh,
+    pub edges_mesh: Mesh,
+    pub per_face_tri_counts: Vec<usize>,
+    pub per_face_ui_color: Vec<[f32; 3]>,
+    pub vertex_face_index: Vec<u32>,
+}
+
 pub(crate) fn build_shell_merged_mesh(
     shell: &StepShell,
     base_face_id: usize,
@@ -938,7 +942,7 @@ pub(crate) fn build_shell_merged_mesh(
     show_step: bool,
     scene_center: Vec3,
     scale: f32,
-) -> (Mesh, Mesh, Vec<usize>, Vec<[f32; 3]>, Vec<u32>) {
+) -> ShellBuildResult {
     let shell_color = shell.color;
 
     // Build each face's indexed geometry in parallel — these are independent
@@ -998,17 +1002,19 @@ pub(crate) fn build_shell_merged_mesh(
         .par_iter()
         .flat_map_iter(|c| std::iter::repeat_n(c.color, c.positions.len()))
         .collect();
+    // Per-vertex global face_id. Goes both into the GPU as
+    // `ATTRIBUTE_FACE_ID` for the shader to look up `face_state`, and into
+    // the CPU `vertex_face_index` for click picking.
+    let base = base_face_id as u32;
     let mut vertex_face_index: Vec<u32> = chunks
         .par_iter()
         .enumerate()
         .flat_map_iter(|(i, c)| {
-            std::iter::repeat_n(i as u32, c.positions.len())
+            std::iter::repeat_n(base + i as u32, c.positions.len())
         })
         .collect();
-    let per_face_tri_counts: Vec<usize> = chunks
-        .par_iter()
-        .map(|c| c.indices.len() / 3)
-        .collect();
+    let per_face_tri_counts: Vec<usize> =
+        chunks.par_iter().map(|c| c.indices.len() / 3).collect();
     let per_face_ui_color: Vec<[f32; 3]> =
         chunks.par_iter().map(|c| c.ui_rgb).collect();
     // Index offsets accumulate sequentially; can't be par_iter'd as a whole
@@ -1084,15 +1090,19 @@ pub(crate) fn build_shell_merged_mesh(
     bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, merged_positions);
     bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, merged_normals);
     bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, merged_colors);
+    bevy_mesh.insert_attribute(
+        crate::viewer_material::ATTRIBUTE_FACE_ID,
+        vertex_face_index.clone(),
+    );
     bevy_mesh.insert_indices(Indices::U32(merged_indices));
 
-    (
-        bevy_mesh,
+    ShellBuildResult {
+        mesh: bevy_mesh,
         edges_mesh,
         per_face_tri_counts,
         per_face_ui_color,
         vertex_face_index,
-    )
+    }
 }
 
 /// Reorder index and vertex buffers for better GPU cache behaviour. On
@@ -1163,18 +1173,103 @@ pub(crate) fn apply_face_visibility(
     }
 }
 
-/// Per-face emissive highlighting is currently a no-op; with merged shells
-/// there's no per-face material to mutate. The state-side selection
-/// bookkeeping (`prev_selection`, `prev_hover`) is still kept up to date so
-/// other systems that diff on selection don't refire forever.
+/// Selection / hover / hidden state is driven by the GPU shader via the
+/// `face_state` storage buffer in `ViewerMaterialExt` (see
+/// `update_face_state_buffer`). This system only keeps the diff bookkeeping
+/// (`prev_selection`, `prev_hover`) in sync.
 pub(crate) fn apply_selection_highlight(mut state: ResMut<ViewerState>) {
-    if state.selection == state.prev_selection
-        && state.hover == state.prev_hover
-    {
-        return;
-    }
     state.prev_selection = state.selection;
     state.prev_hover = state.hover;
+}
+
+/// Refresh the per-face state buffer whenever selection, hover, or
+/// face-visibility state changes. The buffer is keyed by global face_id;
+/// the shader looks each fragment's face up via the `face_id` vertex
+/// attribute.
+pub(crate) fn update_face_state_buffer(
+    mut state: ResMut<ViewerState>,
+    face_state_buffer: Res<crate::viewer_material::FaceStateBuffer>,
+    palette: Res<crate::viewer_material::MaterialPalette>,
+    mut storage_buffers: ResMut<
+        Assets<bevy::render::storage::ShaderStorageBuffer>,
+    >,
+    mut materials: ResMut<Assets<ViewerMaterial>>,
+) {
+    use crate::viewer_material::{
+        FACE_STATE_HIDDEN, FACE_STATE_HOVERED, FACE_STATE_SELECTED,
+    };
+
+    let sel_changed = state.selection != state.prev_face_state_selection;
+    let hov_changed = state.hover != state.prev_face_state_hover;
+    let vis_changed = state.face_state_visibility_dirty;
+    if !sel_changed && !hov_changed && !vis_changed {
+        return;
+    }
+
+    let resolve = |sel: &Option<Selection>,
+                   faces: &[FaceRecord],
+                   loops: &[LoopRecord]|
+     -> std::collections::HashSet<usize> {
+        match sel {
+            Some(Selection::Face(fid)) => [*fid].into_iter().collect(),
+            Some(Selection::Loop(lid)) => loops
+                .iter()
+                .find(|l| l.id == *lid)
+                .map(|l| [l.face_id].into_iter().collect())
+                .unwrap_or_default(),
+            Some(Selection::Edge(eid)) => faces
+                .iter()
+                .find(|f| f.edge_ids.contains(eid))
+                .map(|f| [f.id].into_iter().collect())
+                .unwrap_or_default(),
+            _ => std::collections::HashSet::new(),
+        }
+    };
+    let sel_faces = resolve(&state.selection, &state.faces, &state.loops);
+    let hov_faces = resolve(&state.hover, &state.faces, &state.loops);
+
+    let len = state.faces.len().max(1);
+    let face_state: Vec<u32> = (0..len)
+        .map(|fid| {
+            let Some(face) = state.faces.get(fid) else {
+                return 0;
+            };
+            let shell_visible = state
+                .shells
+                .iter()
+                .find(|s| s.id == face.shell_id)
+                .is_none_or(|s| s.visible);
+            let face_visible = face.visible && shell_visible;
+            let mut bits = 0u32;
+            if !face_visible {
+                bits |= FACE_STATE_HIDDEN;
+            }
+            if sel_faces.contains(&fid) {
+                bits |= FACE_STATE_SELECTED;
+            }
+            if hov_faces.contains(&fid) {
+                bits |= FACE_STATE_HOVERED;
+            }
+            bits
+        })
+        .collect();
+
+    if let Some(buffer) = storage_buffers.get_mut(&face_state_buffer.0) {
+        buffer.set_data(face_state);
+        // Touch every palette material so its bind group is rebuilt against
+        // the (possibly resized) GPU storage buffer. Without this the bind
+        // group keeps a stale reference and the shader reads the old data.
+        for handle in
+            [&palette.default, &palette.selected, &palette.hovered].into_iter()
+        {
+            let _ = materials.get_mut(handle);
+        }
+    }
+    let _ = vis_changed;
+
+    state.prev_face_state_selection = state.selection;
+    state.prev_face_state_hover = state.hover;
+    state.face_state_visibility_dirty = false;
 }
 
 pub(crate) fn normalize_scene_and_setup_camera(
@@ -1310,23 +1405,25 @@ pub(crate) fn rebuild_meshes_on_toggle(
     };
 
     // Build the new color buffers in parallel; commit on the main thread.
-    let updates: Vec<(Handle<Mesh>, Vec<[f32; 4]>, Vec<(usize, [f32; 3])>)> =
-        jobs.into_par_iter()
-            .map(|job| {
-                let new_colors: Vec<[f32; 4]> = job
-                    .vertex_face_index
-                    .iter()
-                    .map(|&fi| job.face_colors[fi as usize])
-                    .collect();
-                let face_ui_updates: Vec<(usize, [f32; 3])> = job
-                    .face_ids
-                    .iter()
-                    .zip(job.face_ui_rgb)
-                    .map(|(&fid, rgb)| (fid, rgb))
-                    .collect();
-                (job.mesh_handle, new_colors, face_ui_updates)
-            })
-            .collect();
+    type ShellColorUpdate =
+        (Handle<Mesh>, Vec<[f32; 4]>, Vec<(usize, [f32; 3])>);
+    let updates: Vec<ShellColorUpdate> = jobs
+        .into_par_iter()
+        .map(|job| {
+            let new_colors: Vec<[f32; 4]> = job
+                .vertex_face_index
+                .iter()
+                .map(|&fi| job.face_colors[fi as usize])
+                .collect();
+            let face_ui_updates: Vec<(usize, [f32; 3])> = job
+                .face_ids
+                .iter()
+                .zip(job.face_ui_rgb)
+                .map(|(&fid, rgb)| (fid, rgb))
+                .collect();
+            (job.mesh_handle, new_colors, face_ui_updates)
+        })
+        .collect();
 
     for (handle, colors, face_ui_updates) in updates {
         if let Some(mesh) = meshes.get_mut(&handle) {
@@ -1393,36 +1490,6 @@ pub(crate) fn face_display_color(
             (random_color, true)
         }
     }
-}
-
-/// Recompute vertex colors for a mesh without rebuilding geometry.
-/// Returns colors in the same vertex order as bevy_mesh_from_polygon.
-pub(crate) fn recompute_colors_for_mesh(
-    mesh: &PolygonMesh,
-    shell_color: [f32; 3],
-    use_random_colors: bool,
-) -> Vec<[f32; 4]> {
-    // Count total vertices.
-    let mut vertex_count = 0usize;
-    vertex_count += mesh.tri_faces().len() * 3;
-    // 2 triangles per quad.
-    vertex_count += mesh.quad_faces().len() * 6;
-    for face in mesh.other_faces() {
-        if face.len() >= 3 {
-            vertex_count += (face.len() - 2) * 3;
-        }
-    }
-
-    // Use shell's distinct color if random colors enabled, otherwise neutral
-    // gray.
-    let color = if use_random_colors {
-        [shell_color[0], shell_color[1], shell_color[2], 1.0]
-    } else {
-        // Neutral gray.
-        NEUTRAL_GRAY
-    };
-
-    vec![color; vertex_count]
 }
 
 /// Gate `MeshPickingPlugin` so it only ray-casts while the left mouse button
@@ -1496,18 +1563,14 @@ fn build_polygon_edges_mesh(
 ) -> Mesh {
     let edges: std::collections::HashSet<(u32, u32)> = tri_indices
         .par_chunks_exact(3)
-        .flat_map_iter(|t| {
-            [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
-        })
+        .flat_map_iter(|t| [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])])
         .map(|(a, b)| if a < b { (a, b) } else { (b, a) })
         .collect();
     let line_indices: Vec<u32> =
         edges.into_iter().flat_map(|(a, b)| [a, b]).collect();
 
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::LineList,
-        RenderAssetUsages::default(),
-    );
+    let mut mesh =
+        Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_indices(Indices::U32(line_indices));
     mesh
@@ -1541,10 +1604,7 @@ pub(crate) fn configure_gizmos(mut config_store: ResMut<GizmoConfigStore>) {
 }
 
 /// Draw bounding box and wireframe gizmos when enabled.
-pub(crate) fn draw_gizmos(
-    state: Res<ViewerState>,
-    mut gizmos: Gizmos,
-) {
+pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
     // Polygon edges are now drawn by per-shell `LineList` `Mesh3d` entities
     // (toggled via `apply_polygon_edges_visibility`); no per-frame gizmo
     // work here.
@@ -1817,89 +1877,6 @@ pub(crate) fn rebuild_normals(mut state: ResMut<ViewerState>) {
     state.needs_normal_rebuild = false;
 }
 
-/// Build a Bevy mesh from a `PolygonMesh` using flat (per-face) normals.
-/// Each triangle gets a single normal computed from the cross product of its
-/// edges, giving a faceted appearance.
-fn bevy_mesh_from_polygon_flat_normals(
-    mesh: &PolygonMesh,
-    shell_color: [f32; 3],
-    use_random_colors: bool,
-    scene_center: Vec3,
-    scale: f32,
-) -> (Mesh, usize) {
-    let positions: Vec<[f32; 3]> = mesh
-        .positions()
-        .par_iter()
-        .map(|p| {
-            let pos = Vec3::new(p.x as f32, p.y as f32, p.z as f32);
-            let normalized = (pos - scene_center) * scale;
-            [normalized.x, normalized.y, normalized.z]
-        })
-        .collect();
-
-    // Collect all triangles as (pos_idx0, pos_idx1, pos_idx2).
-    let mut triangles: Vec<[usize; 3]> = Vec::new();
-
-    for tri in mesh.tri_faces() {
-        triangles.push([tri[0].pos, tri[1].pos, tri[2].pos]);
-    }
-
-    for quad in mesh.quad_faces() {
-        triangles.push([quad[0].pos, quad[1].pos, quad[2].pos]);
-        triangles.push([quad[0].pos, quad[2].pos, quad[3].pos]);
-    }
-
-    for face in mesh.other_faces() {
-        if face.len() < 3 {
-            continue;
-        }
-        let first = face[0].pos;
-        for w in face.windows(2).skip(1) {
-            triangles.push([first, w[0].pos, w[1].pos]);
-        }
-    }
-
-    // Build flat arrays with per-face normals.
-    let mut flat_positions = Vec::with_capacity(triangles.len() * 3);
-    let mut flat_normals = Vec::with_capacity(triangles.len() * 3);
-
-    for tri_indices in &triangles {
-        let v0 = Vec3::from(positions[tri_indices[0]]);
-        let v1 = Vec3::from(positions[tri_indices[1]]);
-        let v2 = Vec3::from(positions[tri_indices[2]]);
-
-        let edge1 = v1 - v0;
-        let edge2 = v2 - v0;
-        let normal = edge1.cross(edge2).normalize_or_zero();
-        let n = [normal.x, normal.y, normal.z];
-
-        flat_positions.push(positions[tri_indices[0]]);
-        flat_positions.push(positions[tri_indices[1]]);
-        flat_positions.push(positions[tri_indices[2]]);
-
-        flat_normals.push(n);
-        flat_normals.push(n);
-        flat_normals.push(n);
-    }
-
-    let color = if use_random_colors {
-        [shell_color[0], shell_color[1], shell_color[2], 1.0]
-    } else {
-        NEUTRAL_GRAY
-    };
-    let colors: Vec<[f32; 4]> = vec![color; flat_positions.len()];
-
-    let mut bevy_mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, flat_positions);
-    bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, flat_normals);
-    bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-
-    (bevy_mesh, triangles.len())
-}
-
 /// Update clip-plane uniforms on every `ViewerMaterial` asset when dirty.
 pub(crate) fn update_clip_plane_uniforms(
     mut state: ResMut<ViewerState>,
@@ -1956,19 +1933,131 @@ pub(crate) fn update_clip_plane_uniforms(
     }
 }
 
-/// Global click observer. Per-face viewport selection is gone for now
-/// (faces no longer exist as ECS entities); clicks on the merged shell mesh
-/// are still recorded so the empty-viewport-click handler doesn't fire and
-/// clear the selection. Per-face picking returns once the GPU face-id pass
-/// lands.
+/// Global click observer: clicks on a shell mesh map back to the face
+/// underneath the cursor by walking the merged-mesh triangles to find which
+/// one contains the hit point, then reading face-local index from
+/// `ShellRecord::vertex_face_index`. Sets the global face selection so the
+/// hierarchy panel scrolls/highlights it.
+///
+/// CPU triangle scan is fine here because clicks are infrequent and a
+/// shell's triangle count is bounded (~hundreds-thousands). When the
+/// offscreen GPU id-pass lands this becomes a single image read.
 pub(crate) fn on_mesh_click(
     click: On<Pointer<Click>>,
+    shell_query: Query<&ShellMesh>,
+    mut state: ResMut<ViewerState>,
     mut guard: ResMut<ViewportClickGuard>,
+    mesh_assets: Res<Assets<Mesh>>,
 ) {
     if click.button != PointerButton::Primary {
         return;
     }
     guard.mesh_consumed = true;
+
+    let Ok(shell_mesh) = shell_query.get(click.entity) else {
+        log::debug!(
+            "on_mesh_click: clicked entity {:?} is not a ShellMesh",
+            click.entity
+        );
+        return;
+    };
+    let Some(world_pos) = click.hit.position else {
+        log::warn!("on_mesh_click: hit.position missing on shell click");
+        return;
+    };
+
+    let Some(shell_record) =
+        state.shells.iter().find(|s| s.id == shell_mesh.shell_id)
+    else {
+        return;
+    };
+    let Some(mesh) = mesh_assets.get(&shell_record.mesh_handle) else {
+        return;
+    };
+    let Some(positions) = mesh
+        .attribute(Mesh::ATTRIBUTE_POSITION)
+        .and_then(|a| a.as_float3())
+    else {
+        return;
+    };
+    let Some(mesh_indices) = mesh.indices() else {
+        return;
+    };
+    let indices: Vec<u32> = mesh_indices.iter().map(|i| i as u32).collect();
+
+    let face_id = find_face_id_at(
+        world_pos,
+        positions,
+        &indices,
+        &shell_record.vertex_face_index,
+    );
+    let Some(face_id) = face_id else {
+        return;
+    };
+    state.selection = Some(Selection::Face(face_id as usize));
+    state.selection_from_viewport = true;
+}
+
+/// Walk the triangles of an indexed mesh and return the global face_id of
+/// the triangle that contains `world_pos`. Uses a cheap barycentric +
+/// plane-distance test; first match wins (good enough since the picking
+/// backend already gives us a point on the front-most surface).
+fn find_face_id_at(
+    world_pos: Vec3,
+    positions: &[[f32; 3]],
+    indices: &[u32],
+    vertex_face_index: &[u32],
+) -> Option<u32> {
+    const BARY_TOLERANCE: f32 = 1e-3;
+    const PLANE_TOLERANCE: f32 = 1e-2;
+
+    indices.chunks_exact(3).find_map(|tri| {
+        let i0 = tri[0] as usize;
+        let i1 = tri[1] as usize;
+        let i2 = tri[2] as usize;
+        let v0 = Vec3::from(positions[i0]);
+        let v1 = Vec3::from(positions[i1]);
+        let v2 = Vec3::from(positions[i2]);
+
+        let edge0 = v1 - v0;
+        let edge1 = v2 - v0;
+        let plane_normal_unnorm = edge0.cross(edge1);
+        let plane_len = plane_normal_unnorm.length();
+        if plane_len < 1e-10 {
+            return None;
+        }
+        let plane_normal = plane_normal_unnorm / plane_len;
+        let plane_dist = (world_pos - v0).dot(plane_normal).abs();
+        if plane_dist > PLANE_TOLERANCE {
+            return None;
+        }
+
+        let bary = barycentric(world_pos, v0, v1, v2);
+        (bary[0] >= -BARY_TOLERANCE
+            && bary[1] >= -BARY_TOLERANCE
+            && bary[2] >= -BARY_TOLERANCE)
+            .then(|| vertex_face_index[i0])
+    })
+}
+
+fn barycentric(p: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> [f32; 3] {
+    let v0v1 = v1 - v0;
+    let v0v2 = v2 - v0;
+    let v0p = p - v0;
+    let d00 = v0v1.dot(v0v1);
+    let d01 = v0v1.dot(v0v2);
+    let d11 = v0v2.dot(v0v2);
+    let d20 = v0p.dot(v0v1);
+    let d21 = v0p.dot(v0v2);
+    let denom = d00 * d11 - d01 * d01;
+    if denom.abs() < 1e-12 {
+        return [-1.0, -1.0, -1.0];
+    }
+    let inv = 1.0 / denom;
+    let v = (d11 * d20 - d01 * d21) * inv;
+    let w = (d00 * d21 - d01 * d20) * inv;
+    let u = 1.0 - v - w;
+    [u, v, w]
 }
 
 /// Click on empty viewport space (no face mesh hit) clears the selection.
@@ -2643,13 +2732,17 @@ fn solidify_clip_inner(
 }
 
 /// Poll for solidify-clip completion and apply the result.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn poll_solidify_clip(
     mut state: ResMut<ViewerState>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     palette: Res<crate::viewer_material::MaterialPalette>,
     edges_material: Res<PolygonEdgesMaterial>,
-    existing_meshes: Query<Entity, Or<(With<FaceMesh>, With<ShellMesh>, With<PolygonEdgesMesh>)>>,
+    existing_meshes: Query<
+        Entity,
+        Or<(With<ShellMesh>, With<PolygonEdgesMesh>)>,
+    >,
     clip_handles: Query<Entity, With<ClipPlaneHandle>>,
 ) {
     let job = match state.solidify_job.as_ref() {

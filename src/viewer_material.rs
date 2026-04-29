@@ -1,13 +1,32 @@
 use bevy::{
     asset::RenderAssetUsages,
     image::ImageSampler,
-    pbr::{ExtendedMaterial, MaterialExtension},
+    mesh::{MeshVertexAttribute, MeshVertexBufferLayoutRef},
+    pbr::{
+        ExtendedMaterial, MaterialExtension, MaterialExtensionKey,
+        MaterialExtensionPipeline,
+    },
     prelude::*,
-    render::render_resource::{
-        AsBindGroup, Extent3d, TextureDimension, TextureFormat,
+    render::{
+        render_resource::{
+            AsBindGroup, Extent3d, RenderPipelineDescriptor,
+            SpecializedMeshPipelineError, TextureDimension, TextureFormat,
+            VertexFormat,
+        },
+        storage::ShaderStorageBuffer,
     },
     shader::ShaderRef,
 };
+
+/// Per-vertex global face id (read by the custom vertex shader and passed
+/// flat to the fragment shader for per-face state lookup).
+pub(crate) const ATTRIBUTE_FACE_ID: MeshVertexAttribute =
+    MeshVertexAttribute::new("ViewerFaceId", 0xa1f0_0001, VertexFormat::Uint32);
+
+/// Bit flags packed into each `face_state` entry.
+pub(crate) const FACE_STATE_SELECTED: u32 = 1 << 0;
+pub(crate) const FACE_STATE_HOVERED: u32 = 1 << 1;
+pub(crate) const FACE_STATE_HIDDEN: u32 = 1 << 2;
 
 /// Type alias for the viewer's extended material.
 pub(crate) type ViewerMaterial =
@@ -52,24 +71,37 @@ fn base_material() -> ViewerMaterial {
     }
 }
 
-/// Create the three shared face materials.
+/// Create the three shared face materials and the per-face state buffer.
 pub(crate) fn setup_material_palette(
     mut commands: Commands,
     mut materials: ResMut<Assets<ViewerMaterial>>,
+    mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
 ) {
-    let default = materials.add(base_material());
-    let mut sel_mat = base_material();
-    sel_mat.base.emissive = SELECTION_EMISSIVE;
-    let selected = materials.add(sel_mat);
-    let mut hov_mat = base_material();
-    hov_mat.base.emissive = HOVER_EMISSIVE;
-    let hovered = materials.add(hov_mat);
+    // One zero-initialised u32 keeps the buffer non-empty (WGSL storage
+    // buffers can't be zero-sized). Resized by `update_face_state_buffer`.
+    let mut initial_buffer = ShaderStorageBuffer::default();
+    initial_buffer.set_data(vec![0u32]);
+    let face_state_handle = storage_buffers.add(initial_buffer);
+
+    let mk = |emissive: Option<LinearRgba>| {
+        let mut mat = base_material();
+        if let Some(e) = emissive {
+            mat.base.emissive = e;
+        }
+        mat.extension.face_state = face_state_handle.clone();
+        mat
+    };
+
+    let default = materials.add(mk(None));
+    let selected = materials.add(mk(Some(SELECTION_EMISSIVE)));
+    let hovered = materials.add(mk(Some(HOVER_EMISSIVE)));
 
     commands.insert_resource(MaterialPalette {
         default,
         selected,
         hovered,
     });
+    commands.insert_resource(FaceStateBuffer(face_state_handle));
 }
 
 /// Material extension carrying clip-plane and shading uniforms.
@@ -107,6 +139,13 @@ pub(crate) struct ViewerMaterialExt {
     #[texture(101)]
     #[sampler(102)]
     pub matcap_texture: Option<Handle<Image>>,
+
+    /// Per-global-face-id state bits (see `FACE_STATE_*` constants). Indexed
+    /// in the fragment shader by the per-vertex `face_id` attribute. The
+    /// underlying buffer is a separate asset; mutating its data triggers a
+    /// re-upload to GPU.
+    #[storage(103, read_only)]
+    pub face_state: Handle<ShaderStorageBuffer>,
 }
 
 impl Default for ViewerMaterialExt {
@@ -121,17 +160,65 @@ impl Default for ViewerMaterialExt {
             _pad2: 0,
             _pad3: 0,
             matcap_texture: None,
+            face_state: Handle::default(),
         }
     }
 }
 
+/// Resource holding the shared `ShaderStorageBuffer` handle that backs
+/// every palette material's `face_state`. The update system mutates this
+/// asset; all bound materials see the change automatically.
+#[derive(Resource, Clone)]
+pub(crate) struct FaceStateBuffer(pub Handle<ShaderStorageBuffer>);
+
 impl MaterialExtension for ViewerMaterialExt {
+    fn vertex_shader() -> ShaderRef {
+        SHADER_PATH.into()
+    }
+
     fn fragment_shader() -> ShaderRef {
         SHADER_PATH.into()
     }
 
     fn deferred_fragment_shader() -> ShaderRef {
         SHADER_PATH.into()
+    }
+
+    /// Skip the depth/normal prepass — we don't use SSAO/TAA/etc. and the
+    /// stock prepass vertex shader expects more attributes than our custom
+    /// vertex layout provides. Re-enable when prepass is wired up properly.
+    fn enable_prepass() -> bool {
+        false
+    }
+
+    fn specialize(
+        _pipeline: &MaterialExtensionPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        key: MaterialExtensionKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        use bevy::pbr::MeshPipelineKey;
+
+        // Only override the vertex layout for the forward pipeline. Prepass /
+        // deferred / shadow pipelines use Bevy's stock vertex shader, which
+        // expects the default attribute layout — overriding here would mean
+        // those pipelines see attributes their shader doesn't declare.
+        let prepass_bits = MeshPipelineKey::DEPTH_PREPASS
+            | MeshPipelineKey::NORMAL_PREPASS
+            | MeshPipelineKey::MOTION_VECTOR_PREPASS
+            | MeshPipelineKey::DEFERRED_PREPASS;
+        if key.mesh_key.intersects(prepass_bits) {
+            return Ok(());
+        }
+
+        let vertex_layout = layout.0.get_layout(&[
+            Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+            Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
+            Mesh::ATTRIBUTE_COLOR.at_shader_location(5),
+            ATTRIBUTE_FACE_ID.at_shader_location(8),
+        ])?;
+        descriptor.vertex.buffers = vec![vertex_layout];
+        Ok(())
     }
 }
 

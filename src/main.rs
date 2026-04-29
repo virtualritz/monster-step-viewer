@@ -103,7 +103,8 @@ fn main() {
         )
         .add_plugins(bevy::pbr::MaterialPlugin::<viewer_material::ViewerMaterial>::default())
         .add_plugins(bevy::pbr::wireframe::WireframePlugin::default())
-        .add_plugins(bevy::pbr::ScreenSpaceAmbientOcclusionPlugin)
+        // SSAO plugin is already in DefaultPlugins (via PbrPlugin); the
+        // `ScreenSpaceAmbientOcclusion` component on the camera is enough.
         .add_plugins(EguiPlugin::default())
         .add_plugins(MeshPickingPlugin)
         // Print fps/frame time periodically so we can read the actual frame
@@ -130,6 +131,7 @@ fn main() {
         .add_systems(
             PreUpdate,
             scene::gate_picking_on_primary_button
+                .after(bevy::input::InputSystems)
                 .before(bevy::picking::PickingSystems::Backend),
         )
         .insert_resource(WinitSettings::desktop_app())
@@ -148,6 +150,7 @@ fn main() {
         .add_systems(Update, scene::apply_face_visibility)
         .add_systems(Update, scene::apply_polygon_edges_visibility)
         .add_systems(Update, scene::apply_selection_highlight)
+        .add_systems(Update, scene::update_face_state_buffer)
         .add_systems(Update, scene::disable_camera_when_egui_wants_input)
         .add_systems(Update, scene::clear_selection_on_empty_click)
         .add_systems(Update, scene::draw_gizmos)
