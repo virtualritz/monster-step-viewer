@@ -64,7 +64,7 @@ mstpv
 | <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/view-in-ar-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/view-in-ar-outline.svg" width="20" alt=""></picture> | Bounding box |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/deployed-code-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/deployed-code-outline.svg" width="20" alt=""></picture> | STEP curve wireframe |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/grid-on-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/grid-on-outline.svg" width="20" alt=""></picture> | Isoparametric curves |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/details-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/details-outline.svg" width="20" alt=""></picture> | Polygon (mesh) edges |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/details.svg?color=white"><img src="https://api.iconify.design/material-symbols/details.svg" width="20" alt=""></picture> | Polygon (mesh) edges |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/counter-3-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/counter-3-outline.svg" width="20" alt=""></picture> | 3Delight NSI overlay (requires `nsi-render`) |
 
 Per-axis clip planes (X/Y/Z) cycle Off → +axis → −axis → Off. The toolbar also has a tessellation-quality slider and a shading-mode picker.
@@ -77,7 +77,7 @@ Build with the `nsi-render` Cargo feature for a 3Delight (NSI) progressive-rende
 cargo run --features nsi-render -- path/to/model.step
 ```
 
-3Delight must be installed locally; the build auto-detects standard install paths and the `$DELIGHT` environment variable. The ③ toolbar button starts an interactive rendering session in 3Delight Display — camera moves translate in real time.
+3Delight must be installed locally. `mstpv` looks it up at runtime — checking standard install paths and the `$DELIGHT` environment variable — and only enables the ③ toolbar button if it's found. Clicking it starts an interactive rendering session in 3Delight Display; camera moves translate in real time.
 
 Native-only; wasm builds are unaffected.
 
