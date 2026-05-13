@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 ehttp = "0.7"
-monstertruck = { git = "https://github.com/virtualritz/monstertruck.git", features = [
+monstertruck = { git = "https://github.com/virtualritz/monstertruck.git", rev = "9a7796a8662f44cefda295f4d1752ee67406bb8c", features = [
     "step",
     "meshing",
     "solid",

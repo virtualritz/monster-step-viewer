@@ -13,8 +13,36 @@ use monstertruck::{
     topology::compress::{CompressedShell, CompressedTrimmedShell},
     traits::ParametricCurve,
 };
+use parking_lot::Mutex;
+use rayon::prelude::*;
+use std::{
+    any::Any,
+    collections::HashMap,
+    fmt::{Debug, Formatter, Result as FmtResult},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+};
+
+pub use monstertruck::step::load::ruststep::ast::Parameter;
+pub use transform::Transform;
+
+use mesh_utils::{apply_transform_to_mesh, extract_mesh_edges};
+use parsing::{
+    parse_assembly_transforms, parse_shell_face_refs, parse_step_colors,
+};
+
 type OriginalShell =
     CompressedTrimmedShell<Point3, Curve3D, Surface, StepParameterCurve>;
+
+const ISOPARAMETRIC_CURVE_OPTIONS: IsoparametricCurveOptions =
+    IsoparametricCurveOptions {
+        samples_per_direction: 4,
+        segments_per_curve: 24,
+    };
 
 fn shell_requires_trimmed_meshing<P, C, S, T>(
     shell: &CompressedTrimmedShell<P, C, S, T>,
@@ -35,25 +63,42 @@ fn count_failed_face_meshes<P, C>(
         .count()
 }
 
-use parking_lot::Mutex;
-use rayon::prelude::*;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, Sender},
-    },
-};
+fn tessellate_original_shell(
+    shell: &OriginalShell,
+    tolerance: f64,
+) -> CompressedShellTessellation {
+    robust_compressed_trimmed_shell_triangulation_with_isoparams(
+        shell,
+        TessellationOptions {
+            tolerance,
+            ..Default::default()
+        },
+        ISOPARAMETRIC_CURVE_OPTIONS,
+    )
+}
 
-pub use monstertruck::step::load::ruststep::ast::Parameter;
-pub use transform::Transform;
+fn point_to_coord(point: Point3, transform: Option<&Transform>) -> [f64; 3] {
+    let coord = [point.x, point.y, point.z];
+    transform
+        .map(|xform| xform.transform_point(coord))
+        .unwrap_or(coord)
+}
 
-use mesh_utils::{apply_transform_to_mesh, extract_mesh_edges};
-use parsing::{
-    parse_assembly_transforms, parse_shell_face_refs, parse_step_colors,
-};
+fn isoparam_curves_to_coords(
+    curves: &[Vec<Point3>],
+    transform: Option<&Transform>,
+) -> Vec<Vec<[f64; 3]>> {
+    curves
+        .iter()
+        .map(|curve| {
+            curve
+                .iter()
+                .copied()
+                .map(|point| point_to_coord(point, transform))
+                .collect()
+        })
+        .collect()
+}
 
 /// A named header entry from the STEP file.
 #[derive(Clone, Debug)]
@@ -87,23 +132,23 @@ pub struct StepBoundaryLoop {
 /// Wraps an original CompressedShell for potential re-tessellation.
 #[derive(Clone)]
 pub struct CompressedShellData {
-    inner: Arc<dyn std::any::Any + Send + Sync>,
+    inner: Arc<dyn Any + Send + Sync>,
 }
 
 impl CompressedShellData {
-    pub fn new<T: std::any::Any + Send + Sync + 'static>(data: T) -> Self {
+    pub fn new<T: Any + Send + Sync + 'static>(data: T) -> Self {
         Self {
             inner: Arc::new(data),
         }
     }
 
-    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
         self.inner.downcast_ref()
     }
 }
 
-impl std::fmt::Debug for CompressedShellData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for CompressedShellData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("CompressedShellData").finish()
     }
 }
@@ -127,6 +172,7 @@ pub struct StepFace {
     pub id: usize,
     pub name: String,
     pub mesh: PolygonMesh,
+    pub isoparams: Vec<Vec<[f64; 3]>>,
     pub boundary_loops: Vec<StepBoundaryLoop>,
     /// RGB color from STEP file (if any).
     pub color: Option<[f32; 3]>,
@@ -350,11 +396,8 @@ fn resolve_to_shell_id(table: &Table, idx: u64) -> u64 {
 /// A solid can reference shells via `outer` (always) and `voids` (optional).
 /// References may go through an `oriented_shell` indirection, so we resolve
 /// those to the underlying shell ID.
-fn build_shell_to_solid_map(
-    table: &Table,
-) -> std::collections::HashMap<u64, u64> {
-    let mut shell_to_solid: std::collections::HashMap<u64, u64> =
-        std::collections::HashMap::new();
+fn build_shell_to_solid_map(table: &Table) -> HashMap<u64, u64> {
+    let mut shell_to_solid: HashMap<u64, u64> = HashMap::new();
     for (solid_id, solid_holder) in &table.manifold_solid_brep {
         // Extract the outer shell entity ID (may be shell or oriented_shell).
         if let PlaceHolder::Ref(Name::Entity(outer_idx)) = &solid_holder.outer {
@@ -410,8 +453,8 @@ fn build_topology_for_shell(
     shell_id: &u64,
     compressed: &OriginalShell,
     table: &Table,
-    shell_to_solid: &std::collections::HashMap<u64, u64>,
-    solid_cache: &Mutex<std::collections::HashMap<u64, CompressedShellData>>,
+    shell_to_solid: &HashMap<u64, u64>,
+    solid_cache: &Mutex<HashMap<u64, CompressedShellData>>,
 ) -> Option<StepTopology> {
     if let Some(&solid_id) = shell_to_solid.get(shell_id) {
         // Check cache first (multiple shells can belong to the same solid).
@@ -529,9 +572,8 @@ pub fn load_step_file_with_progress(
 
     // Build shell-to-solid mapping for topology preservation.
     let shell_to_solid = build_shell_to_solid_map(&table);
-    let solid_cache: Mutex<
-        std::collections::HashMap<u64, CompressedShellData>,
-    > = Mutex::new(std::collections::HashMap::new());
+    let solid_cache: Mutex<HashMap<u64, CompressedShellData>> =
+        Mutex::new(HashMap::new());
 
     // Convert each shell into a triangulated mesh (in parallel).
     let mut shell_entries: Vec<_> = table.shell.iter().collect();
@@ -586,7 +628,9 @@ pub fn load_step_file_with_progress(
 
             let has_boundaries = shell_requires_trimmed_meshing(&compressed);
             let original_shell = CompressedShellData::new(compressed.clone());
-            let poly_shell = compressed.clone().robust_triangulation(tol);
+            let tessellation = tessellate_original_shell(&compressed, tol);
+            let face_isoparams = tessellation.face_isoparams;
+            let poly_shell = tessellation.shell;
             let mut failed_faces = count_failed_face_meshes(&poly_shell);
 
             // Extract tessellated curve edges from the meshed shell edges.
@@ -648,6 +692,12 @@ pub fn load_step_file_with_progress(
                                 id: face_idx,
                                 name: format!("Face {}", face_idx + 1),
                                 mesh,
+                                isoparams: face_isoparams
+                                    .get(face_idx)
+                                    .map(|curves| {
+                                        isoparam_curves_to_coords(curves, None)
+                                    })
+                                    .unwrap_or_default(),
                                 boundary_loops,
                                 color: face_color_at(&face_colors, face_idx),
                             })
@@ -863,9 +913,8 @@ fn load_step_from_string_inner(
 
     // Build shell-to-solid mapping for topology preservation.
     let shell_to_solid = build_shell_to_solid_map(&table);
-    let solid_cache: Arc<
-        Mutex<std::collections::HashMap<u64, CompressedShellData>>,
-    > = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let solid_cache: Arc<Mutex<HashMap<u64, CompressedShellData>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let prepared_count = Arc::new(AtomicUsize::new(0));
 
     let prepared_shells: Result<Vec<PreparedShell>, anyhow::Error> =
@@ -992,7 +1041,9 @@ fn load_step_from_string_inner(
 
             let has_boundaries = shell_requires_trimmed_meshing(&compressed);
             let original_shell = CompressedShellData::new(compressed.clone());
-            let poly_shell = compressed.clone().robust_triangulation(tol);
+            let tessellation = tessellate_original_shell(&compressed, tol);
+            let face_isoparams = tessellation.face_isoparams;
+            let poly_shell = tessellation.shell;
             let mut failed_faces = count_failed_face_meshes(&poly_shell);
 
             // Extract tessellated curve edges (with transform applied).
@@ -1070,6 +1121,15 @@ fn load_step_from_string_inner(
                                 id: face_idx,
                                 name: format!("Face {}", face_idx + 1),
                                 mesh,
+                                isoparams: face_isoparams
+                                    .get(face_idx)
+                                    .map(|curves| {
+                                        isoparam_curves_to_coords(
+                                            curves,
+                                            transform.as_ref(),
+                                        )
+                                    })
+                                    .unwrap_or_default(),
                                 boundary_loops,
                                 color: face_color_at(&face_colors, face_idx),
                             })
@@ -1230,7 +1290,9 @@ fn retessellate_one_shell(
         tol = 0.01;
     }
 
-    let poly_shell = compressed.clone().robust_triangulation(tol);
+    let tessellation = tessellate_original_shell(compressed, tol);
+    let face_isoparams = tessellation.face_isoparams;
+    let poly_shell = tessellation.shell;
     let mut failed_faces = count_failed_face_meshes(&poly_shell);
 
     // Preserve curve_type and per-face colors from the previous tessellation.
@@ -1308,6 +1370,15 @@ fn retessellate_one_shell(
                         id: face_idx,
                         name: format!("Face {}", face_idx + 1),
                         mesh,
+                        isoparams: face_isoparams
+                            .get(face_idx)
+                            .map(|curves| {
+                                isoparam_curves_to_coords(
+                                    curves,
+                                    transform.as_ref(),
+                                )
+                            })
+                            .unwrap_or_default(),
                         boundary_loops,
                         color: face_color_at(&face_colors, face_idx),
                     })
@@ -1329,86 +1400,6 @@ fn retessellate_one_shell(
         tessellation_tolerance: tol,
         failed_faces,
     })
-}
-
-/// Sample isoparametric curves on each face's parametric surface in the
-/// shell. Returns one polyline per (face, iso-direction, sample) tuple,
-/// flattened, in world space (the shell's assembly transform applied).
-///
-/// **Currently untrimmed.** Iso lines span the full parametric rectangle
-/// of each surface and may extend across holes / past trims. A correct
-/// trim pass needs to interpret monstertruck's edge-orientation flags in
-/// conjunction with loop adjacency, and the tessellator already does this
-/// internally — the natural place for trimmed iso sampling is in
-/// monstertruck rather than re-deriving it here. Left as a follow-up.
-pub fn sample_shell_isoparams(
-    shell: &StepShell,
-    sample_count: usize,
-    segments_per_curve: usize,
-) -> Vec<Vec<[f64; 3]>> {
-    use monstertruck::traits::ParametricSurface;
-
-    let Some(shell_data) = shell.original_shell.as_ref() else {
-        return Vec::new();
-    };
-    let Some(compressed): Option<&OriginalShell> = shell_data.downcast_ref()
-    else {
-        return Vec::new();
-    };
-    let transform = shell.transform.as_ref();
-
-    if sample_count == 0 || segments_per_curve == 0 {
-        return Vec::new();
-    }
-
-    compressed
-        .faces
-        .iter()
-        .filter_map(|face| {
-            let surface = &face.surface;
-            let (u_range, v_range) = surface.try_range_tuple();
-            let (u_min, u_max) = u_range?;
-            let (v_min, v_max) = v_range?;
-            if u_max <= u_min || v_max <= v_min {
-                return None;
-            }
-            Some((surface, u_min, u_max, v_min, v_max))
-        })
-        .flat_map(|(surface, u_min, u_max, v_min, v_max)| {
-            let eval = move |u: f64, v: f64| -> [f64; 3] {
-                let p = surface.evaluate(u, v);
-                let mut coord = [p.x, p.y, p.z];
-                if let Some(xform) = transform {
-                    coord = xform.transform_point(coord);
-                }
-                coord
-            };
-
-            let iso_v = (0..sample_count).map(move |i| {
-                let t = (i as f64 + 0.5) / sample_count as f64;
-                let v = v_min + (v_max - v_min) * t;
-                (0..=segments_per_curve)
-                    .map(|j| {
-                        let s = j as f64 / segments_per_curve as f64;
-                        let u = u_min + (u_max - u_min) * s;
-                        eval(u, v)
-                    })
-                    .collect::<Vec<_>>()
-            });
-            let iso_u = (0..sample_count).map(move |i| {
-                let t = (i as f64 + 0.5) / sample_count as f64;
-                let u = u_min + (u_max - u_min) * t;
-                (0..=segments_per_curve)
-                    .map(|j| {
-                        let s = j as f64 / segments_per_curve as f64;
-                        let v = v_min + (v_max - v_min) * s;
-                        eval(u, v)
-                    })
-                    .collect::<Vec<_>>()
-            });
-            iso_v.chain(iso_u)
-        })
-        .collect()
 }
 
 fn classify_curve_type(curve: &Curve3D) -> String {
@@ -1665,6 +1656,7 @@ mod tests {
                 id: 0,
                 name: "face".to_string(),
                 mesh,
+                isoparams: Vec::new(),
                 boundary_loops: Vec::new(),
                 color: None,
             }],

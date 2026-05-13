@@ -6,5 +6,5 @@ pub use step_loader::{
     StepScene, StepShell, StepTopology, Transform, load_step_file,
     load_step_file_streaming, load_step_file_with_progress,
     load_step_from_string_streaming, retessellate_face,
-    retessellate_scene_streaming, sample_shell_isoparams,
+    retessellate_scene_streaming,
 };

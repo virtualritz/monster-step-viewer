@@ -42,6 +42,8 @@ use crate::{
     },
 };
 
+const ISOPARAMS_DEPTH_BIAS: f32 = 4.0;
+
 pub(crate) fn setup_scene(
     mut commands: Commands,
     mut egui_global_settings: ResMut<EguiGlobalSettings>,
@@ -593,36 +595,13 @@ pub(crate) fn spawn_shell_faces_normalized(
         initial_edges_visibility,
     ));
 
-    // Isoparametric curves — sampled from each face's parametric surface.
-    // Builds an empty mesh if the surfaces have no bounded parameter range
-    // or if the original shell data isn't a `CompressedTrimmedShell`.
     let iso_t0 = Instant::now();
-    let iso_polylines =
-        monster_step_viewer::sample_shell_isoparams(shell, 4, 24);
-    let iso_sampled = iso_t0.elapsed();
-    let iso_mesh = build_isoparams_mesh(&iso_polylines, scene_center, scale);
-    let iso_total = iso_t0.elapsed();
-    log::info!(
-        "iso build: shell {} faces={} polylines={} sample={}ms total={}ms",
-        shell.id,
-        shell.faces.len(),
-        iso_polylines.len(),
-        iso_sampled.as_millis(),
-        iso_total.as_millis(),
-    );
-    let iso_mesh_handle = meshes.add(iso_mesh);
     let initial_iso_visibility = if state.show_isoparams {
         Visibility::Visible
     } else {
         Visibility::Hidden
     };
-    commands.spawn((
-        IsoparamsMesh { shell_id: shell.id },
-        Mesh3d(iso_mesh_handle),
-        MeshMaterial3d(isoparams_material.0.clone()),
-        Transform::default(),
-        initial_iso_visibility,
-    ));
+    let mut iso_polyline_count = 0usize;
 
     // Face records still feed the hierarchy panel; the per-face mesh handle is
     // empty because faces no longer own dedicated ECS meshes.
@@ -646,7 +625,32 @@ pub(crate) fn spawn_shell_faces_normalized(
             loop_ids: Vec::new(),
             annotation: Default::default(),
         });
+
+        if !face.isoparams.is_empty() {
+            iso_polyline_count += face.isoparams.len();
+            let iso_mesh =
+                build_isoparams_mesh(&face.isoparams, scene_center, scale);
+            let iso_mesh_handle = meshes.add(iso_mesh);
+            commands.spawn((
+                IsoparamsMesh {
+                    shell_id: shell.id,
+                    face_id: global_face_id,
+                },
+                Mesh3d(iso_mesh_handle),
+                MeshMaterial3d(isoparams_material.0.clone()),
+                Transform::default(),
+                initial_iso_visibility,
+            ));
+        }
     }
+    let iso_total = iso_t0.elapsed();
+    log::info!(
+        "iso build: shell {} faces={} polylines={} total={}ms",
+        shell.id,
+        shell.faces.len(),
+        iso_polyline_count,
+        iso_total.as_millis(),
+    );
 
     // Register edge records for this shell's curve edges.
     let base_edge_id = state.edges.len();
@@ -1707,18 +1711,19 @@ pub(crate) fn apply_polygon_edges_visibility(
     }
 }
 
-/// Shared `StandardMaterial` used by every per-shell isoparams line-list
-/// entity. Slightly lighter and bluer than polygon edges so the two
-/// overlays read as different at a glance.
+/// Shared `StandardMaterial` used by every per-face isoparams line-list
+/// entity. Matches the polygon-edge overlay material. The positive depth
+/// bias keeps coplanar isoparams from z-fighting with the face mesh.
 pub(crate) fn setup_isoparams_material(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let handle = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.15, 0.45, 0.85, 0.7),
+        base_color: Color::srgba(0.0, 0.0, 0.0, 0.6),
         unlit: true,
         cull_mode: None,
         alpha_mode: AlphaMode::Blend,
+        depth_bias: ISOPARAMS_DEPTH_BIAS,
         ..Default::default()
     });
     commands.insert_resource(IsoparamsMaterial(handle));
@@ -1773,8 +1778,8 @@ fn build_isoparams_mesh(
     mesh
 }
 
-/// Toggle the per-shell isoparams entities' visibility based on
-/// `state.show_isoparams` and the owning shell's own visibility. Same
+/// Toggle the per-face isoparams entities' visibility based on
+/// `state.show_isoparams`, the owning shell, and the owning face. Same
 /// no-write-when-unchanged guard as `apply_polygon_edges_visibility`.
 pub(crate) fn apply_isoparams_visibility(
     state: Res<ViewerState>,
@@ -1787,7 +1792,12 @@ pub(crate) fn apply_isoparams_visibility(
             .iter()
             .find(|s| s.id == iso.shell_id)
             .is_none_or(|s| s.visible);
-        let target = if show && shell_visible {
+        let face_visible = state
+            .faces
+            .iter()
+            .find(|f| f.id == iso.face_id)
+            .is_none_or(|f| f.visible);
+        let target = if show && shell_visible && face_visible {
             Visibility::Visible
         } else {
             Visibility::Hidden

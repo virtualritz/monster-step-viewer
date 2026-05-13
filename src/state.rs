@@ -350,12 +350,13 @@ pub(crate) struct PolygonEdgesMesh {
     pub shell_id: usize,
 }
 
-/// Marker on the per-shell line-list mesh that draws isoparametric curves
-/// sampled from each face's parametric surface. Visibility tracks
-/// `state.show_isoparams` together with the shell's own visibility.
+/// Marker on a per-face line-list mesh that draws trim-aware isoparametric
+/// curves emitted by `monstertruck-meshing`. Visibility tracks
+/// `state.show_isoparams` together with shell and face visibility.
 #[derive(Component, Debug)]
 pub(crate) struct IsoparamsMesh {
     pub shell_id: usize,
+    pub face_id: usize,
 }
 
 /// Shared material handle used by every per-shell polygon-edges line-list
