@@ -14,10 +14,10 @@ A 3D viewer for STEP (ISO 10303-21) CAD files, built with [`monstertruck`](https
 - Adjustable tessellation density.
 - Wireframe edge display (boundary edges).
 - Polygon-edge overlay (triangulated mesh edges) and isoparametric curve overlay.
-- Per-axis clip planes (X / Y / Z, flippable, with optional solidify).
+- Per-axis clip planes (X/Y/Z, flippable, with optional solidify).
 - Bounding box visualization.
-- Pan/orbit camera controls, with keyboard shortcuts to frame the scene or focus the current selection.
-- Optional 3Delight (NSI) path-traced overlay — see [3Delight rendering](#3delight-rendering).
+- Pan/orbit camera controls with keyboard shortcuts.
+- Optional 3Delight (NSI) path-traced overlay — see [3Delight Rendering](#3delight-rendering).
 - File metadata display.
 
 ## Installation
@@ -45,59 +45,50 @@ mstpv
 - **Right-drag**: Orbit
 - **Middle-drag**: Pan
 - **Scroll wheel**: Zoom (dolly)
-- **Left-click**: Pick face / hierarchy item
+- **Left-click**: Pick face/hierarchy item
 
 ### Keyboard
 
-- **R**: Reset view (frame the whole scene from the initial vantage)
-- **F**: Frame scene (re-fit current camera angle to the scene bounds)
-- **C**: Center on selection (fit the camera to the currently-selected face)
-- **Ctrl** + **+** / **-** / **0**: Zoom the egui UI in / out / reset
-- **Esc**: Quit
+- **R**: Reset view to the initial vantage.
+- **F**: Frame the scene with the current camera angle.
+- **C**: Center on the selected face.
+- **Ctrl**+**+**/**-**/**0**: Zoom UI in/out/reset.
+- **Esc**: Quit.
 
 ## Toolbar Icons
 
-Top-right viewport overlay; icons are [Material Symbols](https://fonts.google.com/icons) (outlined). Click to toggle.
+| Icon | Action |
+| :--: | :----- |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/casino-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/casino-outline.svg" width="20" alt=""></picture> | Random face colors |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/palette-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/palette-outline.svg" width="20" alt=""></picture> | STEP-defined colors |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/view-in-ar-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/view-in-ar-outline.svg" width="20" alt=""></picture> | Bounding box |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/deployed-code-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/deployed-code-outline.svg" width="20" alt=""></picture> | STEP curve wireframe |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/grid-on-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/grid-on-outline.svg" width="20" alt=""></picture> | Isoparametric curves |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/details-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/details-outline.svg" width="20" alt=""></picture> | Polygon (mesh) edges |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/counter-3-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/counter-3-outline.svg" width="20" alt=""></picture> | 3Delight NSI overlay (requires `nsi-render`) |
 
-| Icon | Symbol | Action |
-| :--: | :----- | :----- |
-| <img src="https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/casino/default/24px.svg" width="20" alt="casino"> | `casino` | Random face colors |
-| <img src="https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/palette/default/24px.svg" width="20" alt="palette"> | `palette` | STEP-defined colors |
-| <img src="https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/view_in_ar/default/24px.svg" width="20" alt="view_in_ar"> | `view_in_ar` | Bounding box |
-| <img src="https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/deployed_code/default/24px.svg" width="20" alt="deployed_code"> | `deployed_code` | STEP curve wireframe |
-| <img src="https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/grid_on/default/24px.svg" width="20" alt="grid_on"> | `grid_on` | Isoparametric curves |
-| <img src="https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/details/default/24px.svg" width="20" alt="details"> | `details` | Polygon (mesh) edges |
-| <img src="https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/counter_3/default/24px.svg" width="20" alt="counter_3"> | `counter_3` | 3Delight NSI overlay (requires `nsi-render` feature + 3Delight installed) |
+Per-axis clip planes (X/Y/Z) cycle Off → +axis → −axis → Off. The toolbar also has a tessellation-quality slider and a shading-mode picker.
 
-The toolbar also exposes per-axis clip planes (X / Y / Z) — click to cycle Off → +axis → −axis → Off — plus a tessellation-quality slider and shading-mode picker.
+## [3Delight](https://www.3delight.com) Rendering
 
-## 3Delight rendering
-
-Build with the `nsi-render` Cargo feature to embed a 3Delight (NSI) progressive-render overlay:
+Build with the `nsi-render` Cargo feature for a 3Delight (NSI) progressive-render overlay:
 
 ```bash
 cargo run --features nsi-render -- path/to/model.step
 ```
 
-[3Delight](https://www.3delight.com) must be installed locally; the build auto-detects it at `/usr/local/3delight` or via `$DELIGHT`. When enabled, the `counter_3` toolbar button starts an interactive path-traced render of the model's exact NURBS surfaces in 3Delight's `idisplay` window — geometry is sent once via NSI's `nurbs` node, camera and visibility toggles stream as incremental `set_attribute` updates.
+3Delight must be installed locally; the build auto-detects standard install paths and the `$DELIGHT` environment variable. The `counter_3` toolbar button starts an interactive path-traced render in 3Delight's `idisplay` window — geometry is sent once via NSI's `nurbs` node, camera and visibility toggles stream as incremental `set_attribute` updates.
 
-This is a native-only feature; wasm builds are unaffected.
+Native-only; wasm builds are unaffected.
 
 ## Building
 
 Requires Rust 1.89+ (2024 edition).
 
 ```bash
-# Debug build
-cargo build
-
-# Release build (recommended for performance)
-cargo build --release
-
-# Native build with the 3Delight overlay
+cargo build              # debug
+cargo build --release    # release
 cargo build --release --features nsi-render
-
-# Run tests
 cargo test
 ```
 
@@ -113,12 +104,12 @@ dnf install clang clang-devel clang-tools-extra libxkbcommon-devel pkg-config op
 
 ## Dependencies
 
-- [`bevy`](https://bevyengine.org/) – game engine for rendering (audio features are disabled, so ALSA/`libasound` is not required)
+- [`bevy`](https://bevyengine.org/) – game engine for rendering
 - [`egui`](https://github.com/emilk/egui/) – immediate-mode GUI
-- [`monstertruck`](https://github.com/virtualritz/monstertruck) – STEP parsing, BRep topology, and tessellation
-- [`bevy_editor_cam`](https://github.com/aevyrie/bevy_editor_cam) – orbit / pan / dolly camera controls
-- [`meshopt`](https://github.com/gwihlidal/meshopt-rs) – mesh post-processing (vertex cache / fetch reordering); native-only
-- [`nsi`](https://github.com/virtualritz/nsi) – 3Delight scene interface bindings (only with `nsi-render`)
+- [`monstertruck`](https://github.com/virtualritz/monstertruck) – STEP parsing, BRep topology, tessellation
+- [`bevy_editor_cam`](https://github.com/aevyrie/bevy_editor_cam) – orbit/pan/dolly camera controls
+- [`meshopt`](https://github.com/gwihlidal/meshopt-rs) – mesh post-processing (vertex cache/fetch reordering); native-only
+- [`nsi`](https://github.com/virtualritz/nsi) – 3Delight scene interface bindings (`nsi-render` only)
 
 ## License
 
