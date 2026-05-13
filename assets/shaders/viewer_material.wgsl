@@ -33,7 +33,7 @@
 //
 // clip_active: bitmask in .x — bit 0 = plane 0, bit 1 = plane 1, bit 2 = plane 2.
 //
-// shading_flags: bit 0 = matcap mode.
+// shading_flags: bit 0 = matcap mode, bit 1 = flat normal mode.
 struct ViewerMaterialExt {
     clip_plane_0: vec4<f32>,
     clip_plane_1: vec4<f32>,
@@ -54,7 +54,7 @@ var matcap_texture: texture_2d<f32>;
 var matcap_sampler: sampler;
 
 // Per-face state bits.
-// bit 0 = selected, bit 1 = hovered, bit 2 = hidden
+// bit 0 = selected, bit 1 = hovered, bit 2 = hidden, bits 3..4 = manual annotation.
 @group(#{MATERIAL_BIND_GROUP}) @binding(103)
 var<storage, read> face_state: array<u32>;
 
@@ -124,6 +124,30 @@ fn face_state_for(face_id: u32) -> u32 {
     return face_state[face_id];
 }
 
+fn annotation_tint(state: u32) -> vec3<f32> {
+    let annotation = (state >> 3u) & 3u;
+    if annotation == 1u {
+        return vec3<f32>(0.95, 0.75, 0.05);
+    }
+    if annotation == 2u {
+        return vec3<f32>(0.95, 0.10, 0.12);
+    }
+    if annotation == 3u {
+        return vec3<f32>(0.15, 0.65, 1.0);
+    }
+    return vec3<f32>(0.0, 0.0, 0.0);
+}
+
+fn apply_annotation(color: vec4<f32>, state: u32) -> vec4<f32> {
+    let annotation = (state >> 3u) & 3u;
+    if annotation == 0u {
+        return color;
+    }
+    let tint = annotation_tint(state);
+    let mixed = color.rgb * 0.55 + tint * 0.45;
+    return vec4<f32>(mixed, color.a);
+}
+
 @fragment
 fn fragment(
     in: ViewerVertexOutput,
@@ -155,7 +179,17 @@ fn fragment(
         }
     }
 
-    let pbr_in = to_pbr(in);
+    var pbr_in = to_pbr(in);
+    if (viewer_ext.shading_flags & 2u) != 0u {
+        let dpdx_world = dpdx(in.world_position.xyz);
+        let dpdy_world = dpdy(in.world_position.xyz);
+        let flat_normal = normalize(cross(dpdx_world, dpdy_world));
+        if is_front {
+            pbr_in.world_normal = flat_normal;
+        } else {
+            pbr_in.world_normal = -flat_normal;
+        }
+    }
 
 #ifndef PREPASS_PIPELINE
     if (viewer_ext.shading_flags & 1u) != 0u {
@@ -170,6 +204,7 @@ fn fragment(
         } else if (state & 2u) != 0u {
             out.color = out.color + vec4<f32>(0.2, 0.15, 0.0, 0.0);
         }
+        out.color = apply_annotation(out.color, state);
         return out;
     }
 #endif
@@ -193,6 +228,7 @@ fn fragment(
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    out.color = apply_annotation(out.color, state);
 #endif
 
     return out;

@@ -31,13 +31,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 ehttp = "0.7"
-#monstertruck = { version = "0.1", features = ["step", "meshing", "solid", "modeling", "yang"] }
-monstertruck = { path = "../truck/.worktrees/yang-loops-store-clean-path/monstertruck", features = [
+monstertruck = { git = "https://github.com/virtualritz/monstertruck.git", features = [
     "step",
     "meshing",
     "solid",
     "modeling",
-    "yang",
 ] }
 
 # meshopt wraps the C++ meshoptimizer library. Keep it native-only for now;
@@ -45,6 +43,20 @@ monstertruck = { path = "../truck/.worktrees/yang-loops-store-clean-path/monster
 # vertex-cache/vertex-fetch reordering.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 meshopt = "0.6"
+# NSI live rendering (3Delight). Optional, native-only. Pins the same git rev as
+# akatela's NSI integration, which we model the BRep export on.
+nsi = { git = "https://github.com/virtualritz/nsi.git", features = ["output"], optional = true }
+crossbeam = { version = "0.8", optional = true }
+
+[features]
+default = []
+# Writes standalone `.nsi` files. Native-only and independent from live
+# rendering.
+nsi-export = []
+# Renders trimmed NURBS surfaces via 3Delight (NSI) and overlays the result
+# in the viewport. Native-only; requires 3Delight installed locally
+# (`/usr/local/3delight/...` or `$DELIGHT`).
+nsi-render = ["dep:nsi", "dep:crossbeam"]
 
 [profile.release]
 opt-level = 2 # fast and small wasm

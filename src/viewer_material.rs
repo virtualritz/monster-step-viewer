@@ -27,6 +27,12 @@ pub(crate) const ATTRIBUTE_FACE_ID: MeshVertexAttribute =
 pub(crate) const FACE_STATE_SELECTED: u32 = 1 << 0;
 pub(crate) const FACE_STATE_HOVERED: u32 = 1 << 1;
 pub(crate) const FACE_STATE_HIDDEN: u32 = 1 << 2;
+pub(crate) const FACE_STATE_ANNOTATION_SHIFT: u32 = 3;
+
+/// Use matcap shading in the custom fragment shader.
+pub(crate) const SHADING_FLAG_MATCAP: u32 = 1 << 0;
+/// Derive a per-fragment geometric normal for flat display mode.
+pub(crate) const SHADING_FLAG_FLAT: u32 = 1 << 1;
 
 /// Type alias for the viewer's extended material.
 pub(crate) type ViewerMaterial =
@@ -108,7 +114,7 @@ pub(crate) fn setup_material_palette(
 ///
 /// Binding slot 100 avoids conflicts with `StandardMaterial` bindings (0-99).
 /// The uniform struct must be 16-byte aligned, so we pad `shading_flags` to
-/// a full `UVec4` worth of space.
+/// a full `vec4<u32>` uniform slot.
 ///
 /// Binding slots 101/102 hold the matcap texture and sampler.
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
@@ -125,7 +131,7 @@ pub(crate) struct ViewerMaterialExt {
     /// Bitmask in `.x` — bit 0/1/2 enable planes 0/1/2.
     #[uniform(100)]
     pub clip_active: UVec4,
-    /// Bit 0 = matcap mode.
+    /// Bit 0 = matcap mode, bit 1 = flat normal mode.
     #[uniform(100)]
     pub shading_flags: u32,
     #[uniform(100)]

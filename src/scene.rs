@@ -3,7 +3,6 @@ use bevy::{
     camera::{RenderTarget, visibility::RenderLayers},
     input::mouse::MouseWheel,
     mesh::Indices,
-    pbr::wireframe::Wireframe,
     picking::pointer::{PointerButton, PointerId, PointerLocation},
     prelude::*,
     render::render_resource::PrimitiveTopology,
@@ -15,29 +14,32 @@ use bevy_editor_cam::{
 };
 use bevy_egui::{EguiContexts, EguiGlobalSettings, PrimaryEguiContext};
 use monster_step_viewer::{
-    CompressedShellData, LoadPhase, StepBoundaryLoop, StepBounds, StepEdge,
-    StepFace, StepScene, StepShell, StepTopology,
+    LoadPhase, StepBounds, StepScene, StepShell, StepTopology,
 };
 use monstertruck::meshing::prelude::PolygonMesh;
 use rayon::prelude::*;
 use std::{
+    collections::{HashMap, HashSet},
+    f32::consts::{FRAC_PI_2, FRAC_PI_4, FRAC_PI_6, PI},
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::TryRecvError,
-    },
+    sync::mpsc::TryRecvError,
+    time::Instant,
 };
 
 use crate::{
     state::{
         AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, ClipPlaneDragState,
-        ClipPlaneHandle, EdgeRecord, FaceRecord, KEY_LIGHT_ILLUMINANCE,
-        LoadJob, LoopRecord, MainCamera, NEUTRAL_GRAY, PolygonEdgesMaterial,
-        PolygonEdgesMesh, Selection, ShadingMode, ShellMesh, ShellRecord,
-        SolidifyJob, ViewerState, ViewportClickGuard,
+        ClipPlaneHandle, EdgeRecord, FaceRecord, IsoparamsMaterial,
+        IsoparamsMesh, KEY_LIGHT_ILLUMINANCE, LoadJob, LoopRecord, MainCamera,
+        NEUTRAL_GRAY, PolygonEdgesMaterial, PolygonEdgesMesh, Selection,
+        ShadingMode, ShellMesh, ShellRecord, ViewerState, ViewportClickGuard,
     },
-    viewer_material::ViewerMaterial,
+    viewer_material::{
+        ATTRIBUTE_FACE_ID, FACE_STATE_ANNOTATION_SHIFT, FACE_STATE_HIDDEN,
+        FACE_STATE_HOVERED, FACE_STATE_SELECTED, FaceStateBuffer,
+        MatcapTexture, MaterialPalette, SHADING_FLAG_FLAT, SHADING_FLAG_MATCAP,
+        ViewerMaterial,
+    },
 };
 
 pub(crate) fn setup_scene(
@@ -74,8 +76,8 @@ pub(crate) fn setup_scene(
                 },
                 Transform::from_rotation(Quat::from_euler(
                     EulerRot::YXZ,
-                    std::f32::consts::PI * 0.25,
-                    std::f32::consts::PI * -0.3,
+                    PI * 0.25,
+                    PI * -0.3,
                     0.0,
                 )),
             ));
@@ -89,8 +91,8 @@ pub(crate) fn setup_scene(
                 },
                 Transform::from_rotation(Quat::from_euler(
                     EulerRot::YXZ,
-                    std::f32::consts::PI * -0.7,
-                    std::f32::consts::PI * 0.15,
+                    PI * -0.7,
+                    PI * 0.15,
                     0.0,
                 )),
             ));
@@ -196,74 +198,15 @@ pub(crate) fn process_load_requests(
     mut commands: Commands,
     mut state: ResMut<ViewerState>,
     mut meshes: ResMut<Assets<Mesh>>,
-    palette: Res<crate::viewer_material::MaterialPalette>,
+    palette: Res<MaterialPalette>,
     edges_material: Res<PolygonEdgesMaterial>,
+    isoparams_material: Res<IsoparamsMaterial>,
     existing_meshes: Query<
         Entity,
-        Or<(With<ShellMesh>, With<PolygonEdgesMesh>)>,
+        Or<(With<ShellMesh>, With<PolygonEdgesMesh>, With<IsoparamsMesh>)>,
     >,
     clip_handles: Query<Entity, With<ClipPlaneHandle>>,
 ) {
-    // Restore pre-solidify scene if requested.
-    if state.restore_original {
-        state.restore_original = false;
-        if let Some(original) = state.pre_solidify_scene.take() {
-            // Despawn all current meshes and handles.
-            for entity in existing_meshes.iter() {
-                commands.entity(entity).despawn();
-            }
-            for entity in clip_handles.iter() {
-                commands.entity(entity).despawn();
-            }
-            state.shells.clear();
-            state.faces.clear();
-            state.edges.clear();
-            state.loops.clear();
-            state.selection = None;
-            state.prev_selection = None;
-
-            let bounds = compute_bounds(&original);
-            if let Some(bounds) = bounds {
-                let size = bounds.max - bounds.min;
-                let max_dim = size.x.max(size.y).max(size.z);
-                let scale = if max_dim > 0.0 { 1.0 / max_dim } else { 1.0 };
-                state.scene_center = bounds.center;
-                state.scene_scale = scale;
-
-                for shell in &original.shells {
-                    spawn_shell_faces_normalized(
-                        shell,
-                        &mut commands,
-                        &mut meshes,
-                        &palette,
-                        &edges_material,
-                        &mut state,
-                        bounds.center,
-                        scale,
-                    );
-                }
-                state.current_bounds = Some(Bounds {
-                    center: Vec3::ZERO,
-                    min: (bounds.min - bounds.center) * scale,
-                    max: (bounds.max - bounds.center) * scale,
-                });
-            }
-            state.scene_data = Some(original);
-            state.clip_planes_dirty = true;
-            state.shading_mode_changed = true;
-            state.visibility_changed = true;
-            // Recompute solid topology flag.
-            state.has_solid_topology =
-                state.scene_data.as_ref().is_some_and(|scene| {
-                    scene.shells.iter().any(|s| {
-                        matches!(s.topology, Some(StepTopology::Solid(_)))
-                    })
-                });
-            info!("Restored pre-solidify scene");
-            return;
-        }
-    }
-
     // Re-tessellate the cached scene if the slider was changed (no re-parse).
     if let Some(factor) = state.pending_retessellate.take()
         && state.loading_job.is_none()
@@ -437,6 +380,7 @@ pub(crate) fn process_load_requests(
                         &mut meshes,
                         &palette,
                         &edges_material,
+                        &isoparams_material,
                         &mut state,
                         center,
                         scale,
@@ -464,6 +408,7 @@ pub(crate) fn process_load_requests(
                         &mut meshes,
                         &palette,
                         &edges_material,
+                        &isoparams_material,
                         &mut state,
                     );
                 }
@@ -471,17 +416,11 @@ pub(crate) fn process_load_requests(
                 // Track the tessellation factor used for this load.
                 state.applied_tessellation_factor = state.tessellation_factor;
 
-                // Check whether any shell has solid topology (for Solidify
-                // Clip).
+                // Track whether any shell has solid topology.
                 state.has_solid_topology =
                     state.scene_data.as_ref().is_some_and(|scene| {
                         scene.shells.iter().any(|s| {
-                            matches!(
-                                s.topology,
-                                Some(monster_step_viewer::StepTopology::Solid(
-                                    _
-                                ))
-                            )
+                            matches!(s.topology, Some(StepTopology::Solid(_)))
                         })
                     });
 
@@ -554,11 +493,13 @@ fn apply_step_bounds_to_state(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_deferred_scene_after_load(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
-    palette: &crate::viewer_material::MaterialPalette,
+    palette: &MaterialPalette,
     edges_material: &PolygonEdgesMaterial,
+    isoparams_material: &IsoparamsMaterial,
     state: &mut ResMut<ViewerState>,
 ) {
     let bounds = state.scene_data.as_ref().and_then(compute_bounds);
@@ -583,6 +524,7 @@ fn spawn_deferred_scene_after_load(
                     meshes,
                     palette,
                     edges_material,
+                    isoparams_material,
                     state,
                     bounds.center,
                     scale,
@@ -600,8 +542,9 @@ pub(crate) fn spawn_shell_faces_normalized(
     shell: &StepShell,
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
-    palette: &crate::viewer_material::MaterialPalette,
+    palette: &MaterialPalette,
     edges_material: &PolygonEdgesMaterial,
+    isoparams_material: &IsoparamsMaterial,
     state: &mut ResMut<ViewerState>,
     scene_center: Vec3,
     scale: f32,
@@ -650,6 +593,37 @@ pub(crate) fn spawn_shell_faces_normalized(
         initial_edges_visibility,
     ));
 
+    // Isoparametric curves — sampled from each face's parametric surface.
+    // Builds an empty mesh if the surfaces have no bounded parameter range
+    // or if the original shell data isn't a `CompressedTrimmedShell`.
+    let iso_t0 = Instant::now();
+    let iso_polylines =
+        monster_step_viewer::sample_shell_isoparams(shell, 4, 24);
+    let iso_sampled = iso_t0.elapsed();
+    let iso_mesh = build_isoparams_mesh(&iso_polylines, scene_center, scale);
+    let iso_total = iso_t0.elapsed();
+    log::info!(
+        "iso build: shell {} faces={} polylines={} sample={}ms total={}ms",
+        shell.id,
+        shell.faces.len(),
+        iso_polylines.len(),
+        iso_sampled.as_millis(),
+        iso_total.as_millis(),
+    );
+    let iso_mesh_handle = meshes.add(iso_mesh);
+    let initial_iso_visibility = if state.show_isoparams {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    commands.spawn((
+        IsoparamsMesh { shell_id: shell.id },
+        Mesh3d(iso_mesh_handle),
+        MeshMaterial3d(isoparams_material.0.clone()),
+        Transform::default(),
+        initial_iso_visibility,
+    ));
+
     // Face records still feed the hierarchy panel; the per-face mesh handle is
     // empty because faces no longer own dedicated ECS meshes.
     for (idx, face) in shell.faces.iter().enumerate() {
@@ -663,12 +637,14 @@ pub(crate) fn spawn_shell_faces_normalized(
         state.faces.push(FaceRecord {
             id: global_face_id,
             shell_id: shell.id,
+            source_face_id: face.id,
             name: face.name.clone(),
             triangles: tri_count,
             visible: true,
             ui_color,
             edge_ids: Vec::new(),
             loop_ids: Vec::new(),
+            annotation: Default::default(),
         });
     }
 
@@ -686,7 +662,7 @@ pub(crate) fn spawn_shell_faces_normalized(
     }
 
     // Register loop records and link edges to faces.
-    let mut referenced_edge_ids = std::collections::HashSet::new();
+    let mut referenced_edge_ids = HashSet::new();
     let mut face_edge_loop_data: Vec<(usize, Vec<usize>, Vec<usize>)> =
         Vec::new();
 
@@ -858,10 +834,8 @@ pub(crate) fn build_indexed_face_geometry(
     // Indexed geometry unlocks GPU vertex caching and ~halves vertex shading
     // work for typical triangle meshes (each vertex is shared by 4–6
     // triangles).
-    let mut vertex_lookup: std::collections::HashMap<
-        (usize, Option<usize>),
-        u32,
-    > = std::collections::HashMap::with_capacity(corners.len() / 2);
+    let mut vertex_lookup: HashMap<(usize, Option<usize>), u32> =
+        HashMap::with_capacity(corners.len() / 2);
     let mut unique_vertices: Vec<(usize, Option<usize>)> =
         Vec::with_capacity(corners.len() / 2);
     let indices: Vec<u32> = corners
@@ -1090,10 +1064,7 @@ pub(crate) fn build_shell_merged_mesh(
     bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, merged_positions);
     bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, merged_normals);
     bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, merged_colors);
-    bevy_mesh.insert_attribute(
-        crate::viewer_material::ATTRIBUTE_FACE_ID,
-        vertex_face_index.clone(),
-    );
+    bevy_mesh.insert_attribute(ATTRIBUTE_FACE_ID, vertex_face_index.clone());
     bevy_mesh.insert_indices(Indices::U32(merged_indices));
 
     ShellBuildResult {
@@ -1188,17 +1159,13 @@ pub(crate) fn apply_selection_highlight(mut state: ResMut<ViewerState>) {
 /// attribute.
 pub(crate) fn update_face_state_buffer(
     mut state: ResMut<ViewerState>,
-    face_state_buffer: Res<crate::viewer_material::FaceStateBuffer>,
-    palette: Res<crate::viewer_material::MaterialPalette>,
+    face_state_buffer: Res<FaceStateBuffer>,
+    palette: Res<MaterialPalette>,
     mut storage_buffers: ResMut<
         Assets<bevy::render::storage::ShaderStorageBuffer>,
     >,
     mut materials: ResMut<Assets<ViewerMaterial>>,
 ) {
-    use crate::viewer_material::{
-        FACE_STATE_HIDDEN, FACE_STATE_HOVERED, FACE_STATE_SELECTED,
-    };
-
     let sel_changed = state.selection != state.prev_face_state_selection;
     let hov_changed = state.hover != state.prev_face_state_hover;
     let vis_changed = state.face_state_visibility_dirty;
@@ -1209,7 +1176,7 @@ pub(crate) fn update_face_state_buffer(
     let resolve = |sel: &Option<Selection>,
                    faces: &[FaceRecord],
                    loops: &[LoopRecord]|
-     -> std::collections::HashSet<usize> {
+     -> HashSet<usize> {
         match sel {
             Some(Selection::Face(fid)) => [*fid].into_iter().collect(),
             Some(Selection::Loop(lid)) => loops
@@ -1222,7 +1189,7 @@ pub(crate) fn update_face_state_buffer(
                 .find(|f| f.edge_ids.contains(eid))
                 .map(|f| [f.id].into_iter().collect())
                 .unwrap_or_default(),
-            _ => std::collections::HashSet::new(),
+            _ => HashSet::new(),
         }
     };
     let sel_faces = resolve(&state.selection, &state.faces, &state.loops);
@@ -1241,6 +1208,8 @@ pub(crate) fn update_face_state_buffer(
                 .is_none_or(|s| s.visible);
             let face_visible = face.visible && shell_visible;
             let mut bits = 0u32;
+            bits |=
+                face.annotation.shader_bits() << FACE_STATE_ANNOTATION_SHIFT;
             if !face_visible {
                 bits |= FACE_STATE_HIDDEN;
             }
@@ -1292,10 +1261,6 @@ pub(crate) fn normalize_scene_and_setup_camera(
     // Now we can consume pending_bounds.
     state.pending_bounds = None;
 
-    // Calculate scene dimensions.
-    let size = bounds.max - bounds.min;
-    let max_dim = size.x.max(size.y).max(size.z);
-
     // Store bounds for bounding box gizmo.
     state.current_bounds = Some(bounds);
 
@@ -1304,25 +1269,12 @@ pub(crate) fn normalize_scene_and_setup_camera(
         bounds.center.x,
         bounds.center.y,
         bounds.center.z,
-        max_dim
+        max_dimension(bounds)
     );
 
-    // Set up camera to view the scene from appropriate distance.
-    // Use ~1.5x the max dimension for good framing.
-    let camera_distance = max_dim * 1.5;
     if let Ok((mut transform, mut editor_cam)) = camera_query.single_mut() {
-        // Set initial transform position.
-        let yaw = std::f32::consts::FRAC_PI_4;
-        let pitch = std::f32::consts::FRAC_PI_6;
-        let offset = Vec3::new(
-            camera_distance * yaw.cos() * pitch.cos(),
-            camera_distance * pitch.sin(),
-            camera_distance * yaw.sin() * pitch.cos(),
-        );
-        transform.translation = bounds.center + offset;
-        *transform = transform.looking_at(bounds.center, Vec3::Y);
-        editor_cam.last_anchor_depth = -(camera_distance as f64).abs();
-        editor_cam.current_motion = Default::default();
+        let camera_distance =
+            frame_camera_initial(bounds, &mut transform, &mut editor_cam);
 
         log::info!(
             "Camera setup: focus=({:.2}, {:.2}, {:.2}), distance={:.2}",
@@ -1539,6 +1491,156 @@ pub(crate) fn disable_camera_when_egui_wants_input(
     }
 }
 
+/// Keyboard shortcuts for camera framing.
+pub(crate) fn handle_view_shortcuts(
+    mut contexts: EguiContexts,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    state: Res<ViewerState>,
+    meshes: Res<Assets<Mesh>>,
+    mut camera_query: Query<(&mut Transform, &mut EditorCam), With<MainCamera>>,
+) {
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    if ctx.wants_keyboard_input() {
+        return;
+    }
+
+    let reset_view = keyboard.just_pressed(KeyCode::KeyR);
+    let center_selection = keyboard.just_pressed(KeyCode::KeyC);
+    if !reset_view && !center_selection {
+        return;
+    }
+
+    let Ok((mut transform, mut editor_cam)) = camera_query.single_mut() else {
+        return;
+    };
+
+    if reset_view && let Some(bounds) = state.current_bounds {
+        frame_camera_initial(bounds, &mut transform, &mut editor_cam);
+    }
+
+    if center_selection
+        && let Some(bounds) = selected_face_bounds(&state, &meshes)
+    {
+        focus_camera_on_bounds(bounds, &mut transform, &mut editor_cam);
+    }
+}
+
+fn selected_face_bounds(
+    state: &ViewerState,
+    meshes: &Assets<Mesh>,
+) -> Option<Bounds> {
+    let face_id =
+        selected_face_id(state.selection, &state.faces, &state.loops)?;
+    let face = state.faces.iter().find(|face| face.id == face_id)?;
+    let shell = state
+        .shells
+        .iter()
+        .find(|shell| shell.id == face.shell_id)?;
+    let mesh = meshes.get(&shell.mesh_handle)?;
+    let positions = mesh
+        .attribute(Mesh::ATTRIBUTE_POSITION)
+        .and_then(|attribute| attribute.as_float3())?;
+
+    bounds_for_face_positions(positions, &shell.vertex_face_index, face_id)
+}
+
+fn selected_face_id(
+    selection: Option<Selection>,
+    faces: &[FaceRecord],
+    loops: &[LoopRecord],
+) -> Option<usize> {
+    match selection {
+        Some(Selection::Face(face_id)) => Some(face_id),
+        Some(Selection::Loop(loop_id)) => loops
+            .iter()
+            .find(|boundary_loop| boundary_loop.id == loop_id)
+            .map(|boundary_loop| boundary_loop.face_id),
+        Some(Selection::Edge(edge_id)) => faces
+            .iter()
+            .find(|face| face.edge_ids.contains(&edge_id))
+            .map(|face| face.id),
+        Some(Selection::Shell(_)) | None => None,
+    }
+}
+
+fn bounds_for_face_positions(
+    positions: &[[f32; 3]],
+    vertex_face_index: &[u32],
+    face_id: usize,
+) -> Option<Bounds> {
+    let (min, max) = positions
+        .iter()
+        .zip(vertex_face_index.iter().copied())
+        .filter_map(|(position, vertex_face_id)| {
+            (vertex_face_id as usize == face_id)
+                .then_some(Vec3::from(*position))
+        })
+        .fold(None::<(Vec3, Vec3)>, |bounds, position| {
+            Some(match bounds {
+                Some((min, max)) => (min.min(position), max.max(position)),
+                None => (position, position),
+            })
+        })?;
+    Some(Bounds {
+        center: (min + max) * 0.5,
+        min,
+        max,
+    })
+}
+
+fn max_dimension(bounds: Bounds) -> f32 {
+    let size = bounds.max - bounds.min;
+    size.x.max(size.y).max(size.z)
+}
+
+fn frame_distance_for_bounds(bounds: Bounds) -> f32 {
+    (max_dimension(bounds) * 1.5).max(1.0e-3)
+}
+
+fn initial_camera_offset(distance: f32) -> Vec3 {
+    let yaw = FRAC_PI_4;
+    let pitch = FRAC_PI_6;
+    Vec3::new(
+        distance * yaw.cos() * pitch.cos(),
+        distance * pitch.sin(),
+        distance * yaw.sin() * pitch.cos(),
+    )
+}
+
+fn update_editor_cam_anchor(editor_cam: &mut EditorCam, distance: f32) {
+    editor_cam.last_anchor_depth = -(distance as f64).abs();
+    editor_cam.current_motion = Default::default();
+}
+
+fn frame_camera_initial(
+    bounds: Bounds,
+    transform: &mut Transform,
+    editor_cam: &mut EditorCam,
+) -> f32 {
+    let distance = frame_distance_for_bounds(bounds);
+    transform.translation = bounds.center + initial_camera_offset(distance);
+    *transform = transform.looking_at(bounds.center, Vec3::Y);
+    update_editor_cam_anchor(editor_cam, distance);
+    distance
+}
+
+fn focus_camera_on_bounds(
+    bounds: Bounds,
+    transform: &mut Transform,
+    editor_cam: &mut EditorCam,
+) -> f32 {
+    let distance = (transform.translation - bounds.center)
+        .length()
+        .max(frame_distance_for_bounds(bounds));
+    let forward = transform.forward().as_vec3();
+    transform.translation = bounds.center - forward * distance;
+    *transform = transform.looking_at(bounds.center, Vec3::Y);
+    update_editor_cam_anchor(editor_cam, distance);
+    distance
+}
+
 /// One-shot startup: create the shared `StandardMaterial` used by every
 /// per-shell polygon-edges line-list entity (unlit black, double-sided).
 pub(crate) fn setup_polygon_edges_material(
@@ -1561,7 +1663,7 @@ fn build_polygon_edges_mesh(
     positions: Vec<[f32; 3]>,
     tri_indices: &[u32],
 ) -> Mesh {
-    let edges: std::collections::HashSet<(u32, u32)> = tri_indices
+    let edges: HashSet<(u32, u32)> = tri_indices
         .par_chunks_exact(3)
         .flat_map_iter(|t| [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])])
         .map(|(a, b)| if a < b { (a, b) } else { (b, a) })
@@ -1577,23 +1679,122 @@ fn build_polygon_edges_mesh(
 }
 
 /// Toggle the per-shell polygon-edges entities' visibility based on
-/// `state.show_polygon_edges` and the owning shell's own visibility.
+/// `state.show_polygon_edges` and the owning shell's own visibility. Skips
+/// the write when the target value already matches — every frame's
+/// `*vis = …` would otherwise trip `Changed<Visibility>` for hundreds of
+/// entities, which Bevy then re-runs visibility propagation + frustum
+/// culling for. That's the dominant cost in the steady-state frame budget.
 pub(crate) fn apply_polygon_edges_visibility(
     state: Res<ViewerState>,
     mut query: Query<(&PolygonEdgesMesh, &mut Visibility)>,
 ) {
-    let show = state.show_polygon_edges;
+    let show = state.show_polygon_edges
+        && state.shading_mode != ShadingMode::Wireframe;
     for (edges, mut vis) in query.iter_mut() {
         let shell_visible = state
             .shells
             .iter()
             .find(|s| s.id == edges.shell_id)
             .is_none_or(|s| s.visible);
-        *vis = if show && shell_visible {
+        let target = if show && shell_visible {
             Visibility::Visible
         } else {
             Visibility::Hidden
         };
+        if *vis != target {
+            *vis = target;
+        }
+    }
+}
+
+/// Shared `StandardMaterial` used by every per-shell isoparams line-list
+/// entity. Slightly lighter and bluer than polygon edges so the two
+/// overlays read as different at a glance.
+pub(crate) fn setup_isoparams_material(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let handle = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.15, 0.45, 0.85, 0.7),
+        unlit: true,
+        cull_mode: None,
+        alpha_mode: AlphaMode::Blend,
+        ..Default::default()
+    });
+    commands.insert_resource(IsoparamsMaterial(handle));
+}
+
+/// Build a `LineList` mesh from a list of polylines (each polyline is a
+/// world-space sequence of points). Points get normalised into the scene's
+/// coordinate frame to match the shell mesh.
+fn build_isoparams_mesh(
+    polylines: &[Vec<[f64; 3]>],
+    scene_center: Vec3,
+    scale: f32,
+) -> Mesh {
+    // Per-polyline vertex offsets (sequential prefix sum) so we can
+    // generate the line-list indices in parallel.
+    let mut polyline_offsets: Vec<u32> =
+        Vec::with_capacity(polylines.len() + 1);
+    let mut running = 0u32;
+    polylines.iter().for_each(|p| {
+        polyline_offsets.push(running);
+        running += p.len() as u32;
+    });
+    polyline_offsets.push(running);
+
+    let positions: Vec<[f32; 3]> = polylines
+        .par_iter()
+        .flat_map_iter(|polyline| {
+            polyline.iter().map(move |p| {
+                let world = Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
+                let n = (world - scene_center) * scale;
+                [n.x, n.y, n.z]
+            })
+        })
+        .collect();
+
+    // For each polyline of N points, emit (N-1)*2 indices forming the line
+    // segments p0-p1, p1-p2, ..., p(N-2)-p(N-1).
+    let indices: Vec<u32> = polylines
+        .par_iter()
+        .zip(polyline_offsets.par_iter().copied())
+        .flat_map_iter(|(polyline, offset)| {
+            let len = polyline.len() as u32;
+            (0..len.saturating_sub(1))
+                .flat_map(move |i| [offset + i, offset + i + 1])
+        })
+        .collect();
+
+    let mut mesh =
+        Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
+/// Toggle the per-shell isoparams entities' visibility based on
+/// `state.show_isoparams` and the owning shell's own visibility. Same
+/// no-write-when-unchanged guard as `apply_polygon_edges_visibility`.
+pub(crate) fn apply_isoparams_visibility(
+    state: Res<ViewerState>,
+    mut query: Query<(&IsoparamsMesh, &mut Visibility)>,
+) {
+    let show = state.show_isoparams;
+    for (iso, mut vis) in query.iter_mut() {
+        let shell_visible = state
+            .shells
+            .iter()
+            .find(|s| s.id == iso.shell_id)
+            .is_none_or(|s| s.visible);
+        let target = if show && shell_visible {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != target {
+            *vis = target;
+        }
     }
 }
 
@@ -1610,7 +1811,7 @@ pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
     // work here.
 
     // Draw STEP curve edges as blue polylines (highlighted if selected).
-    if state.show_wireframe
+    if (state.show_wireframe || state.shading_mode == ShadingMode::Wireframe)
         && let Some(scene) = &state.scene_data
     {
         let edge_color = Color::srgba(0.2, 0.6, 1.0, 0.9);
@@ -1620,23 +1821,22 @@ pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
         let mut edge_offset = 0usize;
 
         // Precompute which edge IDs are highlighted by the current selection.
-        let highlighted_edges: std::collections::HashSet<usize> =
-            match &state.selection {
-                Some(Selection::Edge(eid)) => [*eid].into_iter().collect(),
-                Some(Selection::Loop(lid)) => state
-                    .loops
-                    .iter()
-                    .find(|l| l.id == *lid)
-                    .map(|l| l.edge_ids.iter().copied().collect())
-                    .unwrap_or_default(),
-                Some(Selection::Face(fid)) => state
-                    .faces
-                    .iter()
-                    .find(|f| f.id == *fid)
-                    .map(|f| f.edge_ids.iter().copied().collect())
-                    .unwrap_or_default(),
-                _ => std::collections::HashSet::new(),
-            };
+        let highlighted_edges: HashSet<usize> = match &state.selection {
+            Some(Selection::Edge(eid)) => [*eid].into_iter().collect(),
+            Some(Selection::Loop(lid)) => state
+                .loops
+                .iter()
+                .find(|l| l.id == *lid)
+                .map(|l| l.edge_ids.iter().copied().collect())
+                .unwrap_or_default(),
+            Some(Selection::Face(fid)) => state
+                .faces
+                .iter()
+                .find(|f| f.id == *fid)
+                .map(|f| f.edge_ids.iter().copied().collect())
+                .unwrap_or_default(),
+            _ => HashSet::new(),
+        };
 
         for shell in &scene.shells {
             // Check if shell is visible.
@@ -1769,12 +1969,10 @@ pub(crate) fn retessellate_face(mut state: ResMut<ViewerState>) {
 
 /// Apply shading mode changes to materials and trigger mesh rebuilds.
 pub(crate) fn apply_shading_mode(
-    mut commands: Commands,
     mut state: ResMut<ViewerState>,
     mut materials: ResMut<Assets<ViewerMaterial>>,
-    palette: Res<crate::viewer_material::MaterialPalette>,
-    face_query: Query<Entity, With<ShellMesh>>,
-    matcap_res: Option<Res<crate::viewer_material::MatcapTexture>>,
+    palette: Res<MaterialPalette>,
+    matcap_res: Option<Res<MatcapTexture>>,
 ) {
     if !state.shading_mode_changed {
         return;
@@ -1782,62 +1980,46 @@ pub(crate) fn apply_shading_mode(
     state.shading_mode_changed = false;
 
     let mode = state.shading_mode;
-    let prev_mode = state.previous_shading_mode;
     state.previous_shading_mode = mode;
-
-    // Flat ↔ smooth normal transitions need the geometry rebuilt.
-    let entering_flat =
-        mode == ShadingMode::Flat && prev_mode != ShadingMode::Flat;
-    let leaving_flat =
-        mode != ShadingMode::Flat && prev_mode == ShadingMode::Flat;
-    if entering_flat || leaving_flat {
-        state.needs_normal_rebuild = true;
-    }
 
     // Resolve the per-mode material properties once, then push to the three
     // shared palette handles so every face picks them up via shared material
     // batching.
     let cull_back = Some(bevy::render::render_resource::Face::Back);
-    let (
-        alpha_mode,
-        cull_mode,
-        base_color,
-        shading_flags,
-        want_matcap,
-        want_wireframe,
-    ) = match mode {
-        ShadingMode::Shaded | ShadingMode::Flat => (
-            AlphaMode::Opaque,
-            cull_back,
-            Color::WHITE,
-            0u32,
-            false,
-            false,
-        ),
-        ShadingMode::XRay => (
-            AlphaMode::Blend,
-            None,
-            Color::srgba(0.7, 0.7, 0.7, 0.3),
-            0,
-            false,
-            false,
-        ),
-        ShadingMode::Wireframe => (
-            AlphaMode::Blend,
-            if state.show_wireframe {
-                None
-            } else {
-                cull_back
-            },
-            Color::srgba(0.0, 0.0, 0.0, 0.02),
-            0,
-            false,
-            true,
-        ),
-        ShadingMode::Matcap => {
-            (AlphaMode::Opaque, cull_back, Color::WHITE, 1, true, false)
-        }
-    };
+    let (alpha_mode, cull_mode, base_color, shading_flags, want_matcap) =
+        match mode {
+            ShadingMode::Shaded => {
+                (AlphaMode::Opaque, cull_back, Color::WHITE, 0u32, false)
+            }
+            ShadingMode::Flat => (
+                AlphaMode::Opaque,
+                cull_back,
+                Color::WHITE,
+                SHADING_FLAG_FLAT,
+                false,
+            ),
+            ShadingMode::XRay => (
+                AlphaMode::Blend,
+                None,
+                Color::srgba(0.7, 0.7, 0.7, 0.3),
+                0,
+                false,
+            ),
+            ShadingMode::Wireframe => (
+                AlphaMode::Blend,
+                None,
+                Color::srgba(0.0, 0.0, 0.0, 0.02),
+                0,
+                false,
+            ),
+            ShadingMode::Matcap => (
+                AlphaMode::Opaque,
+                cull_back,
+                Color::WHITE,
+                SHADING_FLAG_MATCAP,
+                true,
+            ),
+        };
 
     let matcap_handle = if want_matcap {
         matcap_res.as_ref().map(|r| r.0.clone())
@@ -1854,17 +2036,6 @@ pub(crate) fn apply_shading_mode(
             mat.base.base_color = base_color;
             mat.extension.shading_flags = shading_flags;
             mat.extension.matcap_texture = matcap_handle.clone();
-        }
-    }
-
-    // Wireframe overlay component is per-entity.
-    if want_wireframe {
-        for entity in face_query.iter() {
-            commands.entity(entity).insert(Wireframe);
-        }
-    } else {
-        for entity in face_query.iter() {
-            commands.entity(entity).remove::<Wireframe>();
         }
     }
 }
@@ -2215,9 +2386,9 @@ pub(crate) fn manage_clip_plane_visuals(
             // Y-handle needs XZ quad: identity rotation (default).
             // Z-handle needs XY quad: rotate 90° around X.
             let rotation = match axis {
-                0 => Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+                0 => Quat::from_rotation_z(FRAC_PI_2),
                 1 => Quat::IDENTITY,
-                _ => Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                _ => Quat::from_rotation_x(FRAC_PI_2),
             };
 
             // Scale: the base mesh is 1×1 (half_size 0.5 on each side).
@@ -2365,495 +2536,6 @@ pub(crate) fn on_clip_plane_drag_end(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Solidify Clip: boolean-AND with half-space boxes for each active clip plane
-// ---------------------------------------------------------------------------
-
-/// Kick off a background thread that performs the boolean AND operation.
-pub(crate) fn start_solidify_clip(mut state: ResMut<ViewerState>) {
-    if !state.start_solidify {
-        return;
-    }
-    state.start_solidify = false;
-
-    // Gather the first solid topology from scene_data.
-    let scene = match state.scene_data.as_ref() {
-        Some(s) => s,
-        None => return,
-    };
-
-    // Find a shell with solid topology.
-    let (solid_data, tol) = {
-        let mut found = None;
-        for shell in &scene.shells {
-            if let Some(StepTopology::Solid(ref data)) = shell.topology {
-                found = Some((data.clone(), shell.tessellation_tolerance));
-                break;
-            }
-        }
-        match found {
-            Some(v) => v,
-            None => {
-                state.error = Some("No solid topology found".to_string());
-                return;
-            }
-        }
-    };
-
-    // Compute bounds from scene mesh data (world-space, pre-normalization).
-    let bounds = match compute_bounds(scene) {
-        Some(b) => b,
-        None => {
-            state.error =
-                Some("Cannot compute bounds for solidify".to_string());
-            return;
-        }
-    };
-
-    // Collect active clip planes with their world-space positions.
-    let mut active_clips: Vec<(usize, f64, bool)> = Vec::new();
-    for (i, cp) in state.clip_planes.iter().enumerate() {
-        if !cp.enabled {
-            continue;
-        }
-        let t = cp.position as f64 / 1000.0;
-        let axis_min = match i {
-            0 => bounds.min.x as f64,
-            1 => bounds.min.y as f64,
-            _ => bounds.min.z as f64,
-        };
-        let axis_max = match i {
-            0 => bounds.max.x as f64,
-            1 => bounds.max.y as f64,
-            _ => bounds.max.z as f64,
-        };
-        let world_pos = axis_min + t * (axis_max - axis_min);
-        active_clips.push((i, world_pos, cp.flip));
-    }
-
-    if active_clips.is_empty() {
-        return;
-    }
-
-    // Save original scene for later restoration.
-    if state.pre_solidify_scene.is_none() {
-        state.pre_solidify_scene = state.scene_data.clone();
-    }
-
-    // Spawn background thread with cancel flag.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_clone = cancel.clone();
-
-    std::thread::spawn(move || {
-        let result =
-            solidify_clip_inner(&solid_data, &active_clips, tol, &cancel_clone);
-        let _ = tx.send(result);
-    });
-
-    state.solidify_job = Some(SolidifyJob {
-        receiver: parking_lot::Mutex::new(rx),
-        cancel,
-    });
-    info!("Started solidify-clip background job");
-}
-
-/// Perform boolean AND of solid with half-space boxes (runs on background
-/// thread).
-fn solidify_clip_inner(
-    solid_data: &CompressedShellData,
-    active_clips: &[(usize, f64, bool)],
-    tol: f64,
-    cancel: &AtomicBool,
-) -> Result<StepScene, String> {
-    use monstertruck::{
-        meshing::prelude::{BoundingBox, Point3, RobustMeshableShape},
-        modeling::{
-            Curve as ModelingCurve, Invertible, Surface as ModelingSurface,
-        },
-        solid::{
-            ShellOrientationHints, and_with_orientation_hints,
-            extract_healed_trimmed_solid,
-        },
-        step::load::step_geometry::{Curve3D, Pcurve, Surface},
-        topology::{Solid, compress::CompressedTrimmedSolid},
-    };
-
-    type StepSolid = Solid<Point3, Curve3D, Surface>;
-    type StepCompressedSolid =
-        CompressedTrimmedSolid<Point3, Curve3D, Surface, Pcurve>;
-    type ModelingSolid = Solid<Point3, ModelingCurve, ModelingSurface>;
-
-    // Downcast and extract the solid.
-    let csolid: &StepCompressedSolid = solid_data
-        .downcast_ref::<StepCompressedSolid>()
-        .ok_or_else(|| {
-            "Failed to downcast CompressedShellData to CompressedSolid"
-                .to_string()
-        })?;
-
-    let current_solid: StepSolid =
-        extract_healed_trimmed_solid(csolid.clone(), tol)
-            .map(|solid| solid.erase_trims())
-            .map_err(|e| {
-                format!("Failed to extract healed trimmed solid: {}", e)
-            })?;
-
-    let mut current_solid: ModelingSolid = current_solid
-        .try_mapped(
-            |p| Some(*p),
-            |c: &Curve3D| ModelingCurve::try_from(c).ok(),
-            |s: &Surface| ModelingSurface::try_from(s).ok(),
-        )
-        .ok_or_else(|| {
-            "Failed to convert STEP solid to modeling types".to_string()
-        })?;
-    // Apply each active clip plane as a boolean AND with a half-space box.
-    // The shader discards fragments where dot(normal, pos) + d > 0, which for
-    // no-flip (normal = +axis, d = -pos) keeps the NEGATIVE side (x <= pos).
-    // The solidify box must match that clip, but the non-clipped axes can be
-    // much larger than the model bounds so the silhouette never coincides with
-    // the cap rectangle boundary.
-    for &(axis, world_pos, flip) in active_clips {
-        let bounds = BoundingBox::from_iter(
-            current_solid.vertex_iter().map(|vertex| vertex.point()),
-        );
-        let margin = f64::max(10.0 * tol, 1.0e-3 * bounds.diameter());
-        let support_padding = bounds.diameter() + margin;
-        let (min_pt, max_pt) = match axis {
-            0 => {
-                // X axis
-                if flip {
-                    (
-                        Point3::new(
-                            world_pos,
-                            bounds.min().y - support_padding,
-                            bounds.min().z - support_padding,
-                        ),
-                        Point3::new(
-                            bounds.max().x + margin,
-                            bounds.max().y + support_padding,
-                            bounds.max().z + support_padding,
-                        ),
-                    )
-                } else {
-                    (
-                        Point3::new(
-                            bounds.min().x - margin,
-                            bounds.min().y - support_padding,
-                            bounds.min().z - support_padding,
-                        ),
-                        Point3::new(
-                            world_pos,
-                            bounds.max().y + support_padding,
-                            bounds.max().z + support_padding,
-                        ),
-                    )
-                }
-            }
-            1 => {
-                // Y axis
-                if flip {
-                    (
-                        Point3::new(
-                            bounds.min().x - support_padding,
-                            world_pos,
-                            bounds.min().z - support_padding,
-                        ),
-                        Point3::new(
-                            bounds.max().x + support_padding,
-                            bounds.max().y + margin,
-                            bounds.max().z + support_padding,
-                        ),
-                    )
-                } else {
-                    (
-                        Point3::new(
-                            bounds.min().x - support_padding,
-                            bounds.min().y - margin,
-                            bounds.min().z - support_padding,
-                        ),
-                        Point3::new(
-                            bounds.max().x + support_padding,
-                            world_pos,
-                            bounds.max().z + support_padding,
-                        ),
-                    )
-                }
-            }
-            _ => {
-                // Z axis
-                if flip {
-                    (
-                        Point3::new(
-                            bounds.min().x - support_padding,
-                            bounds.min().y - support_padding,
-                            world_pos,
-                        ),
-                        Point3::new(
-                            bounds.max().x + support_padding,
-                            bounds.max().y + support_padding,
-                            bounds.max().z + margin,
-                        ),
-                    )
-                } else {
-                    (
-                        Point3::new(
-                            bounds.min().x - support_padding,
-                            bounds.min().y - support_padding,
-                            bounds.min().z - margin,
-                        ),
-                        Point3::new(
-                            bounds.max().x + support_padding,
-                            bounds.max().y + support_padding,
-                            world_pos,
-                        ),
-                    )
-                }
-            }
-        };
-
-        let bbox = BoundingBox::from_iter([min_pt, max_pt]);
-        let halfspace: ModelingSolid =
-            monstertruck::modeling::primitive::cuboid(bbox);
-
-        if cancel.load(Ordering::Relaxed) {
-            return Err("Cancelled".to_string());
-        }
-
-        current_solid = and_with_orientation_hints(
-            &current_solid,
-            &halfspace,
-            ShellOrientationHints {
-                first_inverted: false,
-                second_inverted: false,
-            },
-            tol,
-        )
-        .map_err(|e| format!("Boolean AND failed on axis {}: {:?}", axis, e))?;
-    }
-
-    if cancel.load(Ordering::Relaxed) {
-        return Err("Cancelled".to_string());
-    }
-
-    // Compress the result and preserve exact trims already carried by the
-    // boolean output curves. Meshing can still fall back to shared 3D edges
-    // where no exact face-local trim is available.
-    let compressed = current_solid.compress_with_exact_face_trims();
-    let clipped_solid_data = CompressedShellData::new(compressed.clone());
-
-    // Tessellate each boundary shell of the solid.
-    let mut all_shells: Vec<StepShell> = Vec::new();
-    for (boundary_idx, boundary) in compressed.boundaries.iter().enumerate() {
-        let poly_shell = boundary.robust_triangulation(tol);
-
-        // Extract faces from the tessellated shell.
-        let all_edges: Vec<([f64; 3], [f64; 3])> = Vec::new();
-        let faces: Vec<StepFace> = poly_shell
-            .faces
-            .iter()
-            .enumerate()
-            .filter_map(|(face_idx, face)| {
-                face.surface.as_ref().map(|surface| {
-                    let mesh = match face.orientation {
-                        true => surface.clone(),
-                        false => surface.inverse(),
-                    };
-
-                    // Extract boundary loop topology.
-                    let boundary_loops: Vec<StepBoundaryLoop> = face
-                        .boundaries
-                        .iter()
-                        .enumerate()
-                        .map(|(loop_idx, loop_edges)| StepBoundaryLoop {
-                            edge_indices: loop_edges
-                                .iter()
-                                .map(|ei| ei.index)
-                                .collect(),
-                            is_outer: loop_idx == 0,
-                        })
-                        .collect();
-
-                    StepFace {
-                        id: face_idx,
-                        name: format!("Face {}", face_idx + 1),
-                        mesh,
-                        boundary_loops,
-                        color: None,
-                    }
-                })
-            })
-            .collect();
-
-        // Extract curve edges.
-        let curve_edges: Vec<StepEdge> = poly_shell
-            .edges
-            .iter()
-            .enumerate()
-            .map(|(i, edge)| {
-                let points =
-                    edge.curve.iter().map(|p| [p.x, p.y, p.z]).collect();
-                StepEdge {
-                    id: i,
-                    curve_type: "Unknown".to_string(),
-                    points,
-                }
-            })
-            .collect();
-
-        all_shells.push(StepShell {
-            id: boundary_idx,
-            name: format!("Shell {} (clipped)", boundary_idx + 1),
-            faces,
-            color: None,
-            transform: None,
-            edges: all_edges,
-            curve_edges,
-            original_shell: None,
-            topology: Some(StepTopology::Solid(clipped_solid_data.clone())),
-            tessellation_tolerance: tol,
-            failed_faces: poly_shell
-                .faces
-                .iter()
-                .filter(|face| face.surface.is_none())
-                .count(),
-        });
-    }
-
-    if all_shells.is_empty() {
-        return Err("Boolean clipping produced no shells".to_string());
-    }
-
-    Ok(StepScene {
-        metadata: monster_step_viewer::StepMetadata::default(),
-        shells: all_shells,
-    })
-}
-
-/// Poll for solidify-clip completion and apply the result.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-pub(crate) fn poll_solidify_clip(
-    mut state: ResMut<ViewerState>,
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    palette: Res<crate::viewer_material::MaterialPalette>,
-    edges_material: Res<PolygonEdgesMaterial>,
-    existing_meshes: Query<
-        Entity,
-        Or<(With<ShellMesh>, With<PolygonEdgesMesh>)>,
-    >,
-    clip_handles: Query<Entity, With<ClipPlaneHandle>>,
-) {
-    let job = match state.solidify_job.as_ref() {
-        Some(j) => j,
-        None => return,
-    };
-
-    let result = {
-        let receiver = job.receiver.lock();
-        receiver.try_recv()
-    };
-
-    let result = match result {
-        Ok(r) => r,
-        Err(TryRecvError::Empty) => return,
-        Err(TryRecvError::Disconnected) => {
-            state.solidify_job = None;
-            state.error =
-                Some("Solidify job thread terminated unexpectedly".to_string());
-            return;
-        }
-    };
-
-    // Clear the job.
-    state.solidify_job = None;
-
-    match result {
-        Ok(new_scene) => {
-            info!(
-                "Solidify-clip completed: {} shells, {} total faces",
-                new_scene.shells.len(),
-                new_scene
-                    .shells
-                    .iter()
-                    .map(|s| s.faces.len())
-                    .sum::<usize>(),
-            );
-
-            // Despawn all existing face mesh entities.
-            for entity in existing_meshes.iter() {
-                commands.entity(entity).despawn();
-            }
-            // Remove clip-plane handles — they'll be re-created if needed.
-            for entity in clip_handles.iter() {
-                commands.entity(entity).despawn();
-            }
-
-            // Clear records.
-            state.shells.clear();
-            state.faces.clear();
-            state.edges.clear();
-            state.loops.clear();
-            state.selection = None;
-            state.prev_selection = None;
-
-            // Compute bounds for the new scene and spawn meshes.
-            let bounds = compute_bounds(&new_scene);
-            if let Some(bounds) = bounds {
-                let size = bounds.max - bounds.min;
-                let max_dim = size.x.max(size.y).max(size.z);
-                let scale = if max_dim > 0.0 { 1.0 / max_dim } else { 1.0 };
-
-                state.scene_center = bounds.center;
-                state.scene_scale = scale;
-
-                for shell in &new_scene.shells {
-                    spawn_shell_faces_normalized(
-                        shell,
-                        &mut commands,
-                        &mut meshes,
-                        &palette,
-                        &edges_material,
-                        &mut state,
-                        bounds.center,
-                        scale,
-                    );
-                }
-
-                state.current_bounds = Some(Bounds {
-                    center: Vec3::ZERO,
-                    min: (bounds.min - bounds.center) * scale,
-                    max: (bounds.max - bounds.center) * scale,
-                });
-            }
-
-            // Update scene_data.
-            state.scene_data = Some(new_scene);
-
-            // Update solid topology flag.
-            state.has_solid_topology =
-                state.scene_data.as_ref().is_some_and(|scene| {
-                    scene.shells.iter().any(|s| {
-                        matches!(s.topology, Some(StepTopology::Solid(_)))
-                    })
-                });
-
-            // Trigger material updates.
-            state.clip_planes_dirty = true;
-            state.shading_mode_changed = true;
-            state.visibility_changed = true;
-        }
-        Err(err) if err == "Cancelled" => {
-            info!("Solidify-clip cancelled");
-        }
-        Err(err) => {
-            error!("Solidify-clip failed: {}", err);
-            state.error = Some(format!("Solidify failed: {}", err));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2907,5 +2589,47 @@ mod tests {
         assert!(apply_8);
         assert_ne!(face_7, step_color);
         assert_ne!(face_7, face_8);
+    }
+
+    #[test]
+    fn bounds_for_face_positions_filters_vertices_by_face_id() {
+        let positions = [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 3.0, 0.0],
+            [-10.0, -10.0, -10.0],
+        ];
+        let vertex_face_index = [5, 5, 5, 9];
+
+        let bounds =
+            bounds_for_face_positions(&positions, &vertex_face_index, 5)
+                .expect("face vertices should produce bounds");
+
+        assert_eq!(bounds.min, Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(bounds.max, Vec3::new(2.0, 3.0, 0.0));
+        assert_eq!(bounds.center, Vec3::new(1.0, 1.5, 0.0));
+    }
+
+    #[test]
+    fn frame_distance_uses_largest_bounds_dimension() {
+        let bounds = Bounds {
+            center: Vec3::ZERO,
+            min: Vec3::new(-1.0, -2.0, -3.0),
+            max: Vec3::new(1.0, 2.0, 3.0),
+        };
+
+        assert!((frame_distance_for_bounds(bounds) - 9.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn initial_camera_offset_matches_startup_view_direction() {
+        let offset = initial_camera_offset(2.0);
+        let expected = Vec3::new(
+            2.0 * FRAC_PI_4.cos() * FRAC_PI_6.cos(),
+            2.0 * FRAC_PI_6.sin(),
+            2.0 * FRAC_PI_4.sin() * FRAC_PI_6.cos(),
+        );
+
+        assert!((offset - expected).length() < 1.0e-6);
     }
 }

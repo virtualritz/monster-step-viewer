@@ -8,11 +8,13 @@ use monstertruck::{
     step::load::{
         Table,
         ruststep::{ast::Name, parser::parse, tables::PlaceHolder},
-        step_geometry::{Curve3D, Pcurve, Surface},
+        step_geometry::{Curve3D, StepParameterCurve, Surface},
     },
     topology::compress::{CompressedShell, CompressedTrimmedShell},
+    traits::ParametricCurve,
 };
-type OriginalShell = CompressedTrimmedShell<Point3, Curve3D, Surface, Pcurve>;
+type OriginalShell =
+    CompressedTrimmedShell<Point3, Curve3D, Surface, StepParameterCurve>;
 
 fn shell_requires_trimmed_meshing<P, C, S, T>(
     shell: &CompressedTrimmedShell<P, C, S, T>,
@@ -110,10 +112,12 @@ impl std::fmt::Debug for CompressedShellData {
 #[derive(Clone, Debug)]
 pub enum StepTopology {
     /// From `manifold_solid_brep` — watertight, suitable for boolean ops.
-    /// Wraps a `CompressedTrimmedSolid<Point3, Curve3D, Surface, Pcurve>`.
+    /// Wraps a `CompressedTrimmedSolid<Point3, Curve3D, Surface,
+    /// StepParameterCurve>`.
     Solid(CompressedShellData),
     /// From `shell_based_surface_model` or standalone shell — open surface.
-    /// Wraps a `CompressedTrimmedShell<Point3, Curve3D, Surface, Pcurve>`.
+    /// Wraps a `CompressedTrimmedShell<Point3, Curve3D, Surface,
+    /// StepParameterCurve>`.
     Shell(CompressedShellData),
 }
 
@@ -462,7 +466,7 @@ fn compute_shell_bounds(
         let (start, end) = edge.curve.range_tuple();
         for idx in 0..=16 {
             let t = start + (end - start) * idx as f64 / 16.0;
-            push_point(edge.curve.subs(t));
+            push_point(edge.curve.evaluate(t));
         }
     }
 
@@ -755,7 +759,11 @@ pub fn load_step_file_streaming(
         };
         if let Err(e) = load_step_from_string_inner(raw, &tx, tolerance_factor)
         {
-            let _ = tx.send(LoadMessage::Error(e.to_string()));
+            // `{:#}` walks the full anyhow context chain so the underlying
+            // ruststep / topology error survives the trip to the UI.
+            let message = format!("{e:#}");
+            log::error!("STEP load failed: {message}");
+            let _ = tx.send(LoadMessage::Error(message));
         }
     });
 
@@ -773,7 +781,11 @@ pub fn load_step_from_string_streaming(
     std::thread::spawn(move || {
         if let Err(e) = load_step_from_string_inner(data, &tx, tolerance_factor)
         {
-            let _ = tx.send(LoadMessage::Error(e.to_string()));
+            // `{:#}` walks the full anyhow context chain so the underlying
+            // ruststep / topology error survives the trip to the UI.
+            let message = format!("{e:#}");
+            log::error!("STEP load failed: {message}");
+            let _ = tx.send(LoadMessage::Error(message));
         }
     });
 
@@ -1319,13 +1331,93 @@ fn retessellate_one_shell(
     })
 }
 
+/// Sample isoparametric curves on each face's parametric surface in the
+/// shell. Returns one polyline per (face, iso-direction, sample) tuple,
+/// flattened, in world space (the shell's assembly transform applied).
+///
+/// **Currently untrimmed.** Iso lines span the full parametric rectangle
+/// of each surface and may extend across holes / past trims. A correct
+/// trim pass needs to interpret monstertruck's edge-orientation flags in
+/// conjunction with loop adjacency, and the tessellator already does this
+/// internally — the natural place for trimmed iso sampling is in
+/// monstertruck rather than re-deriving it here. Left as a follow-up.
+pub fn sample_shell_isoparams(
+    shell: &StepShell,
+    sample_count: usize,
+    segments_per_curve: usize,
+) -> Vec<Vec<[f64; 3]>> {
+    use monstertruck::traits::ParametricSurface;
+
+    let Some(shell_data) = shell.original_shell.as_ref() else {
+        return Vec::new();
+    };
+    let Some(compressed): Option<&OriginalShell> = shell_data.downcast_ref()
+    else {
+        return Vec::new();
+    };
+    let transform = shell.transform.as_ref();
+
+    if sample_count == 0 || segments_per_curve == 0 {
+        return Vec::new();
+    }
+
+    compressed
+        .faces
+        .iter()
+        .filter_map(|face| {
+            let surface = &face.surface;
+            let (u_range, v_range) = surface.try_range_tuple();
+            let (u_min, u_max) = u_range?;
+            let (v_min, v_max) = v_range?;
+            if u_max <= u_min || v_max <= v_min {
+                return None;
+            }
+            Some((surface, u_min, u_max, v_min, v_max))
+        })
+        .flat_map(|(surface, u_min, u_max, v_min, v_max)| {
+            let eval = move |u: f64, v: f64| -> [f64; 3] {
+                let p = surface.evaluate(u, v);
+                let mut coord = [p.x, p.y, p.z];
+                if let Some(xform) = transform {
+                    coord = xform.transform_point(coord);
+                }
+                coord
+            };
+
+            let iso_v = (0..sample_count).map(move |i| {
+                let t = (i as f64 + 0.5) / sample_count as f64;
+                let v = v_min + (v_max - v_min) * t;
+                (0..=segments_per_curve)
+                    .map(|j| {
+                        let s = j as f64 / segments_per_curve as f64;
+                        let u = u_min + (u_max - u_min) * s;
+                        eval(u, v)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let iso_u = (0..sample_count).map(move |i| {
+                let t = (i as f64 + 0.5) / sample_count as f64;
+                let u = u_min + (u_max - u_min) * t;
+                (0..=segments_per_curve)
+                    .map(|j| {
+                        let s = j as f64 / segments_per_curve as f64;
+                        let v = v_min + (v_max - v_min) * s;
+                        eval(u, v)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            iso_v.chain(iso_u)
+        })
+        .collect()
+}
+
 fn classify_curve_type(curve: &Curve3D) -> String {
     match curve {
         Curve3D::Line(_) => "Line",
         Curve3D::Polyline(_) => "Polyline",
         Curve3D::Conic(_) => "Conic",
         Curve3D::BsplineCurve(_) => "BSpline",
-        Curve3D::Pcurve(_) => "Pcurve",
+        Curve3D::ParameterCurve(_) => "ParameterCurve",
         Curve3D::NurbsCurve(_) => "NURBS",
         Curve3D::IntersectionCurve(_) => "IntersectionCurve",
         Curve3D::SurfaceCurve(_) => "SurfaceCurve",
@@ -1506,6 +1598,45 @@ mod tests {
         assert!(
             max_z < 0.68,
             "face 17 should remain on the lower conical ring, got max_z={max_z}"
+        );
+    }
+
+    #[test]
+    fn boxy_front_face_keeps_large_center_opening_empty() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/boxy_with_surfacetex.stp");
+        let scene = load_step_file(&path).expect("STEP file should load");
+        let face = scene
+            .shells
+            .first()
+            .and_then(|shell| shell.faces.first())
+            .expect("front face should be present");
+        let positions = face.mesh.positions();
+        let uv_coords = face.mesh.uv_coords();
+
+        let center_triangle =
+            face.mesh.tri_faces().iter().find_map(|triangle| {
+                let center = triangle
+                    .iter()
+                    .map(|vertex| positions[vertex.pos])
+                    .fold(Point3::origin(), |sum, point| {
+                        Point3::from_vec(sum.to_vec() + point.to_vec())
+                    });
+                let center = Point3::from_vec(center.to_vec() / 3.0);
+                let uv_center = triangle
+                    .iter()
+                    .filter_map(|vertex| vertex.uv.map(|uv| uv_coords[uv]))
+                    .fold(Vector2::zero(), |sum, uv| sum + uv)
+                    / 3.0;
+                (center.z.abs() < 1.0e-6
+                    && (25.0..60.0).contains(&center.x)
+                    && (-60.0..-25.0).contains(&center.y))
+                .then_some((center, uv_center))
+            });
+
+        assert!(
+            center_triangle.is_none(),
+            "front face should not have a triangle center inside the large opening: {center_triangle:?}",
         );
     }
 

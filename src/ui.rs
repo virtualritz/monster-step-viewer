@@ -1,27 +1,69 @@
+#[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
+use crate::icons::ICON_COUNTER_3;
+#[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
+use crate::nsi_overlay::NsiOverlayState;
+#[cfg(all(feature = "nsi-export", not(target_arch = "wasm32")))]
+use crate::nsi_render::{NsiFileExportOptions, export_scene_to_nsi_file};
 use crate::{
     browser::{
         poll_preview_loads, refresh_tree_entry, scan_step_files, scan_subdirs,
         start_preview_loads,
     },
     icons::{
-        ICON_BOUNDING_BOX, ICON_CASINO, ICON_DETAILS, ICON_PALETTE,
-        ICON_WIREFRAME, configure_fonts, icon_text,
+        ICON_BOUNDING_BOX, ICON_CASINO, ICON_DETAILS, ICON_GRID_ON,
+        ICON_PALETTE, ICON_WIREFRAME, configure_fonts, icon_text,
     },
     state::{
-        AppMode, BrowserState, DirectoryEntry, MainCamera, PreviewStatus,
-        Selection, ShadingMode, ViewerState,
+        AppMode, BrowserState, DirectoryEntry, FaceAnnotation, FaceRecord,
+        LoopRecord, MainCamera, PreviewStatus, Selection, ShadingMode,
+        ViewerState,
     },
 };
 use bevy::{
     app::AppExit,
     camera::Viewport,
+    ecs::system::SystemParam,
     prelude::{MessageWriter, *},
 };
 use bevy_egui::{EguiContextSettings, EguiContexts, PrimaryEguiContext, egui};
+#[cfg(all(feature = "nsi-export", not(target_arch = "wasm32")))]
+use glam::Mat4 as NsiMat4;
 use monster_step_viewer::Parameter;
-use std::{cell::Cell, sync::atomic::Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use rfd::FileDialog;
+use std::{cell::Cell, path::PathBuf};
 
 const TOOLBAR_ICON_BUTTON_SIZE: f32 = 26.0;
+
+type MainCameraViewportQuery<'w, 's> =
+    Query<'w, 's, &'static mut Camera, With<MainCamera>>;
+type WindowQuery<'w, 's> = Query<'w, 's, &'static Window>;
+type EguiSettingsQuery<'w, 's> =
+    Query<'w, 's, &'static mut EguiContextSettings, With<PrimaryEguiContext>>;
+
+#[cfg(all(feature = "nsi-export", not(target_arch = "wasm32")))]
+type MainCameraExportQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static GlobalTransform, &'static Projection),
+    With<MainCamera>,
+>;
+
+#[derive(SystemParam)]
+pub(crate) struct MainCameraQueries<'w, 's> {
+    viewport: MainCameraViewportQuery<'w, 's>,
+    #[cfg(all(feature = "nsi-export", not(target_arch = "wasm32")))]
+    export: MainCameraExportQuery<'w, 's>,
+}
+
+#[derive(SystemParam)]
+pub(crate) struct UiSystemParams<'w, 's> {
+    windows: WindowQuery<'w, 's>,
+    camera_queries: MainCameraQueries<'w, 's>,
+    egui_settings: EguiSettingsQuery<'w, 's>,
+    #[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
+    nsi_overlay: ResMut<'w, NsiOverlayState>,
+}
 
 fn toolbar_icon_toggle(
     ui: &mut egui::Ui,
@@ -32,6 +74,191 @@ fn toolbar_icon_toggle(
         egui::vec2(TOOLBAR_ICON_BUTTON_SIZE, TOOLBAR_ICON_BUTTON_SIZE),
         egui::Button::selectable(selected, icon_text(icon)),
     )
+}
+
+#[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
+fn nsi_render_toolbar_toggle(
+    ui: &mut egui::Ui,
+    overlay: &mut NsiOverlayState,
+) -> egui::Response {
+    let response = ui.add_enabled(
+        overlay.available,
+        egui::Button::selectable(overlay.enabled, icon_text(ICON_COUNTER_3))
+            .min_size(egui::vec2(
+                TOOLBAR_ICON_BUTTON_SIZE,
+                TOOLBAR_ICON_BUTTON_SIZE,
+            )),
+    );
+    if !overlay.available {
+        response.on_hover_text(
+            "3Delight not detected. Set `DELIGHT` or install it at `/usr/local/3delight`.",
+        )
+    } else {
+        if response.clicked() {
+            if overlay.enabled {
+                if let Some(render) = overlay.render.as_ref() {
+                    render.stop();
+                }
+                overlay.enabled = false;
+            } else {
+                overlay.enabled = true;
+                if overlay.render.is_none() {
+                    overlay.init_requested = true;
+                } else if let Some(render) = overlay.render.as_ref() {
+                    render.start();
+                    overlay.last_pushed_scene_ptr = 0;
+                }
+            }
+        }
+        response.on_hover_text("3Delight NSI render overlay")
+    }
+}
+
+fn annotation_color(annotation: FaceAnnotation) -> Option<egui::Color32> {
+    annotation.color().map(|rgb| {
+        egui::Color32::from_rgb(
+            (rgb[0] * 255.0) as u8,
+            (rgb[1] * 255.0) as u8,
+            (rgb[2] * 255.0) as u8,
+        )
+    })
+}
+
+fn face_annotation_menu(
+    ui: &mut egui::Ui,
+    face_id: usize,
+    changes: &Cell<Vec<(usize, FaceAnnotation)>>,
+) {
+    for annotation in FaceAnnotation::ALL {
+        if ui.button(annotation.label()).clicked() {
+            let mut pending = changes.take();
+            pending.push((face_id, annotation));
+            changes.set(pending);
+            ui.close();
+        }
+    }
+}
+
+fn selection_face_id(
+    selection: Option<Selection>,
+    faces: &[FaceRecord],
+    loops: &[LoopRecord],
+) -> Option<usize> {
+    match selection {
+        Some(Selection::Face(face_id)) => Some(face_id),
+        Some(Selection::Loop(loop_id)) => loops
+            .iter()
+            .find(|loop_record| loop_record.id == loop_id)
+            .map(|loop_record| loop_record.face_id),
+        Some(Selection::Edge(edge_id)) => faces
+            .iter()
+            .find(|face| face.edge_ids.contains(&edge_id))
+            .map(|face| face.id),
+        Some(Selection::Shell(_)) | None => None,
+    }
+}
+
+fn set_face_annotation(
+    state: &mut ViewerState,
+    face_id: usize,
+    annotation: FaceAnnotation,
+) {
+    if let Some(face) = state.faces.iter_mut().find(|face| face.id == face_id)
+        && face.annotation != annotation
+    {
+        face.annotation = annotation;
+        state.face_state_visibility_dirty = true;
+    }
+}
+
+fn annotation_controls_for_selected_face(
+    ui: &mut egui::Ui,
+    state: &mut ViewerState,
+) {
+    let Some(face_id) =
+        selection_face_id(state.selection, &state.faces, &state.loops)
+    else {
+        return;
+    };
+    let Some((face_name, current_annotation)) = state
+        .faces
+        .iter()
+        .find(|face| face.id == face_id)
+        .map(|face| (face.name.clone(), face.annotation))
+    else {
+        return;
+    };
+
+    ui.label(format!("Face {}: {}", face_id, face_name));
+    ui.horizontal_wrapped(|ui| {
+        for annotation in FaceAnnotation::ALL {
+            let mut button = egui::Button::selectable(
+                current_annotation == annotation,
+                annotation.label(),
+            );
+            if let Some(color) = annotation_color(annotation) {
+                button = button.fill(color.gamma_multiply(0.28));
+            }
+            if ui.add(button).clicked() {
+                set_face_annotation(state, face_id, annotation);
+            }
+        }
+    });
+    ui.separator();
+}
+
+fn annotation_summary(ui: &mut egui::Ui, faces: &[FaceRecord]) {
+    if faces.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        for annotation in FaceAnnotation::ALL {
+            let count = faces
+                .iter()
+                .filter(|face| face.annotation == annotation)
+                .count();
+            if annotation == FaceAnnotation::Normal {
+                ui.label(format!("{} {}", annotation.label(), count));
+            } else if count > 0
+                && let Some(color) = annotation_color(annotation)
+            {
+                ui.colored_label(
+                    color,
+                    format!("{} {}", annotation.label(), count),
+                );
+            }
+        }
+    });
+    ui.separator();
+}
+
+fn apply_annotation_shortcuts(ctx: &egui::Context, state: &mut ViewerState) {
+    if ctx.wants_keyboard_input() {
+        return;
+    }
+    let Some(face_id) =
+        selection_face_id(state.selection, &state.faces, &state.loops)
+    else {
+        return;
+    };
+    let pressed = ctx.input(|input| {
+        if input.modifiers.any() {
+            None
+        } else if input.key_pressed(egui::Key::Num1) {
+            Some(FaceAnnotation::Normal)
+        } else if input.key_pressed(egui::Key::Num2) {
+            Some(FaceAnnotation::TrimInverted)
+        } else if input.key_pressed(egui::Key::Num3) {
+            Some(FaceAnnotation::Bad)
+        } else if input.key_pressed(egui::Key::Num4) {
+            Some(FaceAnnotation::NonCylindrical)
+        } else {
+            None
+        }
+    });
+    if let Some(annotation) = pressed {
+        set_face_annotation(state, face_id, annotation);
+    }
 }
 
 /// Clickable collapse/expand arrow drawn with the painter (font-independent).
@@ -180,12 +407,7 @@ pub(crate) fn ui_system(
     mut state: ResMut<ViewerState>,
     mut browser: ResMut<BrowserState>,
     mut exit: MessageWriter<AppExit>,
-    windows: Query<&Window>,
-    mut camera_query: Query<&mut Camera, With<MainCamera>>,
-    mut egui_settings: Query<
-        &mut EguiContextSettings,
-        With<PrimaryEguiContext>,
-    >,
+    mut params: UiSystemParams,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -211,7 +433,7 @@ pub(crate) fn ui_system(
                     Some(egui::TextStyle::Body);
                 if ui.button("Open STEP\u{2026}").clicked() {
                     #[cfg(not(target_arch = "wasm32"))]
-                    if let Some(path) = rfd::FileDialog::new()
+                    if let Some(path) = FileDialog::new()
                         .add_filter("STEP", &["stp", "step"])
                         .pick_file()
                     {
@@ -232,6 +454,29 @@ pub(crate) fn ui_system(
                     state.show_url_dialog = true;
                     ui.close();
                 }
+                #[cfg(all(
+                    feature = "nsi-export",
+                    not(target_arch = "wasm32")
+                ))]
+                {
+                    let export_response = ui.add_enabled(
+                        state.scene_data.is_some(),
+                        egui::Button::new("Export NSI..."),
+                    );
+                    if export_response.clicked() {
+                        export_nsi_dialog(
+                            &mut state,
+                            &params.camera_queries.export,
+                            &params.windows,
+                        );
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("Quit").clicked() {
+                    exit.write(AppExit::Success);
+                    ui.close();
+                }
             });
 
             if state.mode == AppMode::Browser {
@@ -239,8 +484,8 @@ pub(crate) fn ui_system(
                 ui.separator();
                 let display_path =
                     browser.selected_dir.as_deref().unwrap_or(&browser.root);
-                let mut breadcrumb_nav: Option<std::path::PathBuf> = None;
-                let mut accumulated = std::path::PathBuf::new();
+                let mut breadcrumb_nav: Option<PathBuf> = None;
+                let mut accumulated = PathBuf::new();
                 for (i, component) in display_path.components().enumerate() {
                     accumulated.push(component);
                     if i > 0 {
@@ -385,7 +630,28 @@ pub(crate) fn ui_system(
 
     match state.mode {
         AppMode::Viewer => {
-            viewer_ui(ctx, &mut state, &windows, &mut camera_query)
+            #[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
+            {
+                viewer_ui(
+                    ctx,
+                    &mut state,
+                    &params.windows,
+                    &mut params.camera_queries.viewport,
+                    &mut params.nsi_overlay,
+                )
+            }
+            #[cfg(not(all(
+                feature = "nsi-render",
+                not(target_arch = "wasm32")
+            )))]
+            {
+                viewer_ui(
+                    ctx,
+                    &mut state,
+                    &params.windows,
+                    &mut params.camera_queries.viewport,
+                )
+            }
         }
         AppMode::Browser => browser_ui(ctx, &mut state, &mut browser),
     }
@@ -409,7 +675,7 @@ pub(crate) fn ui_system(
         }
     });
     if let Some(delta) = zoom_delta
-        && let Ok(mut settings) = egui_settings.single_mut()
+        && let Ok(mut settings) = params.egui_settings.single_mut()
     {
         settings.scale_factor = if delta == 0.0 {
             1.0
@@ -424,11 +690,99 @@ pub(crate) fn ui_system(
     }
 }
 
+#[cfg(all(feature = "nsi-export", not(target_arch = "wasm32")))]
+fn export_nsi_dialog(
+    state: &mut ViewerState,
+    camera_query: &MainCameraExportQuery,
+    windows: &Query<&Window>,
+) {
+    let Some(scene) = state.scene_data.as_ref() else {
+        state.error =
+            Some("Cannot export NSI: no STEP scene is loaded".to_string());
+        return;
+    };
+    let Some(options) =
+        current_nsi_export_options(state, camera_query, windows)
+    else {
+        state.error =
+            Some("Cannot export NSI: main camera is unavailable".to_string());
+        return;
+    };
+    let Some(path) = FileDialog::new()
+        .add_filter("NSI", &["nsi"])
+        .set_file_name(nsi_default_filename(state).as_str())
+        .save_file()
+    else {
+        return;
+    };
+
+    match export_scene_to_nsi_file(&path, scene, options) {
+        Ok(surface_count) => {
+            log::info!(
+                "Exported NSI scene with {surface_count} BRep surfaces to {}",
+                path.display()
+            );
+        }
+        Err(error) => {
+            state.error = Some(format!("NSI export failed: {error}"));
+        }
+    }
+}
+
+#[cfg(all(feature = "nsi-export", not(target_arch = "wasm32")))]
+fn current_nsi_export_options(
+    state: &ViewerState,
+    camera_query: &MainCameraExportQuery,
+    windows: &Query<&Window>,
+) -> Option<NsiFileExportOptions> {
+    let (camera_transform, projection) = camera_query.single().ok()?;
+    let view_matrix = NsiMat4::from_cols_array(
+        &camera_transform.to_matrix().inverse().to_cols_array(),
+    );
+    let fov_y_degrees = match projection {
+        Projection::Perspective(perspective) => perspective.fov.to_degrees(),
+        Projection::Orthographic(_) | Projection::Custom(_) => 45.0,
+    };
+    let resolution = windows
+        .single()
+        .ok()
+        .map(|window| [window.physical_width(), window.physical_height()])
+        .unwrap_or([1024, 1024]);
+
+    Some(NsiFileExportOptions {
+        model_matrix: nsi_scene_model_matrix(state),
+        view_matrix,
+        fov_y_degrees,
+        resolution,
+    })
+}
+
+#[cfg(all(feature = "nsi-export", not(target_arch = "wasm32")))]
+fn nsi_scene_model_matrix(state: &ViewerState) -> NsiMat4 {
+    let matrix = Mat4::from_scale(Vec3::splat(state.scene_scale))
+        * Mat4::from_translation(-state.scene_center);
+    NsiMat4::from_cols_array(&matrix.to_cols_array())
+}
+
+#[cfg(all(feature = "nsi-export", not(target_arch = "wasm32")))]
+fn nsi_default_filename(state: &ViewerState) -> String {
+    let stem = state
+        .loaded_path
+        .as_ref()
+        .and_then(|path| path.file_stem())
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("mstpv_export");
+    format!("{stem}.nsi")
+}
+
 fn viewer_ui(
     ctx: &egui::Context,
     state: &mut ResMut<ViewerState>,
     windows: &Query<&Window>,
-    camera_query: &mut Query<&mut Camera, With<MainCamera>>,
+    camera_query: &mut MainCameraViewportQuery,
+    #[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
+    nsi_overlay: &mut ResMut<NsiOverlayState>,
 ) {
     // Pre-seed panel width from settings on first frame (before egui has stored
     // state).
@@ -471,6 +825,9 @@ fn viewer_ui(
                 let face_vis_changes: Cell<Vec<(usize, bool)>> = Cell::new(Vec::new());
                 let edge_vis_changes: Cell<Vec<(usize, bool)>> = Cell::new(Vec::new());
                 let loop_trim_changes: Cell<Vec<(usize, bool)>> = Cell::new(Vec::new());
+                let face_annotation_changes: Cell<
+                    Vec<(usize, FaceAnnotation)>,
+                > = Cell::new(Vec::new());
                 let current_selection = state.selection;
                 let viewport_selected = state.selection_from_viewport;
                 state.selection_from_viewport = false;
@@ -479,7 +836,9 @@ fn viewer_ui(
                 // Track hover: None = nothing hovered this frame.
                 let new_hover: Cell<Option<Selection>> = Cell::new(None);
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                     ui.spacing_mut().indent = 12.0;
                     // Snapshot all data needed for rendering (immutable borrows only).
                     let shell_data: Vec<_> = state
@@ -503,22 +862,26 @@ fn viewer_ui(
                     // Snapshot face data.
                     struct FaceSnap {
                         id: usize,
+                        source_face_id: usize,
                         name: String,
                         triangles: usize,
                         visible: bool,
                         ui_color: [f32; 3],
                         loop_ids: Vec<usize>,
+                        annotation: FaceAnnotation,
                     }
                     let face_snaps: Vec<FaceSnap> = state
                         .faces
                         .iter()
                         .map(|f| FaceSnap {
                             id: f.id,
+                            source_face_id: f.source_face_id,
                             name: f.name.clone(),
                             triangles: f.triangles,
                             visible: f.visible,
                             ui_color: f.ui_color,
                             loop_ids: f.loop_ids.clone(),
+                            annotation: f.annotation,
                         })
                         .collect();
 
@@ -610,11 +973,11 @@ fn viewer_ui(
                                     else {
                                         continue;
                                     };
-                                    let color = egui::Color32::from_rgb(
+                                    let color = annotation_color(face.annotation).unwrap_or_else(|| egui::Color32::from_rgb(
                                         (face.ui_color[0] * 255.0) as u8,
                                         (face.ui_color[1] * 255.0) as u8,
                                         (face.ui_color[2] * 255.0) as u8,
-                                    );
+                                    ));
                                     let has_loops = !face.loop_ids.is_empty();
 
                                     if has_loops {
@@ -649,7 +1012,11 @@ fn viewer_ui(
                                             let label = ui.add(
                                                 egui::Button::selectable(face_sel, face_text)
                                                     .truncate(),
-                                            );
+                                            )
+                                            .on_hover_text(format!(
+                                                "Source face {}",
+                                                face.source_face_id + 1
+                                            ));
                                             if label.clicked() {
                                                 new_selection.set(Some(if face_sel {
                                                     None
@@ -666,6 +1033,14 @@ fn viewer_ui(
                                             // RMB context menu for edge visibility.
                                             let face_loop_ids = face.loop_ids.clone();
                                             label.context_menu(|ui| {
+                                                ui.menu_button("Mark", |ui| {
+                                                    face_annotation_menu(
+                                                        ui,
+                                                        face_id,
+                                                        &face_annotation_changes,
+                                                    );
+                                                });
+                                                ui.separator();
                                                 let all_edge_ids: Vec<usize> = face_loop_ids.iter()
                                                     .flat_map(|lid| {
                                                         loop_snaps.iter()
@@ -886,7 +1261,11 @@ fn viewer_ui(
                                                     ),
                                                 )
                                                 .truncate(),
-                                            );
+                                            )
+                                            .on_hover_text(format!(
+                                                "Source face {}",
+                                                face.source_face_id + 1
+                                            ));
                                             if face_label.clicked() {
                                                 new_selection.set(Some(if face_sel {
                                                     None
@@ -897,6 +1276,13 @@ fn viewer_ui(
                                             if face_label.hovered() {
                                                 new_hover.set(Some(Selection::Face(face_id)));
                                             }
+                                            face_label.context_menu(|ui| {
+                                                face_annotation_menu(
+                                                    ui,
+                                                    face_id,
+                                                    &face_annotation_changes,
+                                                );
+                                            });
                                             // Scroll to this face when selected from viewport.
                                             if viewport_selected && face_sel {
                                                 face_label.scroll_to_me(Some(egui::Align::Center));
@@ -1016,6 +1402,9 @@ fn viewer_ui(
                         state.retessellate_face = Some(loop_rec.face_id);
                     }
                 }
+                for (face_id, annotation) in face_annotation_changes.take() {
+                    set_face_annotation(state, face_id, annotation);
+                }
 
                 if let Some(sel) = new_selection.take() {
                     state.selection = sel;
@@ -1058,6 +1447,8 @@ fn viewer_ui(
         .resizable(true)
         .width_range(100.0..=800.0)
         .show(ctx, |ui| {
+            annotation_controls_for_selected_face(ui, state);
+            annotation_summary(ui, &state.faces);
             if let Some(meta) = &state.metadata {
                 ui.label(format!("Entity Count: {}", meta.entity_count));
                 ui.separator();
@@ -1080,6 +1471,8 @@ fn viewer_ui(
         });
 
     let right_panel_width = right_panel_response.response.rect.width();
+
+    apply_annotation_shortcuts(ctx, state);
 
     if (state.panel_width - left_panel_width).abs() > 1.0
         || (state.right_panel_width - right_panel_width).abs() > 1.0
@@ -1279,6 +1672,17 @@ fn viewer_ui(
                             }
                             wireframe_btn.on_hover_text("Wireframe");
 
+                            let iso_btn = toolbar_icon_toggle(
+                                ui,
+                                state.show_isoparams,
+                                ICON_GRID_ON,
+                            );
+                            if iso_btn.clicked() {
+                                state.show_isoparams = !state.show_isoparams;
+                                state.settings_dirty = true;
+                            }
+                            iso_btn.on_hover_text("Isoparametric curves");
+
                             let poly_edges_btn = toolbar_icon_toggle(
                                 ui,
                                 state.show_polygon_edges,
@@ -1289,6 +1693,15 @@ fn viewer_ui(
                                 state.settings_dirty = true;
                             }
                             poly_edges_btn.on_hover_text("Polygon edges");
+
+                            #[cfg(all(
+                                feature = "nsi-render",
+                                not(target_arch = "wasm32")
+                            ))]
+                            {
+                                let _ =
+                                    nsi_render_toolbar_toggle(ui, nsi_overlay);
+                            }
 
                             ui.separator();
 
@@ -1332,52 +1745,6 @@ fn viewer_ui(
                                 clip_btn.on_hover_text(tooltip);
                             }
 
-                            ui.separator();
-
-                            // Solidify Clip button.
-                            let any_clip_active = state.clip_planes.iter().any(|c| c.enabled);
-                            let is_processing = state.solidify_job.is_some();
-                            let can_solidify = state.has_solid_topology && any_clip_active && !is_processing;
-
-                            if is_processing {
-                                ui.spinner();
-                                if ui.button("Cancel").clicked()
-                                    && let Some(ref job) = state.solidify_job
-                                {
-                                    job.cancel.store(true, Ordering::Relaxed);
-                                }
-                            } else if state.pre_solidify_scene.is_some() {
-                                let solidify_btn = ui.add_enabled(
-                                    can_solidify,
-                                    egui::Button::new(
-                                        egui::RichText::new("Re-solidify").strong(),
-                                    ),
-                                );
-                                if solidify_btn.clicked() {
-                                    state.start_solidify = true;
-                                }
-                                solidify_btn.on_hover_text("Re-run boolean clip with current planes");
-                                if ui.button("Revert").clicked() {
-                                    state.restore_original = true;
-                                }
-                            } else {
-                                let solidify_btn = ui.add_enabled(
-                                    can_solidify,
-                                    egui::Button::new(
-                                        egui::RichText::new("Solidify").strong(),
-                                    ),
-                                );
-                                if solidify_btn.clicked() {
-                                    state.start_solidify = true;
-                                }
-                                if !state.has_solid_topology {
-                                    solidify_btn.on_hover_text("Only for STEP solids");
-                                } else if !any_clip_active {
-                                    solidify_btn.on_hover_text("Enable clip planes first");
-                                } else {
-                                    solidify_btn.on_hover_text("Boolean-clip the solid using active clip planes");
-                                }
-                            }
                         });
                     });
                 });
@@ -1509,7 +1876,7 @@ fn browser_ui(
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // Collect actions to avoid borrow issues.
-                let mut select_dir: Option<std::path::PathBuf> = None;
+                let mut select_dir: Option<PathBuf> = None;
                 let mut expand_actions: Vec<(Vec<usize>, bool)> = Vec::new();
                 let mut children_to_load: Vec<Vec<usize>> = Vec::new();
 
@@ -1758,8 +2125,8 @@ fn browser_ui(
 fn render_dir_tree(
     ui: &mut egui::Ui,
     entries: &[DirectoryEntry],
-    selected_dir: &Option<std::path::PathBuf>,
-    select_dir: &mut Option<std::path::PathBuf>,
+    selected_dir: &Option<PathBuf>,
+    select_dir: &mut Option<PathBuf>,
     expand_actions: &mut Vec<(Vec<usize>, bool)>,
     children_to_load: &mut Vec<Vec<usize>>,
     current_path: &mut Vec<usize>,

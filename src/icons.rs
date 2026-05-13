@@ -18,6 +18,11 @@ pub(crate) const ICON_WIREFRAME: &str = "\u{f720}";
 pub(crate) const ICON_EDGES: &str = "\u{e922}";
 /// Polygon-edges toggle (details).
 pub(crate) const ICON_DETAILS: &str = "\u{e3c8}";
+/// Isoparams overlay toggle (grid_on).
+pub(crate) const ICON_GRID_ON: &str = "\u{e3ec}";
+/// NSI overlay toggle (counter_3).
+#[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
+pub(crate) const ICON_COUNTER_3: &str = "\u{f782}";
 
 /// Configure egui fonts with embedded Material Symbols subset.
 pub(crate) fn configure_fonts(ctx: &egui::Context) {

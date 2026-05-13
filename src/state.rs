@@ -94,6 +94,7 @@ pub(crate) struct ViewerState {
     pub show_step_colors: bool,
     pub show_bounding_box: bool,
     pub show_polygon_edges: bool,
+    pub show_isoparams: bool,
     pub scene_data: Option<StepScene>,
     pub needs_mesh_rebuild: bool,
     pub current_bounds: Option<Bounds>,
@@ -158,16 +159,8 @@ pub(crate) struct ViewerState {
     /// Flag indicating normals need rebuilding (flat <-> smooth transition).
     pub needs_normal_rebuild: bool,
     /// Whether any loaded shell has solid (manifold_solid_brep) topology,
-    /// enabling the "Solidify Clip" feature.
+    /// retained for diagnostics and future public boolean support.
     pub has_solid_topology: bool,
-    /// Active solidify-clip background job.
-    pub solidify_job: Option<SolidifyJob>,
-    /// Flag to trigger solidify-clip computation.
-    pub start_solidify: bool,
-    /// Original scene data saved before solidify (for restoring on unclip).
-    pub pre_solidify_scene: Option<StepScene>,
-    /// Flag to trigger restore of pre-solidify scene.
-    pub restore_original: bool,
     /// Whether the "Open URL" dialog is shown.
     pub show_url_dialog: bool,
     /// Text input for the URL dialog.
@@ -195,6 +188,7 @@ impl Default for ViewerState {
             show_step_colors: false,
             show_bounding_box: false,
             show_polygon_edges: false,
+            show_isoparams: false,
             scene_data: None,
             needs_mesh_rebuild: false,
             current_bounds: None,
@@ -227,10 +221,6 @@ impl Default for ViewerState {
             previous_shading_mode: ShadingMode::default(),
             needs_normal_rebuild: false,
             has_solid_topology: false,
-            solidify_job: None,
-            start_solidify: false,
-            pre_solidify_scene: None,
-            restore_original: false,
             show_url_dialog: false,
             url_input: String::new(),
             url_fetch: None,
@@ -243,6 +233,8 @@ impl Default for ViewerState {
 pub(crate) struct FaceRecord {
     pub id: usize,
     pub shell_id: usize,
+    /// Face index from the source shell topology.
+    pub source_face_id: usize,
     pub name: String,
     pub triangles: usize,
     pub visible: bool,
@@ -251,6 +243,53 @@ pub(crate) struct FaceRecord {
     pub edge_ids: Vec<usize>,
     /// Global loop IDs for this face.
     pub loop_ids: Vec<usize>,
+    /// Manual diagnostic annotation for NSI trim debugging.
+    pub annotation: FaceAnnotation,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FaceAnnotation {
+    #[default]
+    Normal,
+    TrimInverted,
+    Bad,
+    NonCylindrical,
+}
+
+impl FaceAnnotation {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Normal,
+        Self::TrimInverted,
+        Self::Bad,
+        Self::NonCylindrical,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::TrimInverted => "trim inverted",
+            Self::Bad => "bad",
+            Self::NonCylindrical => "non-cylindrical",
+        }
+    }
+
+    pub(crate) fn color(self) -> Option<[f32; 3]> {
+        match self {
+            Self::Normal => None,
+            Self::TrimInverted => Some([0.95, 0.75, 0.05]),
+            Self::Bad => Some([0.95, 0.1, 0.12]),
+            Self::NonCylindrical => Some([0.15, 0.65, 1.0]),
+        }
+    }
+
+    pub(crate) fn shader_bits(self) -> u32 {
+        match self {
+            Self::Normal => 0,
+            Self::TrimInverted => 1,
+            Self::Bad => 2,
+            Self::NonCylindrical => 3,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -311,10 +350,25 @@ pub(crate) struct PolygonEdgesMesh {
     pub shell_id: usize,
 }
 
+/// Marker on the per-shell line-list mesh that draws isoparametric curves
+/// sampled from each face's parametric surface. Visibility tracks
+/// `state.show_isoparams` together with the shell's own visibility.
+#[derive(Component, Debug)]
+pub(crate) struct IsoparamsMesh {
+    pub shell_id: usize,
+}
+
 /// Shared material handle used by every per-shell polygon-edges line-list
 /// entity. One asset, regardless of shell count.
 #[derive(Resource)]
 pub(crate) struct PolygonEdgesMaterial(
+    pub Handle<bevy::prelude::StandardMaterial>,
+);
+
+/// Shared material handle used by every per-shell isoparams line-list
+/// entity.
+#[derive(Resource)]
+pub(crate) struct IsoparamsMaterial(
     pub Handle<bevy::prelude::StandardMaterial>,
 );
 
@@ -346,18 +400,6 @@ pub(crate) struct LoadJob {
     pub phase: LoadPhase,
     pub current_shell: usize,
     pub total_shells: usize,
-}
-
-/// Background job for solidify-clip boolean operation.
-pub(crate) struct SolidifyJob {
-    pub receiver: Mutex<Receiver<Result<StepScene, String>>>,
-    pub cancel: Arc<AtomicBool>,
-}
-
-impl std::fmt::Debug for SolidifyJob {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SolidifyJob").finish()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
