@@ -1496,6 +1496,29 @@ pub(crate) fn disable_camera_when_egui_wants_input(
 }
 
 /// Keyboard shortcuts for camera framing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewShortcutAction {
+    ResetView,
+    FrameScene,
+    CenterSelection,
+}
+
+fn view_shortcut_action(
+    reset_view: bool,
+    frame_scene: bool,
+    center_selection: bool,
+) -> Option<ViewShortcutAction> {
+    if reset_view {
+        Some(ViewShortcutAction::ResetView)
+    } else if frame_scene {
+        Some(ViewShortcutAction::FrameScene)
+    } else if center_selection {
+        Some(ViewShortcutAction::CenterSelection)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn handle_view_shortcuts(
     mut contexts: EguiContexts,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -1510,24 +1533,35 @@ pub(crate) fn handle_view_shortcuts(
         return;
     }
 
-    let reset_view = keyboard.just_pressed(KeyCode::KeyR);
-    let center_selection = keyboard.just_pressed(KeyCode::KeyC);
-    if !reset_view && !center_selection {
+    let action = view_shortcut_action(
+        keyboard.just_pressed(KeyCode::KeyR),
+        keyboard.just_pressed(KeyCode::KeyF),
+        keyboard.just_pressed(KeyCode::KeyC),
+    );
+    let Some(action) = action else {
         return;
-    }
+    };
 
     let Ok((mut transform, mut editor_cam)) = camera_query.single_mut() else {
         return;
     };
 
-    if reset_view && let Some(bounds) = state.current_bounds {
-        frame_camera_initial(bounds, &mut transform, &mut editor_cam);
-    }
-
-    if center_selection
-        && let Some(bounds) = selected_face_bounds(&state, &meshes)
-    {
-        focus_camera_on_bounds(bounds, &mut transform, &mut editor_cam);
+    match action {
+        ViewShortcutAction::ResetView => {
+            if let Some(bounds) = state.current_bounds {
+                frame_camera_initial(bounds, &mut transform, &mut editor_cam);
+            }
+        }
+        ViewShortcutAction::FrameScene => {
+            if let Some(bounds) = state.current_bounds {
+                focus_camera_on_bounds(bounds, &mut transform, &mut editor_cam);
+            }
+        }
+        ViewShortcutAction::CenterSelection => {
+            if let Some(bounds) = selected_face_bounds(&state, &meshes) {
+                focus_camera_on_bounds(bounds, &mut transform, &mut editor_cam);
+            }
+        }
     }
 }
 
@@ -2641,5 +2675,13 @@ mod tests {
         );
 
         assert!((offset - expected).length() < 1.0e-6);
+    }
+
+    #[test]
+    fn f_shortcut_frames_scene_geometry() {
+        assert_eq!(
+            view_shortcut_action(false, true, false),
+            Some(ViewShortcutAction::FrameScene)
+        );
     }
 }
