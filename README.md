@@ -77,7 +77,7 @@ Build with the `nsi-render` Cargo feature for a 3Delight (NSI) progressive-rende
 cargo run --features nsi-render -- path/to/model.step
 ```
 
-3Delight must be installed locally; the build auto-detects standard install paths and the `$DELIGHT` environment variable. The `counter_3` toolbar button starts an interactive path-traced render in 3Delight's `idisplay` window — geometry is sent once via NSI's `nurbs` node, camera and visibility toggles stream as incremental `set_attribute` updates.
+3Delight must be installed locally; the build auto-detects standard install paths and the `$DELIGHT` environment variable. The ③ toolbar button starts an interactive rendering session in 3Delight Display — camera moves translate in real time.
 
 Native-only; wasm builds are unaffected.
 
