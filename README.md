@@ -42,10 +42,10 @@ mstpv
 
 ### Mouse
 
-- **Right-drag**: Orbit
-- **Middle-drag**: Pan
-- **Scroll wheel**: Zoom (dolly)
-- **Left-click**: Pick face/hierarchy item
+- **Right-drag**: Orbit.
+- **Middle-drag**: Pan.
+- **Scroll wheel**: Zoom (dolly).
+- **Left-click**: Pick face/hierarchy item.
 
 ### Keyboard
 
@@ -104,12 +104,12 @@ dnf install clang clang-devel clang-tools-extra libxkbcommon-devel pkg-config op
 
 ## Dependencies
 
-- [`bevy`](https://bevyengine.org/) – game engine for rendering
-- [`egui`](https://github.com/emilk/egui/) – immediate-mode GUI
-- [`monstertruck`](https://github.com/virtualritz/monstertruck) – STEP parsing, BRep topology, tessellation
-- [`bevy_editor_cam`](https://github.com/aevyrie/bevy_editor_cam) – orbit/pan/dolly camera controls
-- [`meshopt`](https://github.com/gwihlidal/meshopt-rs) – mesh post-processing (vertex cache/fetch reordering); native-only
-- [`nsi`](https://github.com/virtualritz/nsi) – 3Delight scene interface bindings (`nsi-render` only)
+- [`bevy`](https://bevyengine.org/) – game engine for rendering.
+- [`egui`](https://github.com/emilk/egui/) – immediate-mode GUI.
+- [`monstertruck`](https://github.com/virtualritz/monstertruck) – STEP parsing, BRep topology, tessellation.
+- [`bevy_editor_cam`](https://github.com/aevyrie/bevy_editor_cam) – orbit/pan/dolly camera controls.
+- [`meshopt`](https://github.com/gwihlidal/meshopt-rs) – mesh post-processing (vertex cache/fetch reordering); native-only.
+- [`nsi`](https://github.com/virtualritz/nsi) – 3Delight scene interface bindings (`nsi-render` only).
 
 ## License
 
