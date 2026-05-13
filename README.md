@@ -2,6 +2,8 @@
 
 A 3D viewer for STEP (ISO 10303-21) CAD files, built with [`monstertruck`](https://github.com/virtualritz/monstertruck), `bevy` and `egui`.
 
+![Screenshot](screenshot.png)
+
 ## Features
 
 - Load and display STEP files with full assembly support.
