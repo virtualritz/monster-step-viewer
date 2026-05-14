@@ -36,10 +36,34 @@ use std::{
     time::Duration,
 };
 
+struct CliArgs {
+    path: Option<PathBuf>,
+    verbose: bool,
+}
+
+fn parse_cli_args() -> CliArgs {
+    let mut path: Option<PathBuf> = None;
+    let mut verbose = false;
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "-v" | "--verbose" => verbose = true,
+            "-h" | "--help" => {
+                eprintln!(
+                    "mstpv — STEP CAD viewer\n\nUSAGE:\n    mstpv [OPTIONS] [FILE]\n\nOPTIONS:\n    -v, --verbose   Enable INFO log messages (default: WARN+)\n    -h, --help      Show this help"
+                );
+                std::process::exit(0);
+            }
+            _ if path.is_none() => path = Some(PathBuf::from(arg)),
+            _ => {}
+        }
+    }
+    CliArgs { path, verbose }
+}
+
 fn main() {
-    let cli_path = env::args().nth(1).map(PathBuf::from);
+    let cli = parse_cli_args();
     let settings = persistence::load_settings();
-    let initial_path = cli_path.or(settings.last_file_path.clone());
+    let initial_path = cli.path.or(settings.last_file_path.clone());
 
     let browser_root = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let mut initial_tree = browser::scan_subdirs(&browser_root);
@@ -70,6 +94,9 @@ fn main() {
         show_wireframe: settings.show_wireframe,
         tessellation_factor: settings.tessellation_factor,
         applied_tessellation_factor: settings.tessellation_factor,
+        meshing: settings.meshing,
+        applied_meshing: settings.meshing,
+        meshing_panel_expanded: settings.meshing_panel_expanded,
         mode: settings.mode,
         clip_planes: settings.clip_planes,
         shading_mode: settings.shading_mode,
@@ -104,10 +131,18 @@ fn main() {
                 }),
                 ..Default::default()
             })
-            .set(LogPlugin {
-                filter: "info,wgpu_core=warn,wgpu_hal=warn".into(),
-                level: bevy::log::Level::INFO,
-                ..Default::default()
+            .set(if cli.verbose {
+                LogPlugin {
+                    filter: "info,wgpu_core=warn,wgpu_hal=warn".into(),
+                    level: bevy::log::Level::INFO,
+                    ..Default::default()
+                }
+            } else {
+                LogPlugin {
+                    filter: "warn".into(),
+                    level: bevy::log::Level::WARN,
+                    ..Default::default()
+                }
             }),
     )
     .add_plugins(

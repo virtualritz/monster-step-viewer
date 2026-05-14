@@ -35,10 +35,9 @@ use crate::{
         ShadingMode, ShellMesh, ShellRecord, ViewerState, ViewportClickGuard,
     },
     viewer_material::{
-        ATTRIBUTE_FACE_ID, FACE_STATE_ANNOTATION_SHIFT, FACE_STATE_HIDDEN,
-        FACE_STATE_HOVERED, FACE_STATE_SELECTED, FaceStateBuffer,
-        MatcapTexture, MaterialPalette, SHADING_FLAG_FLAT, SHADING_FLAG_MATCAP,
-        ViewerMaterial,
+        ATTRIBUTE_FACE_ID, FACE_STATE_HIDDEN, FACE_STATE_HOVERED,
+        FACE_STATE_SELECTED, FaceStateBuffer, MatcapTexture, MaterialPalette,
+        SHADING_FLAG_FLAT, SHADING_FLAG_MATCAP, ViewerMaterial,
     },
 };
 
@@ -217,8 +216,12 @@ pub(crate) fn process_load_requests(
         let StepScene { metadata, shells } = scene;
         let path = state.loaded_path.clone().unwrap_or_default();
 
-        let receiver =
-            monster_step_viewer::retessellate_scene_streaming(shells, factor);
+        let meshing_config = state.meshing.to_loader_config();
+        let receiver = monster_step_viewer::retessellate_scene_streaming(
+            shells,
+            factor,
+            meshing_config,
+        );
 
         for entity in existing_meshes.iter() {
             commands.entity(entity).despawn();
@@ -255,10 +258,12 @@ pub(crate) fn process_load_requests(
     }
 
     // Determine the load source: local file path or fetched URL data.
+    let meshing_config = state.meshing.to_loader_config();
     let load_source = if let Some(path) = state.pending_path.take() {
         let receiver = monster_step_viewer::load_step_file_streaming(
             path.clone(),
             state.tessellation_factor,
+            meshing_config,
         );
         Some((path, receiver))
     } else if let Some(data) = state.pending_url_data.take() {
@@ -266,6 +271,7 @@ pub(crate) fn process_load_requests(
         let receiver = monster_step_viewer::load_step_from_string_streaming(
             data,
             state.tessellation_factor,
+            meshing_config,
         );
         Some((path, receiver))
     } else {
@@ -415,8 +421,11 @@ pub(crate) fn process_load_requests(
                     );
                 }
 
-                // Track the tessellation factor used for this load.
+                // Track the tessellation factor + meshing knobs used for
+                // this load — Meshing panel diffs against this to decide
+                // when to re-tessellate.
                 state.applied_tessellation_factor = state.tessellation_factor;
+                state.applied_meshing = state.meshing;
 
                 // Track whether any shell has solid topology.
                 state.has_solid_topology =
@@ -623,7 +632,6 @@ pub(crate) fn spawn_shell_faces_normalized(
             ui_color,
             edge_ids: Vec::new(),
             loop_ids: Vec::new(),
-            annotation: Default::default(),
         });
 
         if !face.isoparams.is_empty() {
@@ -1212,8 +1220,6 @@ pub(crate) fn update_face_state_buffer(
                 .is_none_or(|s| s.visible);
             let face_visible = face.visible && shell_visible;
             let mut bits = 0u32;
-            bits |=
-                face.annotation.shader_bits() << FACE_STATE_ANNOTATION_SHIFT;
             if !face_visible {
                 bits |= FACE_STATE_HIDDEN;
             }

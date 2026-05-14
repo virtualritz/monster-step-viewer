@@ -14,9 +14,9 @@ use crate::{
         ICON_PALETTE, ICON_WIREFRAME, configure_fonts, icon_text,
     },
     state::{
-        AppMode, BrowserState, DirectoryEntry, FaceAnnotation, FaceRecord,
-        LoopRecord, MainCamera, PreviewStatus, Selection, ShadingMode,
-        ViewerState,
+        AppMode, BrowserState, DirectoryEntry, MainCamera, MeshingMode,
+        MeshingOptions, MeshingPrimitiveMode, PreviewStatus, Selection,
+        ShadingMode, ViewerState,
     },
 };
 use bevy::{
@@ -114,150 +114,267 @@ fn nsi_render_toolbar_toggle(
     }
 }
 
-fn annotation_color(annotation: FaceAnnotation) -> Option<egui::Color32> {
-    annotation.color().map(|rgb| {
-        egui::Color32::from_rgb(
-            (rgb[0] * 255.0) as u8,
-            (rgb[1] * 255.0) as u8,
-            (rgb[2] * 255.0) as u8,
-        )
-    })
-}
+/// Rollout panel exposing every monstertruck tessellation knob. Lives at
+/// the bottom of the left SidePanel; when collapsed it's a single-row
+/// `CollapsingHeader`. Top of the open body holds a Quality/Custom
+/// toggle — Quality leaves the knobs grayed out (the top-toolbar
+/// tessellation slider drives the shape), Custom ungrays them.
+///
+/// Edits push a re-tessellation through `state.pending_retessellate` the
+/// same way the toolbar slider does.
+fn meshing_panel(ui: &mut egui::Ui, state: &mut ViewerState) {
+    let mut requested_re_tess = false;
 
-fn face_annotation_menu(
-    ui: &mut egui::Ui,
-    face_id: usize,
-    changes: &Cell<Vec<(usize, FaceAnnotation)>>,
-) {
-    for annotation in FaceAnnotation::ALL {
-        if ui.button(annotation.label()).clicked() {
-            let mut pending = changes.take();
-            pending.push((face_id, annotation));
-            changes.set(pending);
-            ui.close();
-        }
-    }
-}
+    let response = egui::CollapsingHeader::new("Meshing")
+        .id_salt("meshing_panel")
+        .default_open(state.meshing_panel_expanded)
+        .show(ui, |ui| {
+            // Mode toggle row.
+            ui.horizontal(|ui| {
+                let mut mode = state.meshing.mode;
+                if ui
+                    .add(egui::Button::selectable(
+                        mode == MeshingMode::Quality,
+                        "Quality",
+                    ))
+                    .clicked()
+                {
+                    mode = MeshingMode::Quality;
+                }
+                if ui
+                    .add(egui::Button::selectable(
+                        mode == MeshingMode::Custom,
+                        "Custom",
+                    ))
+                    .clicked()
+                {
+                    mode = MeshingMode::Custom;
+                }
+                if mode != state.meshing.mode {
+                    state.meshing.mode = mode;
+                    state.settings_dirty = true;
+                }
+            });
+            ui.separator();
 
-fn selection_face_id(
-    selection: Option<Selection>,
-    faces: &[FaceRecord],
-    loops: &[LoopRecord],
-) -> Option<usize> {
-    match selection {
-        Some(Selection::Face(face_id)) => Some(face_id),
-        Some(Selection::Loop(loop_id)) => loops
-            .iter()
-            .find(|loop_record| loop_record.id == loop_id)
-            .map(|loop_record| loop_record.face_id),
-        Some(Selection::Edge(edge_id)) => faces
-            .iter()
-            .find(|face| face.edge_ids.contains(&edge_id))
-            .map(|face| face.id),
-        Some(Selection::Shell(_)) | None => None,
-    }
-}
-
-fn set_face_annotation(
-    state: &mut ViewerState,
-    face_id: usize,
-    annotation: FaceAnnotation,
-) {
-    if let Some(face) = state.faces.iter_mut().find(|face| face.id == face_id)
-        && face.annotation != annotation
-    {
-        face.annotation = annotation;
-        state.face_state_visibility_dirty = true;
-    }
-}
-
-fn annotation_controls_for_selected_face(
-    ui: &mut egui::Ui,
-    state: &mut ViewerState,
-) {
-    let Some(face_id) =
-        selection_face_id(state.selection, &state.faces, &state.loops)
-    else {
-        return;
-    };
-    let Some((face_name, current_annotation)) = state
-        .faces
-        .iter()
-        .find(|face| face.id == face_id)
-        .map(|face| (face.name.clone(), face.annotation))
-    else {
-        return;
-    };
-
-    ui.label(format!("Face {}: {}", face_id, face_name));
-    ui.horizontal_wrapped(|ui| {
-        for annotation in FaceAnnotation::ALL {
-            let mut button = egui::Button::selectable(
-                current_annotation == annotation,
-                annotation.label(),
-            );
-            if let Some(color) = annotation_color(annotation) {
-                button = button.fill(color.gamma_multiply(0.28));
-            }
-            if ui.add(button).clicked() {
-                set_face_annotation(state, face_id, annotation);
-            }
-        }
-    });
-    ui.separator();
-}
-
-fn annotation_summary(ui: &mut egui::Ui, faces: &[FaceRecord]) {
-    if faces.is_empty() {
-        return;
-    }
-    ui.horizontal_wrapped(|ui| {
-        for annotation in FaceAnnotation::ALL {
-            let count = faces
-                .iter()
-                .filter(|face| face.annotation == annotation)
-                .count();
-            if annotation == FaceAnnotation::Normal {
-                ui.label(format!("{} {}", annotation.label(), count));
-            } else if count > 0
-                && let Some(color) = annotation_color(annotation)
-            {
-                ui.colored_label(
-                    color,
-                    format!("{} {}", annotation.label(), count),
+            // Quality slider — always editable (mirrors the toolbar's
+            // top-right slider so users can tune density without
+            // hunting). Only this widget runs in Quality mode.
+            ui.horizontal(|ui| {
+                ui.label("Quality");
+                let mut quality = -state.tessellation_factor.log10();
+                let slider = ui.add(
+                    egui::Slider::new(&mut quality, 2.0_f64..=5.0_f64)
+                        .show_value(false)
+                        .custom_formatter(|v, _| {
+                            if v > 4.5 {
+                                "Ultra".to_string()
+                            } else if v > 3.8 {
+                                "High".to_string()
+                            } else if v > 3.0 {
+                                "Medium".to_string()
+                            } else {
+                                "Low".to_string()
+                            }
+                        }),
                 );
-            }
-        }
-    });
-    ui.separator();
-}
+                if slider.changed() {
+                    state.tessellation_factor = 10_f64.powf(-quality);
+                    state.settings_dirty = true;
+                }
+                if slider.drag_stopped()
+                    && (state.tessellation_factor
+                        - state.applied_tessellation_factor)
+                        .abs()
+                        > 1e-10
+                {
+                    requested_re_tess = true;
+                }
+            });
 
-fn apply_annotation_shortcuts(ctx: &egui::Context, state: &mut ViewerState) {
-    if ctx.wants_keyboard_input() {
-        return;
+            // Everything below is the per-knob group — grayed in
+            // Quality mode, live in Custom mode.
+            let custom = state.meshing.mode == MeshingMode::Custom;
+            ui.add_enabled_ui(custom, |ui| {
+                ui.separator();
+                egui::Grid::new("meshing_custom_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("Primitive");
+                        egui::ComboBox::from_id_salt("meshing_prim_mode")
+                            .selected_text(state.meshing.primitive_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in MeshingPrimitiveMode::ALL {
+                                    if ui
+                                        .selectable_label(
+                                            state.meshing.primitive_mode
+                                                == mode,
+                                            mode.label(),
+                                        )
+                                        .clicked()
+                                    {
+                                        state.meshing.primitive_mode = mode;
+                                        state.settings_dirty = true;
+                                    }
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Search trials");
+                        if ui
+                            .add(
+                                egui::DragValue::new(
+                                    &mut state.meshing.search_trials,
+                                )
+                                .range(1..=10_000),
+                            )
+                            .changed()
+                        {
+                            state.settings_dirty = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("Plane tolerance");
+                        if ui
+                            .add(
+                                egui::DragValue::new(
+                                    &mut state.meshing.plane_tolerance,
+                                )
+                                .range(1.0e-6..=1.0)
+                                .speed(0.001),
+                            )
+                            .changed()
+                        {
+                            state.settings_dirty = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("Score tolerance");
+                        if ui
+                            .add(
+                                egui::DragValue::new(
+                                    &mut state.meshing.score_tolerance,
+                                )
+                                .range(0.0..=10.0)
+                                .speed(0.05),
+                            )
+                            .changed()
+                        {
+                            state.settings_dirty = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("Normal blend (°)");
+                        if ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut state.meshing.normal_blend_angle_deg,
+                                    0.0..=180.0,
+                                )
+                                .suffix("°"),
+                            )
+                            .changed()
+                        {
+                            state.settings_dirty = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("Min quad area");
+                        if ui
+                            .add(
+                                egui::DragValue::new(
+                                    &mut state.meshing.minimum_area,
+                                )
+                                .range(1.0e-15..=1.0)
+                                .speed(1.0e-9),
+                            )
+                            .changed()
+                        {
+                            state.settings_dirty = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("Max corner (°)");
+                        if ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut state.meshing.maximum_corner_angle_deg,
+                                    0.0..=180.0,
+                                )
+                                .suffix("°"),
+                            )
+                            .changed()
+                        {
+                            state.settings_dirty = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("Iso samples/dir");
+                        if ui
+                            .add(
+                                egui::DragValue::new(
+                                    &mut state
+                                        .meshing
+                                        .iso_samples_per_direction,
+                                )
+                                .range(0..=64),
+                            )
+                            .changed()
+                        {
+                            state.settings_dirty = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("Iso segments/curve");
+                        if ui
+                            .add(
+                                egui::DragValue::new(
+                                    &mut state.meshing.iso_segments_per_curve,
+                                )
+                                .range(1..=256),
+                            )
+                            .changed()
+                        {
+                            state.settings_dirty = true;
+                        }
+                        ui.end_row();
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked()
+                        && state.scene_data.is_some()
+                        && state.loading_job.is_none()
+                    {
+                        state.pending_retessellate =
+                            Some(state.tessellation_factor);
+                    }
+                    if ui.button("Reset").clicked() {
+                        let current_mode = state.meshing.mode;
+                        state.meshing = MeshingOptions {
+                            mode: current_mode,
+                            ..MeshingOptions::default()
+                        };
+                        state.settings_dirty = true;
+                    }
+                });
+            });
+        });
+
+    // Mirror collapse state back to the persistent flag.
+    let new_expanded = response.fully_open();
+    if new_expanded != state.meshing_panel_expanded {
+        state.meshing_panel_expanded = new_expanded;
+        state.settings_dirty = true;
     }
-    let Some(face_id) =
-        selection_face_id(state.selection, &state.faces, &state.loops)
-    else {
-        return;
-    };
-    let pressed = ctx.input(|input| {
-        if input.modifiers.any() {
-            None
-        } else if input.key_pressed(egui::Key::Num1) {
-            Some(FaceAnnotation::Normal)
-        } else if input.key_pressed(egui::Key::Num2) {
-            Some(FaceAnnotation::TrimInverted)
-        } else if input.key_pressed(egui::Key::Num3) {
-            Some(FaceAnnotation::Bad)
-        } else if input.key_pressed(egui::Key::Num4) {
-            Some(FaceAnnotation::NonCylindrical)
-        } else {
-            None
-        }
-    });
-    if let Some(annotation) = pressed {
-        set_face_annotation(state, face_id, annotation);
+
+    if requested_re_tess
+        && state.scene_data.is_some()
+        && state.loading_job.is_none()
+    {
+        state.pending_retessellate = Some(state.tessellation_factor);
     }
 }
 
@@ -825,9 +942,6 @@ fn viewer_ui(
                 let face_vis_changes: Cell<Vec<(usize, bool)>> = Cell::new(Vec::new());
                 let edge_vis_changes: Cell<Vec<(usize, bool)>> = Cell::new(Vec::new());
                 let loop_trim_changes: Cell<Vec<(usize, bool)>> = Cell::new(Vec::new());
-                let face_annotation_changes: Cell<
-                    Vec<(usize, FaceAnnotation)>,
-                > = Cell::new(Vec::new());
                 let current_selection = state.selection;
                 let viewport_selected = state.selection_from_viewport;
                 state.selection_from_viewport = false;
@@ -868,7 +982,6 @@ fn viewer_ui(
                         visible: bool,
                         ui_color: [f32; 3],
                         loop_ids: Vec<usize>,
-                        annotation: FaceAnnotation,
                     }
                     let face_snaps: Vec<FaceSnap> = state
                         .faces
@@ -881,7 +994,6 @@ fn viewer_ui(
                             visible: f.visible,
                             ui_color: f.ui_color,
                             loop_ids: f.loop_ids.clone(),
-                            annotation: f.annotation,
                         })
                         .collect();
 
@@ -973,11 +1085,11 @@ fn viewer_ui(
                                     else {
                                         continue;
                                     };
-                                    let color = annotation_color(face.annotation).unwrap_or_else(|| egui::Color32::from_rgb(
+                                    let color = egui::Color32::from_rgb(
                                         (face.ui_color[0] * 255.0) as u8,
                                         (face.ui_color[1] * 255.0) as u8,
                                         (face.ui_color[2] * 255.0) as u8,
-                                    ));
+                                    );
                                     let has_loops = !face.loop_ids.is_empty();
 
                                     if has_loops {
@@ -1033,14 +1145,6 @@ fn viewer_ui(
                                             // RMB context menu for edge visibility.
                                             let face_loop_ids = face.loop_ids.clone();
                                             label.context_menu(|ui| {
-                                                ui.menu_button("Mark", |ui| {
-                                                    face_annotation_menu(
-                                                        ui,
-                                                        face_id,
-                                                        &face_annotation_changes,
-                                                    );
-                                                });
-                                                ui.separator();
                                                 let all_edge_ids: Vec<usize> = face_loop_ids.iter()
                                                     .flat_map(|lid| {
                                                         loop_snaps.iter()
@@ -1276,13 +1380,6 @@ fn viewer_ui(
                                             if face_label.hovered() {
                                                 new_hover.set(Some(Selection::Face(face_id)));
                                             }
-                                            face_label.context_menu(|ui| {
-                                                face_annotation_menu(
-                                                    ui,
-                                                    face_id,
-                                                    &face_annotation_changes,
-                                                );
-                                            });
                                             // Scroll to this face when selected from viewport.
                                             if viewport_selected && face_sel {
                                                 face_label.scroll_to_me(Some(egui::Align::Center));
@@ -1402,10 +1499,6 @@ fn viewer_ui(
                         state.retessellate_face = Some(loop_rec.face_id);
                     }
                 }
-                for (face_id, annotation) in face_annotation_changes.take() {
-                    set_face_annotation(state, face_id, annotation);
-                }
-
                 if let Some(sel) = new_selection.take() {
                     state.selection = sel;
                 }
@@ -1418,6 +1511,8 @@ fn viewer_ui(
                     state.edge_visibility_changed = true;
                 }
             }
+
+            meshing_panel(ui, state);
         });
 
     let left_panel_width = panel_response.response.rect.width();
@@ -1447,8 +1542,6 @@ fn viewer_ui(
         .resizable(true)
         .width_range(100.0..=800.0)
         .show(ctx, |ui| {
-            annotation_controls_for_selected_face(ui, state);
-            annotation_summary(ui, &state.faces);
             if let Some(meta) = &state.metadata {
                 ui.label(format!("Entity Count: {}", meta.entity_count));
                 ui.separator();
@@ -1471,8 +1564,6 @@ fn viewer_ui(
         });
 
     let right_panel_width = right_panel_response.response.rect.width();
-
-    apply_annotation_shortcuts(ctx, state);
 
     if (state.panel_width - left_panel_width).abs() > 1.0
         || (state.right_panel_width - right_panel_width).abs() > 1.0

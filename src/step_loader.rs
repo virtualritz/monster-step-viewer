@@ -44,6 +44,74 @@ const ISOPARAMETRIC_CURVE_OPTIONS: IsoparametricCurveOptions =
         segments_per_curve: 24,
     };
 
+/// Fine-grained tessellation knobs surfaced by the Meshing panel.
+/// Matches monstertruck's `TessellationOptions` /
+/// `TessellationPrimitiveOptions` / `IsoparametricCurveOptions` 1:1; angles
+/// are kept in degrees in the public API and converted to radians at the
+/// monstertruck call site. `None` ⇒ use monstertruck defaults.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MeshingConfig {
+    /// `TessellationOptions::search_trials`.
+    pub search_trials: Option<usize>,
+    /// `TessellationPrimitiveOptions::mode`.
+    pub primitive_mode: Option<TessellationPrimitiveMode>,
+    /// `TessellationPrimitiveOptions::plane_tolerance`.
+    pub plane_tolerance: Option<f64>,
+    /// `TessellationPrimitiveOptions::score_tolerance`.
+    pub score_tolerance: Option<f64>,
+    /// `TessellationPrimitiveOptions::normal_blend_angle` (radians).
+    pub normal_blend_angle: Option<f64>,
+    /// `TessellationPrimitiveOptions::minimum_area`.
+    pub minimum_area: Option<f64>,
+    /// `TessellationPrimitiveOptions::maximum_corner_angle` (radians).
+    pub maximum_corner_angle: Option<f64>,
+    /// `IsoparametricCurveOptions::samples_per_direction`.
+    pub iso_samples_per_direction: Option<usize>,
+    /// `IsoparametricCurveOptions::segments_per_curve`.
+    pub iso_segments_per_curve: Option<usize>,
+}
+
+impl MeshingConfig {
+    fn tessellation_options(&self, tolerance: f64) -> TessellationOptions {
+        let defaults = TessellationOptions::default();
+        let mut primitive = defaults.primitive;
+        if let Some(mode) = self.primitive_mode {
+            primitive.mode = mode;
+        }
+        if let Some(t) = self.plane_tolerance {
+            primitive.plane_tolerance = t;
+        }
+        if let Some(t) = self.score_tolerance {
+            primitive.score_tolerance = t;
+        }
+        if let Some(angle) = self.normal_blend_angle {
+            primitive.normal_blend_angle = angle;
+        }
+        if let Some(area) = self.minimum_area {
+            primitive.minimum_area = area;
+        }
+        if let Some(angle) = self.maximum_corner_angle {
+            primitive.maximum_corner_angle = angle;
+        }
+        TessellationOptions {
+            tolerance,
+            search_trials: self.search_trials.unwrap_or(defaults.search_trials),
+            primitive,
+        }
+    }
+
+    fn iso_options(&self) -> IsoparametricCurveOptions {
+        IsoparametricCurveOptions {
+            samples_per_direction: self
+                .iso_samples_per_direction
+                .unwrap_or(ISOPARAMETRIC_CURVE_OPTIONS.samples_per_direction),
+            segments_per_curve: self
+                .iso_segments_per_curve
+                .unwrap_or(ISOPARAMETRIC_CURVE_OPTIONS.segments_per_curve),
+        }
+    }
+}
+
 fn shell_requires_trimmed_meshing<P, C, S, T>(
     shell: &CompressedTrimmedShell<P, C, S, T>,
 ) -> bool {
@@ -66,14 +134,12 @@ fn count_failed_face_meshes<P, C>(
 fn tessellate_original_shell(
     shell: &OriginalShell,
     tolerance: f64,
+    config: &MeshingConfig,
 ) -> CompressedShellTessellation {
     robust_compressed_trimmed_shell_triangulation_with_isoparams(
         shell,
-        TessellationOptions {
-            tolerance,
-            ..Default::default()
-        },
-        ISOPARAMETRIC_CURVE_OPTIONS,
+        config.tessellation_options(tolerance),
+        config.iso_options(),
     )
 }
 
@@ -628,7 +694,9 @@ pub fn load_step_file_with_progress(
 
             let has_boundaries = shell_requires_trimmed_meshing(&compressed);
             let original_shell = CompressedShellData::new(compressed.clone());
-            let tessellation = tessellate_original_shell(&compressed, tol);
+            let meshing_defaults = MeshingConfig::default();
+            let tessellation =
+                tessellate_original_shell(&compressed, tol, &meshing_defaults);
             let face_isoparams = tessellation.face_isoparams;
             let poly_shell = tessellation.shell;
             let mut failed_faces = count_failed_face_meshes(&poly_shell);
@@ -788,10 +856,12 @@ struct PreparedShell {
 
 /// Start loading a STEP file in a background thread, streaming results via
 /// channel. `tolerance_factor` controls tessellation density (smaller = more
-/// triangles, default 0.005).
+/// triangles, default 0.005). `meshing` overrides individual monstertruck
+/// knobs; pass `MeshingConfig::default()` for the previous behaviour.
 pub fn load_step_file_streaming(
     path: PathBuf,
     tolerance_factor: f64,
+    meshing: MeshingConfig,
 ) -> Receiver<LoadMessage> {
     let (tx, rx) = mpsc::channel();
 
@@ -807,7 +877,8 @@ pub fn load_step_file_streaming(
                 return;
             }
         };
-        if let Err(e) = load_step_from_string_inner(raw, &tx, tolerance_factor)
+        if let Err(e) =
+            load_step_from_string_inner(raw, &tx, tolerance_factor, meshing)
         {
             // `{:#}` walks the full anyhow context chain so the underlying
             // ruststep / topology error survives the trip to the UI.
@@ -825,11 +896,13 @@ pub fn load_step_file_streaming(
 pub fn load_step_from_string_streaming(
     data: String,
     tolerance_factor: f64,
+    meshing: MeshingConfig,
 ) -> Receiver<LoadMessage> {
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        if let Err(e) = load_step_from_string_inner(data, &tx, tolerance_factor)
+        if let Err(e) =
+            load_step_from_string_inner(data, &tx, tolerance_factor, meshing)
         {
             // `{:#}` walks the full anyhow context chain so the underlying
             // ruststep / topology error survives the trip to the UI.
@@ -846,6 +919,7 @@ fn load_step_from_string_inner(
     raw: String,
     tx: &Sender<LoadMessage>,
     tolerance_factor: f64,
+    meshing: MeshingConfig,
 ) -> anyhow::Result<()> {
     let raw = raw.as_str();
 
@@ -1041,7 +1115,8 @@ fn load_step_from_string_inner(
 
             let has_boundaries = shell_requires_trimmed_meshing(&compressed);
             let original_shell = CompressedShellData::new(compressed.clone());
-            let tessellation = tessellate_original_shell(&compressed, tol);
+            let tessellation =
+                tessellate_original_shell(&compressed, tol, &meshing);
             let face_isoparams = tessellation.face_isoparams;
             let poly_shell = tessellation.shell;
             let mut failed_faces = count_failed_face_meshes(&poly_shell);
@@ -1235,10 +1310,12 @@ pub fn retessellate_face(
 pub fn retessellate_scene_streaming(
     shells: Vec<StepShell>,
     tolerance_factor: f64,
+    meshing: MeshingConfig,
 ) -> Receiver<LoadMessage> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = retessellate_scene_inner(shells, tolerance_factor, &tx);
+        let _ =
+            retessellate_scene_inner(shells, tolerance_factor, meshing, &tx);
     });
     rx
 }
@@ -1246,6 +1323,7 @@ pub fn retessellate_scene_streaming(
 fn retessellate_scene_inner(
     shells: Vec<StepShell>,
     tolerance_factor: f64,
+    meshing: MeshingConfig,
     tx: &Sender<LoadMessage>,
 ) -> anyhow::Result<()> {
     tx.send(LoadMessage::Phase(LoadPhase::Meshing))?;
@@ -1260,8 +1338,9 @@ fn retessellate_scene_inner(
     shells
         .into_par_iter()
         .for_each_with(tx.clone(), |tx, shell| {
-            let new_shell = retessellate_one_shell(&shell, tolerance_factor)
-                .unwrap_or(shell);
+            let new_shell =
+                retessellate_one_shell(&shell, tolerance_factor, &meshing)
+                    .unwrap_or(shell);
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             let _ = tx.send(LoadMessage::Progress {
                 phase: LoadPhase::Meshing,
@@ -1278,6 +1357,7 @@ fn retessellate_scene_inner(
 fn retessellate_one_shell(
     shell: &StepShell,
     tolerance_factor: f64,
+    meshing: &MeshingConfig,
 ) -> Option<StepShell> {
     let shell_data = shell.original_shell.as_ref()?;
     let compressed: &OriginalShell = shell_data.downcast_ref()?;
@@ -1290,7 +1370,7 @@ fn retessellate_one_shell(
         tol = 0.01;
     }
 
-    let tessellation = tessellate_original_shell(compressed, tol);
+    let tessellation = tessellate_original_shell(compressed, tol, meshing);
     let face_isoparams = tessellation.face_isoparams;
     let poly_shell = tessellation.shell;
     let mut failed_faces = count_failed_face_meshes(&poly_shell);
@@ -1592,18 +1672,117 @@ mod tests {
         );
     }
 
+    fn point_xy(point: Point3) -> Vector2 {
+        Vector2::new(point.x, point.y)
+    }
+
+    fn coord_xy(point: [f64; 3]) -> Vector2 {
+        Vector2::new(point[0], point[1])
+    }
+
+    fn distance2(lhs: Vector2, rhs: Vector2) -> f64 {
+        let delta = lhs - rhs;
+        delta.x * delta.x + delta.y * delta.y
+    }
+
+    fn append_oriented_polyline(
+        loop_points: &mut Vec<Vector2>,
+        edge_points: &[Vector2],
+    ) {
+        if loop_points.is_empty() {
+            loop_points.extend_from_slice(edge_points);
+        } else if let Some(last) = loop_points.last().copied() {
+            match (edge_points.first().copied(), edge_points.last().copied()) {
+                (Some(front), Some(back))
+                    if distance2(last, back) < distance2(last, front) =>
+                {
+                    edge_points
+                        .iter()
+                        .rev()
+                        .copied()
+                        .filter(|point| distance2(last, *point) > 1.0e-12)
+                        .for_each(|point| loop_points.push(point));
+                }
+                _ => {
+                    edge_points
+                        .iter()
+                        .copied()
+                        .filter(|point| distance2(last, *point) > 1.0e-12)
+                        .for_each(|point| loop_points.push(point));
+                }
+            }
+        }
+    }
+
+    fn boundary_loop_xy(
+        shell: &StepShell,
+        boundary_loop: &StepBoundaryLoop,
+    ) -> Vec<Vector2> {
+        boundary_loop
+            .edge_indices
+            .iter()
+            .filter_map(|edge_idx| shell.curve_edges.get(*edge_idx))
+            .map(|edge| {
+                edge.points
+                    .iter()
+                    .copied()
+                    .map(coord_xy)
+                    .collect::<Vec<_>>()
+            })
+            .fold(Vec::new(), |mut loop_points, edge_points| {
+                append_oriented_polyline(&mut loop_points, &edge_points);
+                loop_points
+            })
+    }
+
+    fn polygon_area(points: &[Vector2]) -> f64 {
+        points
+            .iter()
+            .zip(points.iter().cycle().skip(1))
+            .take(points.len())
+            .map(|(a, b)| a.x * b.y - b.x * a.y)
+            .sum::<f64>()
+            * 0.5
+    }
+
+    fn point_in_polygon(point: Vector2, points: &[Vector2]) -> bool {
+        points
+            .iter()
+            .zip(points.iter().cycle().skip(1))
+            .take(points.len())
+            .fold(false, |inside, (a, b)| {
+                let crosses = (a.y > point.y) != (b.y > point.y);
+                if crosses
+                    && point.x
+                        < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x
+                {
+                    !inside
+                } else {
+                    inside
+                }
+            })
+    }
+
     #[test]
     fn boxy_front_face_keeps_large_center_opening_empty() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("step-files/boxy_with_surfacetex.stp");
         let scene = load_step_file(&path).expect("STEP file should load");
-        let face = scene
-            .shells
-            .first()
-            .and_then(|shell| shell.faces.first())
-            .expect("front face should be present");
+        let shell =
+            scene.shells.first().expect("first shell should be present");
+        let face = shell.faces.first().expect("front face should be present");
         let positions = face.mesh.positions();
         let uv_coords = face.mesh.uv_coords();
+        let center_opening = face
+            .boundary_loops
+            .iter()
+            .filter(|boundary_loop| !boundary_loop.is_outer)
+            .map(|boundary_loop| boundary_loop_xy(shell, boundary_loop))
+            .filter(|points| points.len() >= 3)
+            .max_by(|lhs, rhs| {
+                polygon_area(lhs).abs().total_cmp(&polygon_area(rhs).abs())
+            })
+            .expect("front face should have a center opening loop");
 
         let center_triangle =
             face.mesh.tri_faces().iter().find_map(|triangle| {
@@ -1620,8 +1799,7 @@ mod tests {
                     .fold(Vector2::zero(), |sum, uv| sum + uv)
                     / 3.0;
                 (center.z.abs() < 1.0e-6
-                    && (25.0..60.0).contains(&center.x)
-                    && (-60.0..-25.0).contains(&center.y))
+                    && point_in_polygon(point_xy(center), &center_opening))
                 .then_some((center, uv_center))
             });
 

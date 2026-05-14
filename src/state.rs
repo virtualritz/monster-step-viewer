@@ -30,6 +30,134 @@ pub(crate) enum AppMode {
     Browser,
 }
 
+/// Mode selector for the Meshing panel.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub(crate) enum MeshingMode {
+    /// Single tessellation-quality slider drives everything.
+    #[default]
+    Quality,
+    /// Every monstertruck knob is editable.
+    Custom,
+}
+
+/// Mirrors `monstertruck::meshing::TessellationPrimitiveMode` so we can
+/// (de)serialize and pattern-match without dragging monstertruck into
+/// `state.rs`.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub(crate) enum MeshingPrimitiveMode {
+    #[default]
+    Triangles,
+    PreferQuads,
+    AllQuads,
+    IsoQuads,
+}
+
+impl MeshingPrimitiveMode {
+    pub const ALL: [Self; 4] = [
+        Self::Triangles,
+        Self::PreferQuads,
+        Self::AllQuads,
+        Self::IsoQuads,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Triangles => "Triangles",
+            Self::PreferQuads => "Prefer quads",
+            Self::AllQuads => "All quads",
+            Self::IsoQuads => "Iso quads",
+        }
+    }
+}
+
+/// Snapshot of the meshing knobs exposed by the Meshing panel — mirrors
+/// `monstertruck::meshing::TessellationOptions` +
+/// `TessellationPrimitiveOptions` + `IsoparametricCurveOptions`. Angles
+/// are stored in degrees for the UI; converted to radians at the
+/// monstertruck call site.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MeshingOptions {
+    pub mode: MeshingMode,
+    pub primitive_mode: MeshingPrimitiveMode,
+    pub search_trials: usize,
+    pub plane_tolerance: f64,
+    pub score_tolerance: f64,
+    pub normal_blend_angle_deg: f64,
+    pub minimum_area: f64,
+    pub maximum_corner_angle_deg: f64,
+    pub iso_samples_per_direction: usize,
+    pub iso_segments_per_curve: usize,
+}
+
+impl MeshingOptions {
+    /// Translate UI state to the loader's `MeshingConfig`. In Quality
+    /// mode every per-knob field is left as `None` so the loader falls
+    /// back to monstertruck defaults; only the tessellation tolerance
+    /// (driven by the top-toolbar slider) varies. In Custom mode every
+    /// field is forwarded.
+    pub fn to_loader_config(self) -> monster_step_viewer::MeshingConfig {
+        let to_rad = |deg: f64| deg.to_radians();
+        match self.mode {
+            MeshingMode::Quality => {
+                monster_step_viewer::MeshingConfig::default()
+            }
+            MeshingMode::Custom => monster_step_viewer::MeshingConfig {
+                search_trials: Some(self.search_trials),
+                primitive_mode: Some(self.primitive_mode.to_monstertruck()),
+                plane_tolerance: Some(self.plane_tolerance),
+                score_tolerance: Some(self.score_tolerance),
+                normal_blend_angle: Some(to_rad(self.normal_blend_angle_deg)),
+                minimum_area: Some(self.minimum_area),
+                maximum_corner_angle: Some(to_rad(
+                    self.maximum_corner_angle_deg,
+                )),
+                iso_samples_per_direction: Some(self.iso_samples_per_direction),
+                iso_segments_per_curve: Some(self.iso_segments_per_curve),
+            },
+        }
+    }
+}
+
+impl MeshingPrimitiveMode {
+    pub fn to_monstertruck(
+        self,
+    ) -> monstertruck::meshing::prelude::TessellationPrimitiveMode {
+        use monstertruck::meshing::prelude::TessellationPrimitiveMode as M;
+        match self {
+            Self::Triangles => M::Triangles,
+            Self::PreferQuads => M::PreferQuads,
+            Self::AllQuads => M::AllQuads,
+            Self::IsoQuads => M::IsoQuads,
+        }
+    }
+}
+
+impl Default for MeshingOptions {
+    fn default() -> Self {
+        // Match monstertruck's TessellationOptions / IsoparametricCurveOptions
+        // defaults so first-run users see the same behaviour as before the
+        // panel existed.
+        Self {
+            mode: MeshingMode::default(),
+            primitive_mode: MeshingPrimitiveMode::Triangles,
+            search_trials: 100,
+            plane_tolerance: 0.01,
+            score_tolerance: 1.0,
+            normal_blend_angle_deg: 45.0,
+            // monstertruck uses `TOLERANCE * TOLERANCE` (TOLERANCE = 1e-6),
+            // i.e. 1e-12. Round-trip via UI as 1e-12.
+            minimum_area: 1.0e-12,
+            maximum_corner_angle_deg: 175.0,
+            iso_samples_per_direction: 4,
+            iso_segments_per_curve: 24,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ClipPlaneState {
     pub enabled: bool,
@@ -104,6 +232,14 @@ pub(crate) struct ViewerState {
     /// Tessellation factor used for currently loaded scene (to detect
     /// changes).
     pub applied_tessellation_factor: f64,
+    /// All monstertruck tessellation knobs surfaced by the Meshing panel.
+    pub meshing: MeshingOptions,
+    /// `meshing` snapshot used for the currently-loaded scene; comparing
+    /// against `meshing` is how we detect that a re-tessellation is needed
+    /// because of a panel edit.
+    pub applied_meshing: MeshingOptions,
+    /// Whether the Meshing rollout panel is expanded.
+    pub meshing_panel_expanded: bool,
     /// Flag to trigger visibility update (avoids costly is_changed() checks).
     pub visibility_changed: bool,
     /// Scene normalization: original center (for wireframe rendering).
@@ -194,6 +330,9 @@ impl Default for ViewerState {
             current_bounds: None,
             tessellation_factor: DEFAULT_TESSELLATION_FACTOR,
             applied_tessellation_factor: DEFAULT_TESSELLATION_FACTOR,
+            meshing: MeshingOptions::default(),
+            applied_meshing: MeshingOptions::default(),
+            meshing_panel_expanded: false,
             visibility_changed: false,
             scene_center: Vec3::ZERO,
             scene_scale: 1.0,
@@ -243,53 +382,6 @@ pub(crate) struct FaceRecord {
     pub edge_ids: Vec<usize>,
     /// Global loop IDs for this face.
     pub loop_ids: Vec<usize>,
-    /// Manual diagnostic annotation for NSI trim debugging.
-    pub annotation: FaceAnnotation,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum FaceAnnotation {
-    #[default]
-    Normal,
-    TrimInverted,
-    Bad,
-    NonCylindrical,
-}
-
-impl FaceAnnotation {
-    pub(crate) const ALL: [Self; 4] = [
-        Self::Normal,
-        Self::TrimInverted,
-        Self::Bad,
-        Self::NonCylindrical,
-    ];
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Normal => "normal",
-            Self::TrimInverted => "trim inverted",
-            Self::Bad => "bad",
-            Self::NonCylindrical => "non-cylindrical",
-        }
-    }
-
-    pub(crate) fn color(self) -> Option<[f32; 3]> {
-        match self {
-            Self::Normal => None,
-            Self::TrimInverted => Some([0.95, 0.75, 0.05]),
-            Self::Bad => Some([0.95, 0.1, 0.12]),
-            Self::NonCylindrical => Some([0.15, 0.65, 1.0]),
-        }
-    }
-
-    pub(crate) fn shader_bits(self) -> u32 {
-        match self {
-            Self::Normal => 0,
-            Self::TrimInverted => 1,
-            Self::Bad => 2,
-            Self::NonCylindrical => 3,
-        }
-    }
 }
 
 #[derive(Debug)]

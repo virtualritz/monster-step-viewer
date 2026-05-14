@@ -54,7 +54,7 @@ var matcap_texture: texture_2d<f32>;
 var matcap_sampler: sampler;
 
 // Per-face state bits.
-// bit 0 = selected, bit 1 = hovered, bit 2 = hidden, bits 3..4 = manual annotation.
+// bit 0 = selected, bit 1 = hovered, bit 2 = hidden.
 @group(#{MATERIAL_BIND_GROUP}) @binding(103)
 var<storage, read> face_state: array<u32>;
 
@@ -124,30 +124,6 @@ fn face_state_for(face_id: u32) -> u32 {
     return face_state[face_id];
 }
 
-fn annotation_tint(state: u32) -> vec3<f32> {
-    let annotation = (state >> 3u) & 3u;
-    if annotation == 1u {
-        return vec3<f32>(0.95, 0.75, 0.05);
-    }
-    if annotation == 2u {
-        return vec3<f32>(0.95, 0.10, 0.12);
-    }
-    if annotation == 3u {
-        return vec3<f32>(0.15, 0.65, 1.0);
-    }
-    return vec3<f32>(0.0, 0.0, 0.0);
-}
-
-fn apply_annotation(color: vec4<f32>, state: u32) -> vec4<f32> {
-    let annotation = (state >> 3u) & 3u;
-    if annotation == 0u {
-        return color;
-    }
-    let tint = annotation_tint(state);
-    let mixed = color.rgb * 0.55 + tint * 0.45;
-    return vec4<f32>(mixed, color.a);
-}
-
 @fragment
 fn fragment(
     in: ViewerVertexOutput,
@@ -204,7 +180,6 @@ fn fragment(
         } else if (state & 2u) != 0u {
             out.color = out.color + vec4<f32>(0.2, 0.15, 0.0, 0.0);
         }
-        out.color = apply_annotation(out.color, state);
         return out;
     }
 #endif
@@ -228,7 +203,6 @@ fn fragment(
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
-    out.color = apply_annotation(out.color, state);
 #endif
 
     return out;

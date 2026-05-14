@@ -2,8 +2,8 @@ use std::{env, path::PathBuf, sync::mpsc::Receiver};
 
 use anyhow::Context;
 use monster_step_viewer::{
-    LoadMessage, StepBounds, StepFace, StepMetadata, StepScene, StepShell,
-    load_step_file, load_step_file_streaming,
+    LoadMessage, MeshingConfig, StepBounds, StepFace, StepMetadata, StepScene,
+    StepShell, load_step_file, load_step_file_streaming,
 };
 
 fn point_max_box_excess(point: [f64; 3], min: [f64; 3], max: [f64; 3]) -> f64 {
@@ -191,8 +191,11 @@ fn main() -> anyhow::Result<()> {
     let scene = load_step_file(&path)?;
     print_scene("direct", &scene);
 
-    let streamed_scene =
-        collect_streamed_scene(load_step_file_streaming(path, 0.001))?;
+    let streamed_scene = collect_streamed_scene(load_step_file_streaming(
+        path,
+        0.001,
+        MeshingConfig::default(),
+    ))?;
     print_scene("stream collected", &streamed_scene);
 
     Ok(())

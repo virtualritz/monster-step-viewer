@@ -27,7 +27,6 @@ pub(crate) const ATTRIBUTE_FACE_ID: MeshVertexAttribute =
 pub(crate) const FACE_STATE_SELECTED: u32 = 1 << 0;
 pub(crate) const FACE_STATE_HOVERED: u32 = 1 << 1;
 pub(crate) const FACE_STATE_HIDDEN: u32 = 1 << 2;
-pub(crate) const FACE_STATE_ANNOTATION_SHIFT: u32 = 3;
 
 /// Use matcap shading in the custom fragment shader.
 pub(crate) const SHADING_FLAG_MATCAP: u32 = 1 << 0;

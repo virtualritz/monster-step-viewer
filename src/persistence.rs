@@ -4,7 +4,7 @@ use std::{path::PathBuf, time::Instant};
 
 use crate::state::{
     AppMode, BrowserState, ClipPlaneState, DEFAULT_PANEL_WIDTH,
-    DEFAULT_TESSELLATION_FACTOR, ShadingMode, ViewerState,
+    DEFAULT_TESSELLATION_FACTOR, MeshingOptions, ShadingMode, ViewerState,
 };
 
 const APP_NAME: &str = "monster-step-viewer";
@@ -34,6 +34,10 @@ pub(crate) struct PersistentSettings {
     pub clip_planes: [ClipPlaneState; 3],
     #[serde(default)]
     pub shading_mode: ShadingMode,
+    #[serde(default)]
+    pub meshing: MeshingOptions,
+    #[serde(default)]
+    pub meshing_panel_expanded: bool,
 }
 
 fn default_true() -> bool {
@@ -56,6 +60,8 @@ impl Default for PersistentSettings {
             show_wireframe: true,
             clip_planes: [ClipPlaneState::default(); 3],
             shading_mode: ShadingMode::default(),
+            meshing: MeshingOptions::default(),
+            meshing_panel_expanded: false,
         }
     }
 }
@@ -126,6 +132,8 @@ pub(crate) fn auto_save_system(
         last_browser_dir: browser.selected_dir.clone(),
         clip_planes: state.clip_planes,
         shading_mode: state.shading_mode,
+        meshing: state.meshing,
+        meshing_panel_expanded: state.meshing_panel_expanded,
     };
     save_settings(&settings);
     timer.last_save = Instant::now();
