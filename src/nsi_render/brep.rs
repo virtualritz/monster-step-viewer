@@ -15,7 +15,7 @@
 //! The output structs (`NsiBrepSurfaceData` / `NsiBrepTrimData` /
 //! `NsiBrepTrimCurveData`) mirror NSI's `nurbs` node attribute names exactly,
 //! so the caller writes them with `nsi::set_attribute(...)` and is done.
-use std::f64::consts::FRAC_PI_2;
+use std::{cmp::Ordering, f64::consts::FRAC_PI_2};
 
 use monstertruck::{
     core::{MetricSpace, tolerance::TOLERANCE},
@@ -50,6 +50,8 @@ const MAX_RATIONAL_QUADRATIC_ARC: f64 = FRAC_PI_2;
 /// scaling, returning None).
 const PARAMETER_CURVE_TOLERANCE: f64 = 1.0e-3;
 const TRIM_CLOSURE_TOLERANCE: f64 = 1.0e-3;
+#[cfg(feature = "nsi-render")]
+const SCALAR_COMPATIBLE_TRIM_SENSE: i32 = 1;
 type StepFaceTrim = CompressedEdgeUse<StepParameterCurve>;
 type StepCompressedFace = CompressedTrimmedFace<Surface, StepParameterCurve>;
 type StepCompressedShell =
@@ -96,6 +98,14 @@ impl NsiBrepTrimData {
     pub(crate) fn scalar_sense_workaround(&self) -> i32 {
         self.sense.first().copied().unwrap_or(0)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrimSenseMode {
+    #[cfg(any(feature = "nsi-export", test))]
+    PerLoop,
+    #[cfg(feature = "nsi-render")]
+    ScalarCompatible,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -181,8 +191,29 @@ enum SurfaceAxis {
 /// boundaries (if any) close cleanly. Faces with non-NURBS surfaces or
 /// incomplete trim boundaries are silently skipped — they just won't
 /// appear in the NSI overlay.
+#[cfg(any(feature = "nsi-export", test))]
 pub(crate) fn shell_data_to_nsi_surfaces(
     shell_data: &CompressedShellData,
+) -> Vec<NsiBrepSurfaceData> {
+    shell_data_to_nsi_surfaces_with_trim_sense(
+        shell_data,
+        TrimSenseMode::PerLoop,
+    )
+}
+
+#[cfg(feature = "nsi-render")]
+pub(crate) fn shell_data_to_nsi_surfaces_for_scalar_trim_sense(
+    shell_data: &CompressedShellData,
+) -> Vec<NsiBrepSurfaceData> {
+    shell_data_to_nsi_surfaces_with_trim_sense(
+        shell_data,
+        TrimSenseMode::ScalarCompatible,
+    )
+}
+
+fn shell_data_to_nsi_surfaces_with_trim_sense(
+    shell_data: &CompressedShellData,
+    trim_sense_mode: TrimSenseMode,
 ) -> Vec<NsiBrepSurfaceData> {
     let Some(shell): Option<&StepCompressedShell> = shell_data.downcast_ref()
     else {
@@ -193,7 +224,7 @@ pub(crate) fn shell_data_to_nsi_surfaces(
         .iter()
         .enumerate()
         .filter_map(|(face_index, face)| {
-            face_to_nsi(face_index, face, &shell.edges)
+            face_to_nsi(face_index, face, &shell.edges, trim_sense_mode)
         })
         .collect()
 }
@@ -202,6 +233,7 @@ fn face_to_nsi(
     face_index: usize,
     face: &StepCompressedFace,
     edges: &[CompressedEdge<Curve3D>],
+    trim_sense_mode: TrimSenseMode,
 ) -> Option<NsiBrepSurfaceData> {
     let mut surface = surface_to_nsi_data(&face.surface)?;
     let has_boundaries =
@@ -246,7 +278,8 @@ fn face_to_nsi(
             "NSI BRep emitter: face {face_index} uses {sampled_trim_fallback_count} sampled trim fallback(s)"
         );
     }
-    let trims = trim_loops.map(trim_loops_to_nsi_data);
+    let trims =
+        trim_loops.map(|loops| trim_loops_to_nsi_data(loops, trim_sense_mode));
 
     Some(NsiBrepSurfaceData {
         face_index,
@@ -267,20 +300,149 @@ fn align_surface_to_trim_domain(
     face_surface: &Surface,
     (u_lo, u_hi, v_lo, v_hi): (f32, f32, f32, f32),
 ) {
-    let target_u = target_axis_range(
+    if !align_periodic_surface_seam_to_trim_domain(
         surface,
         SurfaceAxis::U,
         (u_lo, u_hi),
         surface_u_range(face_surface),
-    );
-    let target_v = target_axis_range(
+        face_surface.u_period(),
+    ) {
+        let target_u = target_axis_range(
+            surface,
+            SurfaceAxis::U,
+            (u_lo, u_hi),
+            surface_u_range(face_surface),
+        );
+        align_surface_axis(surface, SurfaceAxis::U, target_u.0, target_u.1);
+    }
+    if !align_periodic_surface_seam_to_trim_domain(
         surface,
         SurfaceAxis::V,
         (v_lo, v_hi),
         surface_v_range(face_surface),
-    );
-    align_surface_axis(surface, SurfaceAxis::U, target_u.0, target_u.1);
-    align_surface_axis(surface, SurfaceAxis::V, target_v.0, target_v.1);
+        face_surface.v_period(),
+    ) {
+        let target_v = target_axis_range(
+            surface,
+            SurfaceAxis::V,
+            (v_lo, v_hi),
+            surface_v_range(face_surface),
+        );
+        align_surface_axis(surface, SurfaceAxis::V, target_v.0, target_v.1);
+    }
+}
+
+fn align_periodic_surface_seam_to_trim_domain(
+    surface: &mut NsiBrepSurfaceData,
+    axis: SurfaceAxis,
+    trim_range: (f32, f32),
+    natural_range: Option<(f32, f32)>,
+    period: Option<f64>,
+) -> bool {
+    let Some(period) = period.map(|period| period as f32) else {
+        return false;
+    };
+    let Some((lower, upper)) = natural_range else {
+        return false;
+    };
+    let straddles_lower_seam = trim_range.0
+        < lower - TRIM_CLOSURE_TOLERANCE as f32
+        && trim_range.1 > lower + TRIM_CLOSURE_TOLERANCE as f32;
+    let natural_span = upper - lower;
+    let trim_span = trim_range.1 - trim_range.0;
+    let is_full_period =
+        (natural_span - period).abs() <= TRIM_CLOSURE_TOLERANCE as f32;
+    if surface_axis_is_linear(surface, axis)
+        || !straddles_lower_seam
+        || !is_full_period
+        || trim_span >= period * 0.5
+    {
+        false
+    } else {
+        align_surface_axis(surface, axis, lower, upper);
+        rotate_periodic_surface_axis_by_half_period(surface, axis, period)
+    }
+}
+
+fn rotate_periodic_surface_axis_by_half_period(
+    surface: &mut NsiBrepSurfaceData,
+    axis: SurfaceAxis,
+    period: f32,
+) -> bool {
+    match axis {
+        SurfaceAxis::U => {
+            rotate_periodic_surface_u_axis_by_half_period(surface)
+        }
+        SurfaceAxis::V => {
+            rotate_periodic_surface_v_axis_by_half_period(surface)
+        }
+    }
+    .then(|| shift_surface_axis_domain(surface, axis, -period * 0.5))
+    .is_some()
+}
+
+fn rotate_periodic_surface_u_axis_by_half_period(
+    surface: &mut NsiBrepSurfaceData,
+) -> bool {
+    let Some((nu, _)) = surface_dimensions(surface) else {
+        return false;
+    };
+    if !surface.pw.len().is_multiple_of(nu) || nu < 5 || nu.is_multiple_of(2) {
+        false
+    } else {
+        let half = (nu - 1) / 2;
+        surface.pw.chunks_mut(nu).for_each(|row| {
+            let rotated = row[half..]
+                .iter()
+                .chain(row[1..=half].iter())
+                .copied()
+                .collect::<Vec<_>>();
+            row.copy_from_slice(&rotated);
+        });
+        true
+    }
+}
+
+fn rotate_periodic_surface_v_axis_by_half_period(
+    surface: &mut NsiBrepSurfaceData,
+) -> bool {
+    let Some((nu, nv)) = surface_dimensions(surface) else {
+        return false;
+    };
+    if surface.pw.len() != nu.saturating_mul(nv)
+        || nv < 5
+        || nv.is_multiple_of(2)
+    {
+        false
+    } else {
+        let half = (nv - 1) / 2;
+        let rows = surface.pw.chunks(nu).collect::<Vec<_>>();
+        surface.pw = rows[half..]
+            .iter()
+            .chain(rows[1..=half].iter())
+            .flat_map(|row| row.iter().copied())
+            .collect();
+        true
+    }
+}
+
+fn shift_surface_axis_domain(
+    surface: &mut NsiBrepSurfaceData,
+    axis: SurfaceAxis,
+    shift: f32,
+) {
+    match axis {
+        SurfaceAxis::U => {
+            surface.uknot.iter_mut().for_each(|knot| *knot += shift);
+            surface.umin += shift;
+            surface.umax += shift;
+        }
+        SurfaceAxis::V => {
+            surface.vknot.iter_mut().for_each(|knot| *knot += shift);
+            surface.vmin += shift;
+            surface.vmax += shift;
+        }
+    }
 }
 
 fn target_axis_range(
@@ -532,8 +694,24 @@ fn trims_to_nsi_data(
     face_surface: &Surface,
     _surface: &NsiBrepSurfaceData,
 ) -> Option<Option<NsiBrepTrimData>> {
-    trim_loops_from_boundaries(boundaries, edges, face_surface)
-        .map(|loops| loops.map(trim_loops_to_nsi_data))
+    trims_to_nsi_data_with_mode(
+        boundaries,
+        edges,
+        face_surface,
+        TrimSenseMode::PerLoop,
+    )
+}
+
+#[cfg(test)]
+fn trims_to_nsi_data_with_mode(
+    boundaries: &[Vec<StepFaceTrim>],
+    edges: &[CompressedEdge<Curve3D>],
+    face_surface: &Surface,
+    trim_sense_mode: TrimSenseMode,
+) -> Option<Option<NsiBrepTrimData>> {
+    trim_loops_from_boundaries(boundaries, edges, face_surface).map(|loops| {
+        loops.map(|loops| trim_loops_to_nsi_data(loops, trim_sense_mode))
+    })
 }
 
 fn trim_loops_from_boundaries(
@@ -660,17 +838,16 @@ fn mirror_trim_loop_u_axis(trim_loop: &mut TrimLoop, umin: f32, umax: f32) {
         .for_each(|point| point.x = u_origin as f64 - point.x);
 }
 
-fn trim_loops_to_nsi_data(loops: Vec<TrimLoop>) -> NsiBrepTrimData {
+fn trim_loops_to_nsi_data(
+    mut loops: Vec<TrimLoop>,
+    trim_sense_mode: TrimSenseMode,
+) -> NsiBrepTrimData {
+    let sense = trim_senses_for_mode(&mut loops, trim_sense_mode);
+    loops.iter_mut().for_each(snap_trim_loop_curve_endpoints);
     let nloops = loops.len() as i32;
     let ncurves = loops
         .iter()
         .map(|trim_loop| trim_loop.curves.len() as i32)
-        .collect();
-    let sense = loops
-        .iter()
-        .map(|trim_loop| {
-            i32::from(!loop_orientation(&trim_loop.topology_points))
-        })
         .collect();
     let curves: Vec<NsiBrepTrimCurveData> = loops
         .into_iter()
@@ -704,15 +881,100 @@ fn trim_loops_to_nsi_data(loops: Vec<TrimLoop>) -> NsiBrepTrimData {
     }
 }
 
+#[cfg(feature = "nsi-render")]
+fn trim_senses_for_mode(
+    loops: &mut [TrimLoop],
+    trim_sense_mode: TrimSenseMode,
+) -> Vec<i32> {
+    if matches!(trim_sense_mode, TrimSenseMode::ScalarCompatible) {
+        loops
+            .iter_mut()
+            .filter(|trim_loop| {
+                trim_loop_sense(trim_loop) != SCALAR_COMPATIBLE_TRIM_SENSE
+            })
+            .for_each(reverse_trim_loop);
+        vec![SCALAR_COMPATIBLE_TRIM_SENSE; loops.len()]
+    } else {
+        loops.iter().map(trim_loop_sense).collect()
+    }
+}
+
+#[cfg(not(feature = "nsi-render"))]
+fn trim_senses_for_mode(
+    loops: &mut [TrimLoop],
+    _trim_sense_mode: TrimSenseMode,
+) -> Vec<i32> {
+    loops.iter().map(trim_loop_sense).collect()
+}
+
+fn trim_loop_sense(trim_loop: &TrimLoop) -> i32 {
+    i32::from(!loop_orientation(&trim_loop.topology_points))
+}
+
+fn snap_trim_loop_curve_endpoints(trim_loop: &mut TrimLoop) {
+    let end_points = trim_loop
+        .curves
+        .iter()
+        .map(trim_curve_back_point)
+        .collect::<Vec<_>>();
+    let len = trim_loop.curves.len();
+    (0..len).for_each(|index| {
+        let next_index = (index + 1) % len;
+        if let Some(end_point) = end_points[index]
+            && let Some(next_start) =
+                trim_curve_front_point(&trim_loop.curves[next_index])
+            && uv_distance(end_point, next_start) <= TRIM_CLOSURE_TOLERANCE
+        {
+            set_trim_curve_front_point(
+                &mut trim_loop.curves[next_index],
+                end_point,
+            );
+        }
+    });
+}
+
+fn trim_curve_front_point(curve: &NsiBrepTrimCurveData) -> Option<Point2> {
+    trim_curve_point(curve, 0)
+}
+
+fn trim_curve_back_point(curve: &NsiBrepTrimCurveData) -> Option<Point2> {
+    curve
+        .u
+        .len()
+        .checked_sub(1)
+        .and_then(|index| trim_curve_point(curve, index))
+}
+
+fn trim_curve_point(
+    curve: &NsiBrepTrimCurveData,
+    index: usize,
+) -> Option<Point2> {
+    let u = *curve.u.get(index)?;
+    let v = *curve.v.get(index)?;
+    let w = *curve.w.get(index)?;
+    (w.abs() > f32::EPSILON)
+        .then(|| Point2::new(u as f64 / w as f64, v as f64 / w as f64))
+}
+
+fn set_trim_curve_front_point(curve: &mut NsiBrepTrimCurveData, point: Point2) {
+    if let (Some(u), Some(v), Some(w)) =
+        (curve.u.first_mut(), curve.v.first_mut(), curve.w.first())
+    {
+        *u = point.x as f32 * *w;
+        *v = point.y as f32 * *w;
+    }
+}
+
 fn trim_boundary_to_piece(
     boundary: &[StepFaceTrim],
     edges: &[CompressedEdge<Curve3D>],
     face_surface: &Surface,
 ) -> Option<TrimPiece> {
-    let entries: Vec<TrimEdgeCurve> = boundary
+    let mut entries: Vec<TrimEdgeCurve> = boundary
         .iter()
         .map(|edge_use| trim_edge_to_curve(edge_use, edges, face_surface))
         .collect::<Option<Vec<_>>>()?;
+    align_periodic_trim_entries(&mut entries, face_surface);
     let curves = entries
         .iter()
         .map(|entry| entry.curve.clone())
@@ -739,6 +1001,206 @@ fn trim_boundary_to_piece(
         closed_by_topology,
         sampled_fallback_count,
     })
+}
+
+fn align_periodic_trim_entries(
+    entries: &mut [TrimEdgeCurve],
+    surface: &Surface,
+) {
+    (0..=1).for_each(|axis| {
+        let (period, range) = surface_axis_range(surface, axis);
+        if let Some(period) = period
+            && entries_have_periodic_jump(entries, axis, period)
+            && let Some(shifts) =
+                periodic_trim_entry_shifts(entries, axis, period, range)
+        {
+            entries.iter_mut().zip(shifts).for_each(|(entry, shift)| {
+                translate_trim_entry_axis(entry, axis, shift)
+            });
+        }
+    });
+}
+
+fn entries_have_periodic_jump(
+    entries: &[TrimEdgeCurve],
+    axis: usize,
+    period: f64,
+) -> bool {
+    entries.iter().any(|entry| {
+        entry.topology_points.windows(2).any(|points| {
+            (uv_axis(points[1], axis) - uv_axis(points[0], axis)).abs()
+                > period * 0.5
+        })
+    }) || entries
+        .iter()
+        .zip(entries.iter().cycle().skip(1))
+        .take(entries.len())
+        .any(|(current, next)| {
+            current
+                .topology_points
+                .last()
+                .zip(next.topology_points.first())
+                .is_some_and(|(current, next)| {
+                    (uv_axis(*next, axis) - uv_axis(*current, axis)).abs()
+                        > period * 0.5
+                })
+        })
+}
+
+fn periodic_trim_entry_shifts(
+    entries: &[TrimEdgeCurve],
+    axis: usize,
+    period: f64,
+    range: Option<(f64, f64)>,
+) -> Option<Vec<f64>> {
+    let best = (-2..=2)
+        .filter_map(|lap| {
+            let initial_shift = lap as f64 * period;
+            periodic_trim_entry_shift_candidate(
+                entries,
+                axis,
+                period,
+                range,
+                initial_shift,
+            )
+        })
+        .min_by(periodic_shift_score_cmp);
+    best.map(|candidate| candidate.shifts)
+}
+
+#[derive(Clone, Debug)]
+struct PeriodicTrimEntryShiftCandidate {
+    shifts: Vec<f64>,
+    closure_error: f64,
+    domain_overflow: f64,
+    span: f64,
+}
+
+fn periodic_trim_entry_shift_candidate(
+    entries: &[TrimEdgeCurve],
+    axis: usize,
+    period: f64,
+    range: Option<(f64, f64)>,
+    initial_shift: f64,
+) -> Option<PeriodicTrimEntryShiftCandidate> {
+    let first_entry = entries.first()?;
+    let first_start =
+        uv_axis(*first_entry.topology_points.first()?, axis) + initial_shift;
+    let init = (
+        Vec::with_capacity(entries.len()),
+        None,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        0.0,
+    );
+    let (shifts, previous_end, min, max, domain_overflow) =
+        entries.iter().enumerate().try_fold(
+            init,
+            |(mut shifts, previous_end, min, max, overflow), (index, entry)| {
+                let shift = if index == 0 {
+                    initial_shift
+                } else {
+                    let previous_end = previous_end?;
+                    closest_periodic_shift(
+                        uv_axis(*entry.topology_points.first()?, axis),
+                        previous_end,
+                        period,
+                    )
+                };
+                let (entry_min, entry_max, entry_overflow) =
+                    shifted_entry_axis_metrics(entry, axis, shift, range)?;
+                shifts.push(shift);
+                Some((
+                    shifts,
+                    entry
+                        .topology_points
+                        .last()
+                        .map(|point| uv_axis(*point, axis) + shift),
+                    min.min(entry_min),
+                    max.max(entry_max),
+                    overflow + entry_overflow,
+                ))
+            },
+        )?;
+    let previous_end = previous_end?;
+    Some(PeriodicTrimEntryShiftCandidate {
+        shifts,
+        closure_error: (previous_end - first_start).abs(),
+        domain_overflow,
+        span: max - min,
+    })
+}
+
+fn periodic_shift_score_cmp(
+    lhs: &PeriodicTrimEntryShiftCandidate,
+    rhs: &PeriodicTrimEntryShiftCandidate,
+) -> Ordering {
+    lhs.closure_error
+        .total_cmp(&rhs.closure_error)
+        .then(lhs.domain_overflow.total_cmp(&rhs.domain_overflow))
+        .then(lhs.span.total_cmp(&rhs.span))
+}
+
+fn closest_periodic_shift(value: f64, target: f64, period: f64) -> f64 {
+    (-4..=4)
+        .map(|lap| lap as f64 * period)
+        .min_by(|lhs, rhs| {
+            (value + *lhs - target)
+                .abs()
+                .total_cmp(&(value + *rhs - target).abs())
+        })
+        .unwrap_or(0.0)
+}
+
+fn shifted_entry_axis_metrics(
+    entry: &TrimEdgeCurve,
+    axis: usize,
+    shift: f64,
+    range: Option<(f64, f64)>,
+) -> Option<(f64, f64, f64)> {
+    entry
+        .topology_points
+        .iter()
+        .map(|point| uv_axis(*point, axis) + shift)
+        .try_fold(
+            (f64::INFINITY, f64::NEG_INFINITY, 0.0),
+            |(min, max, overflow), value| {
+                value.is_finite().then(|| {
+                    (
+                        min.min(value),
+                        max.max(value),
+                        overflow + axis_domain_overflow(value, range),
+                    )
+                })
+            },
+        )
+}
+
+fn axis_domain_overflow(value: f64, range: Option<(f64, f64)>) -> f64 {
+    range
+        .map(|(min, max)| {
+            if value < min {
+                min - value
+            } else if value > max {
+                value - max
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0)
+}
+
+fn translate_trim_entry_axis(
+    entry: &mut TrimEdgeCurve,
+    axis: usize,
+    shift: f64,
+) {
+    if shift.abs() > TOLERANCE {
+        entry.curve.translate_axis(axis, shift);
+        entry.topology_points.iter_mut().for_each(|point| {
+            set_uv_axis(point, axis, uv_axis(*point, axis) + shift)
+        });
+    }
 }
 
 fn trim_edge_to_curve(
@@ -1726,7 +2188,10 @@ fn point2_to_homogeneous(point: Point2) -> Vector3 {
 
 #[cfg(test)]
 mod tests {
-    use std::{f64::consts::TAU, path::Path};
+    use std::{
+        f64::consts::{PI, TAU},
+        path::Path,
+    };
 
     use super::*;
     use monstertruck::{
@@ -2008,8 +2473,8 @@ mod tests {
             surface,
         };
 
-        let nsi_surface =
-            face_to_nsi(0, &face, &[]).expect("cylinder should export to NSI");
+        let nsi_surface = face_to_nsi(0, &face, &[], TrimSenseMode::PerLoop)
+            .expect("cylinder should export to NSI");
 
         assert_eq!(nsi_surface.nv, 2);
         assert_eq!(nsi_surface.face_index, 0);
@@ -2074,6 +2539,157 @@ mod tests {
         assert_eq!(trims.nloops, 2);
         assert_eq!(trims.ncurves, vec![1, 1]);
         assert_eq!(trims.sense, vec![0, 1]);
+    }
+
+    #[test]
+    #[cfg(feature = "nsi-render")]
+    fn scalar_compatible_trim_sense_uses_fixed_outside_sense() {
+        let surface =
+            Surface::ElementarySurface(ElementarySurface::Plane(Plane::xy()));
+        let mut hole = rectangle_parameter_curve(&surface, 0.5, 1.0, 0.5, 1.0);
+        hole.invert();
+        let boundaries = vec![
+            vec![edge_use_with_trim(rectangle_parameter_curve(
+                &surface, 0.0, 2.0, 0.0, 2.0,
+            ))],
+            vec![edge_use_with_trim(hole)],
+        ];
+
+        let trims = trims_to_nsi_data_with_mode(
+            &boundaries,
+            &[],
+            &surface,
+            TrimSenseMode::ScalarCompatible,
+        )
+        .expect("trim extraction should succeed")
+        .expect("trim data should be emitted");
+
+        assert_eq!(trims.nloops, 2);
+        assert_eq!(trims.ncurves, vec![1, 1]);
+        assert_eq!(trims.sense, vec![1, 1]);
+        assert!(uv_near(trim_point(&trims, 0), Point2::new(0.0, 0.0)));
+        assert!(uv_near(trim_point(&trims, 1), Point2::new(0.0, 2.0)));
+        let hole_start = usize::try_from(trims.n[0])
+            .expect("trim point count should fit usize");
+        assert!(uv_near(
+            trim_point(&trims, hole_start),
+            Point2::new(0.5, 0.5)
+        ));
+        assert!(uv_near(
+            trim_point(&trims, hole_start + 1),
+            Point2::new(0.5, 1.0)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "nsi-render")]
+    fn boxy_face_12_scalar_trim_sense_uses_fixed_outside_sense() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/boxy_with_surfacetex.stp");
+        let scene = monster_step_viewer::load_step_file(&path)
+            .expect("STEP fixture should load");
+        let shell_data = scene
+            .shells
+            .first()
+            .and_then(|shell| shell.original_shell.as_ref())
+            .expect("STEP fixture should preserve original shell data");
+        let shell: &StepCompressedShell = shell_data
+            .downcast_ref()
+            .expect("STEP fixture should preserve compressed BRep data");
+        let face_index = 11;
+        let nsi_surface = face_to_nsi(
+            face_index,
+            &shell.faces[face_index],
+            &shell.edges,
+            TrimSenseMode::ScalarCompatible,
+        )
+        .expect("face should export to NSI");
+        let trims = nsi_surface.trims.expect("face should be trimmed");
+
+        assert_eq!(trims.nloops, 1);
+        assert_eq!(trims.sense, vec![1]);
+    }
+
+    #[test]
+    #[cfg(feature = "nsi-render")]
+    fn ap224_face_22_trim_uses_positive_cone_lap() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/ap224_995277945.stp");
+        let scene = monster_step_viewer::load_step_file(&path)
+            .expect("STEP fixture should load");
+        let shell_data = scene
+            .shells
+            .first()
+            .and_then(|shell| shell.original_shell.as_ref())
+            .expect("STEP fixture should preserve original shell data");
+        let shell: &StepCompressedShell = shell_data
+            .downcast_ref()
+            .expect("STEP fixture should preserve compressed BRep data");
+        let face_index = 21;
+        [TrimSenseMode::PerLoop, TrimSenseMode::ScalarCompatible]
+            .into_iter()
+            .for_each(|trim_sense_mode| {
+                let nsi_surface = face_to_nsi(
+                    face_index,
+                    &shell.faces[face_index],
+                    &shell.edges,
+                    trim_sense_mode,
+                )
+                .expect("face should export to NSI");
+                let trims = nsi_surface.trims.expect("face should be trimmed");
+                let (min_u, max_u) = trim_u_range(&trims);
+
+                assert!(
+                    min_u >= PI - 1.0e-4,
+                    "one-based face 22 {trim_sense_mode:?} should stay on the positive cone lap, got min_u={min_u}"
+                );
+                assert!(
+                    max_u <= TAU + 1.0e-4,
+                    "one-based face 22 {trim_sense_mode:?} should stay inside the cone period, got max_u={max_u}"
+                );
+            });
+    }
+
+    #[test]
+    #[cfg(feature = "nsi-render")]
+    fn ap224_face_40_seam_trim_stays_inside_exported_cone_domain() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/ap224_995277945.stp");
+        let scene = monster_step_viewer::load_step_file(&path)
+            .expect("STEP fixture should load");
+        let shell_data = scene
+            .shells
+            .first()
+            .and_then(|shell| shell.original_shell.as_ref())
+            .expect("STEP fixture should preserve original shell data");
+        let shell: &StepCompressedShell = shell_data
+            .downcast_ref()
+            .expect("STEP fixture should preserve compressed BRep data");
+        let face_index = 39;
+        [TrimSenseMode::PerLoop, TrimSenseMode::ScalarCompatible]
+            .into_iter()
+            .for_each(|trim_sense_mode| {
+                let nsi_surface = face_to_nsi(
+                    face_index,
+                    &shell.faces[face_index],
+                    &shell.edges,
+                    trim_sense_mode,
+                )
+                .expect("face should export to NSI");
+                let trims = nsi_surface.trims.expect("face should be trimmed");
+                let (min_u, max_u) = trim_u_range(&trims);
+
+                assert!(
+                    min_u >= nsi_surface.umin as f64 - 1.0e-4,
+                    "one-based face 40 {trim_sense_mode:?} should stay inside exported cone u-domain, got min_u={min_u}, umin={}",
+                    nsi_surface.umin
+                );
+                assert!(
+                    max_u <= nsi_surface.umax as f64 + 1.0e-4,
+                    "one-based face 40 {trim_sense_mode:?} should stay inside exported cone u-domain, got max_u={max_u}, umax={}",
+                    nsi_surface.umax
+                );
+            });
     }
 
     #[test]
@@ -2274,9 +2890,13 @@ mod tests {
             .downcast_ref()
             .expect("STEP fixture should preserve compressed BRep data");
         let face_index = 11;
-        let nsi_surface =
-            face_to_nsi(face_index, &shell.faces[face_index], &shell.edges)
-                .expect("face should export to NSI");
+        let nsi_surface = face_to_nsi(
+            face_index,
+            &shell.faces[face_index],
+            &shell.edges,
+            TrimSenseMode::PerLoop,
+        )
+        .expect("face should export to NSI");
         let trims = nsi_surface.trims.expect("face should be trimmed");
 
         assert_trim_loops_are_connected(
@@ -2322,18 +2942,41 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_boxy_face_34_nsi_payload() {
-        dump_boxy_face_nsi_payload(33);
+        dump_step_face_nsi_payload("step-files/boxy_with_surfacetex.stp", 33);
     }
 
     #[test]
     #[ignore]
     fn dump_boxy_face_12_nsi_payload() {
-        dump_boxy_face_nsi_payload(11);
+        dump_step_face_nsi_payload("step-files/boxy_with_surfacetex.stp", 11);
     }
 
-    fn dump_boxy_face_nsi_payload(face_index: usize) {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("step-files/boxy_with_surfacetex.stp");
+    #[test]
+    #[ignore]
+    fn dump_ap224_face_21_nsi_payload() {
+        dump_step_face_nsi_payload("step-files/ap224_995277945.stp", 20);
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_ap224_face_22_nsi_payload() {
+        dump_step_face_nsi_payload("step-files/ap224_995277945.stp", 21);
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_ap224_face_39_nsi_payload() {
+        dump_step_face_nsi_payload("step-files/ap224_995277945.stp", 38);
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_ap224_face_40_nsi_payload() {
+        dump_step_face_nsi_payload("step-files/ap224_995277945.stp", 39);
+    }
+
+    fn dump_step_face_nsi_payload(fixture: &str, face_index: usize) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
         let scene = monster_step_viewer::load_step_file(&path)
             .expect("STEP fixture should load");
         let shell_data = scene
@@ -2398,10 +3041,32 @@ mod tests {
                 trim_loop.topology_points,
             );
         });
-        let nsi_surface = face_to_nsi(face_index, face, &shell.edges)
+        dump_step_face_nsi_payload_for_mode(
+            face_index,
+            face,
+            &shell.edges,
+            TrimSenseMode::PerLoop,
+        );
+        #[cfg(feature = "nsi-render")]
+        dump_step_face_nsi_payload_for_mode(
+            face_index,
+            face,
+            &shell.edges,
+            TrimSenseMode::ScalarCompatible,
+        );
+    }
+
+    fn dump_step_face_nsi_payload_for_mode(
+        face_index: usize,
+        face: &StepCompressedFace,
+        edges: &[CompressedEdge<Curve3D>],
+        trim_sense_mode: TrimSenseMode,
+    ) {
+        let nsi_surface = face_to_nsi(face_index, face, edges, trim_sense_mode)
             .expect("face should export to NSI");
         eprintln!(
-            "nsi surface face={} nu={} nv={} uorder={} vorder={} u=[{}..{}] v=[{}..{}] fallbacks={}",
+            "nsi {:?} surface face={} nu={} nv={} uorder={} vorder={} u=[{}..{}] v=[{}..{}] fallbacks={}",
+            trim_sense_mode,
             nsi_surface.face_index + 1,
             nsi_surface.nu,
             nsi_surface.nv,
@@ -2414,14 +3079,18 @@ mod tests {
             nsi_surface.sampled_trim_fallback_count,
         );
         if let Some(trims) = &nsi_surface.trims {
-            eprintln!(
-                "trims nloops={} ncurves={:?} n={:?} order={:?} sense={:?}",
-                trims.nloops, trims.ncurves, trims.n, trims.order, trims.sense,
-            );
-            eprintln!("trim u={:?}", trims.u);
-            eprintln!("trim v={:?}", trims.v);
-            eprintln!("trim w={:?}", trims.w);
+            dump_trim_payload(trims);
         }
+    }
+
+    fn dump_trim_payload(trims: &NsiBrepTrimData) {
+        eprintln!(
+            "trims nloops={} ncurves={:?} n={:?} order={:?} sense={:?}",
+            trims.nloops, trims.ncurves, trims.n, trims.order, trims.sense,
+        );
+        eprintln!("trim u={:?}", trims.u);
+        eprintln!("trim v={:?}", trims.v);
+        eprintln!("trim w={:?}", trims.w);
     }
 
     fn trim_point(trims: &NsiBrepTrimData, index: usize) -> Point2 {
@@ -2429,6 +3098,17 @@ mod tests {
             trims.u[index] as f64 / trims.w[index] as f64,
             trims.v[index] as f64 / trims.w[index] as f64,
         )
+    }
+
+    fn trim_u_range(trims: &NsiBrepTrimData) -> (f64, f64) {
+        trims
+            .u
+            .iter()
+            .zip(trims.w.iter())
+            .map(|(u, w)| *u as f64 / *w as f64)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), u| {
+                (min.min(u), max.max(u))
+            })
     }
 
     fn assert_trim_loops_are_connected(

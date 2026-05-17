@@ -1,2 +1,4 @@
 [build]
 filehash = false
+# Use the wasm-tuned release profile (see Cargo.toml).
+cargo_profile = "wasm-release"

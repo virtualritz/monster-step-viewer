@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 ehttp = "0.7"
-monstertruck = { git = "https://github.com/virtualritz/monstertruck.git", rev = "9a7796a8662f44cefda295f4d1752ee67406bb8c", features = [
+monstertruck = { git = "https://github.com/virtualritz/monstertruck.git", features = [
     "step",
     "meshing",
     "solid",
@@ -58,8 +58,19 @@ nsi-export = []
 # (`/usr/local/3delight/...` or `$DELIGHT`).
 nsi-render = ["dep:nsi", "dep:crossbeam"]
 
+# Native release: maximum perf.
 [profile.release]
-opt-level = 2 # fast and small wasm
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# WASM release: smaller binary, faster link. Trunk.toml selects this via
+# `cargo_profile`.
+[profile.wasm-release]
+inherits = "release"
+opt-level = 2
+lto = "thin"
+codegen-units = 16
 
 # Optimize all dependencies even in debug builds:
 [profile.dev.package."*"]

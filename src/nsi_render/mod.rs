@@ -15,9 +15,8 @@
 //!   sent once per shell — subsequent calls with the same key replace the
 //!   surfaces.
 //! * `update_camera(...)` posts new camera attributes and sends `Sync`.
-//! * `set_face_visibility(key, face_index, visible)` toggles all visibility
-//!   attributes on one face's `attributes` node and sends `Sync`. No geometry
-//!   re-push.
+//! * `set_face_visibilities(...)` toggles all visibility attributes for a batch
+//!   of face `attributes` nodes and sends one `Sync`. No geometry re-push.
 //! * `stop()` halts the render thread; geometry stays alive in the context
 //!   unless dropped.
 
@@ -316,7 +315,8 @@ impl NsiRenderState {
         shell_data: &CompressedShellData,
         model_matrix: Mat4,
     ) {
-        let surfaces = brep::shell_data_to_nsi_surfaces(shell_data);
+        let surfaces =
+            brep::shell_data_to_nsi_surfaces_for_scalar_trim_sense(shell_data);
         if surfaces.is_empty() {
             self.hide_shell_faces(key);
             return;
@@ -533,44 +533,36 @@ impl NsiRenderState {
 
     fn set_attribute_node_visibility(&self, attrib: &str, visible: bool) {
         let value = i32::from(visible);
-        self.context.set_attribute(
-            attrib,
-            &[
-                nsi::i32!("visibility", value),
-                nsi::i32!("visibility.camera", value),
-                nsi::i32!("visibility.diffuse", value),
-                nsi::i32!("visibility.hair", value),
-                nsi::i32!("visibility.reflection", value),
-                nsi::i32!("visibility.refraction", value),
-                nsi::i32!("visibility.shadow", value),
-                nsi::i32!("visibility.specular", value),
-                nsi::i32!("visibility.volume", value),
-            ],
-        );
+        self.context
+            .set_attribute(attrib, &[nsi::i32!("visibility", value)]);
     }
 
-    /// Toggle all visibility attributes on one face's attributes node.
-    pub fn set_face_visibility(
+    /// Toggle all visibility attributes for a batch of face attributes nodes.
+    pub fn set_face_visibilities<'a>(
         &self,
-        key: &str,
-        face_index: usize,
-        visible: bool,
+        updates: impl IntoIterator<Item = (&'a str, usize, bool)>,
     ) {
-        let attrib = {
+        let attribs: Vec<(String, bool)> = {
             let handles = self.brep_handles.lock();
-            handles.get(key).and_then(|entry| {
-                entry
-                    .surfaces
-                    .iter()
-                    .find(|surface| surface.face_index == face_index)
-                    .map(|surface| surface.attrib.clone())
-            })
+            updates
+                .into_iter()
+                .filter_map(|(key, face_index, visible)| {
+                    handles.get(key).and_then(|entry| {
+                        entry
+                            .surfaces
+                            .iter()
+                            .find(|surface| surface.face_index == face_index)
+                            .map(|surface| (surface.attrib.clone(), visible))
+                    })
+                })
+                .collect()
         };
-        let Some(attrib) = attrib else {
-            return;
-        };
-        self.set_attribute_node_visibility(&attrib, visible);
-        self.send_command(NsiCommand::Synchronize);
+        if !attribs.is_empty() {
+            attribs.iter().for_each(|(attrib, visible)| {
+                self.set_attribute_node_visibility(attrib, *visible);
+            });
+            self.send_command(NsiCommand::Synchronize);
+        }
     }
 
     /// Hide every face currently tracked for one shell.

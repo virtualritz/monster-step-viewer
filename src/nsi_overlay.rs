@@ -9,8 +9,8 @@
 //! * Geometry is pushed exactly once per shell, when the overlay is first
 //!   enabled with a loaded scene (or when the scene reloads).
 //! * Camera updates: `set_attribute` on the camera + `Synchronize`.
-//! * Visibility updates: `set_attribute("visibility.*", ...)` on each face's
-//!   attribute node + `Synchronize`. No geometry re-push.
+//! * Visibility updates: `set_attribute("visibility.*", ...)` on each changed
+//!   face's attribute node + one batched `Synchronize`. No geometry re-push.
 
 use std::collections::{HashMap, HashSet};
 
@@ -215,9 +215,11 @@ fn push_visibility_to_nsi(
     }
 
     if let Some(render) = overlay.render.as_ref() {
-        for (_, source_face_id, key, visible) in &updates {
-            render.set_face_visibility(key, *source_face_id, *visible);
-        }
+        render.set_face_visibilities(updates.iter().map(
+            |(_, source_face_id, key, visible)| {
+                (key.as_str(), *source_face_id, *visible)
+            },
+        ));
     }
     for (shell_id, source_face_id, _, visible) in updates {
         overlay
