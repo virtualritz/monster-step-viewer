@@ -97,6 +97,7 @@ fn main() {
         meshing: settings.meshing,
         applied_meshing: settings.meshing,
         meshing_panel_expanded: settings.meshing_panel_expanded,
+        up_axis: settings.up_axis,
         mode: settings.mode,
         clip_planes: settings.clip_planes,
         shading_mode: settings.shading_mode,
@@ -200,6 +201,7 @@ fn main() {
     .add_systems(Update, scene::update_face_state_buffer)
     .add_systems(Update, scene::disable_camera_when_egui_wants_input)
     .add_systems(Update, scene::handle_view_shortcuts)
+    .add_systems(Update, scene::apply_up_axis_change)
     .add_systems(Update, scene::clear_selection_on_empty_click)
     .add_systems(Update, scene::draw_gizmos)
     .add_systems(Update, scene::retessellate_face)

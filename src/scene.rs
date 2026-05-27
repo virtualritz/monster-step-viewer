@@ -10,7 +10,7 @@ use bevy::{
 };
 use bevy_editor_cam::{
     input::{CameraPointerMap, EditorCamInputMessage, MotionKind},
-    prelude::{EditorCam, EnabledMotion},
+    prelude::{EditorCam, EnabledMotion, OrbitConstraint},
 };
 use bevy_egui::{EguiContexts, EguiGlobalSettings, PrimaryEguiContext};
 use monster_step_viewer::{
@@ -32,7 +32,8 @@ use crate::{
         ClipPlaneHandle, EdgeRecord, FaceRecord, IsoparamsMaterial,
         IsoparamsMesh, KEY_LIGHT_ILLUMINANCE, LoadJob, LoopRecord, MainCamera,
         NEUTRAL_GRAY, PolygonEdgesMaterial, PolygonEdgesMesh, Selection,
-        ShadingMode, ShellMesh, ShellRecord, ViewerState, ViewportClickGuard,
+        ShadingMode, ShellMesh, ShellRecord, UpAxis, ViewerState,
+        ViewportClickGuard,
     },
     viewer_material::{
         ATTRIBUTE_FACE_ID, FACE_STATE_HIDDEN, FACE_STATE_HOVERED,
@@ -1282,9 +1283,10 @@ pub(crate) fn normalize_scene_and_setup_camera(
         max_dimension(bounds)
     );
 
+    let up = state.up_axis;
     if let Ok((mut transform, mut editor_cam)) = camera_query.single_mut() {
         let camera_distance =
-            frame_camera_initial(bounds, &mut transform, &mut editor_cam);
+            frame_camera_initial(bounds, &mut transform, &mut editor_cam, up);
 
         log::info!(
             "Camera setup: focus=({:.2}, {:.2}, {:.2}), distance={:.2}",
@@ -1372,10 +1374,21 @@ pub(crate) fn rebuild_meshes_on_toggle(
     let updates: Vec<ShellColorUpdate> = jobs
         .into_par_iter()
         .map(|job| {
+            // `vertex_face_index` holds GLOBAL face ids, but `face_colors`
+            // is this shell's local Vec — map global id -> color so any
+            // shell (base_face_id != 0) resolves correctly.
+            let color_by_fid: HashMap<u32, [f32; 4]> = job
+                .face_ids
+                .iter()
+                .zip(job.face_colors.iter())
+                .map(|(&fid, &color)| (fid as u32, color))
+                .collect();
             let new_colors: Vec<[f32; 4]> = job
                 .vertex_face_index
                 .iter()
-                .map(|&fi| job.face_colors[fi as usize])
+                .map(|&fi| {
+                    color_by_fid.get(&fi).copied().unwrap_or(NEUTRAL_GRAY)
+                })
                 .collect();
             let face_ui_updates: Vec<(usize, [f32; 3])> = job
                 .face_ids
@@ -1525,6 +1538,33 @@ fn view_shortcut_action(
     }
 }
 
+/// Re-frame the camera with the new up axis when the toolbar button flips
+/// `state.up_axis`. The model isn't touched — only the orbit-up and camera
+/// pose change.
+pub(crate) fn apply_up_axis_change(
+    mut state: ResMut<ViewerState>,
+    mut camera_query: Query<
+        (&mut Transform, &mut EditorCam),
+        With<MainCamera>,
+    >,
+) {
+    if !state.up_axis_changed {
+        return;
+    }
+    state.up_axis_changed = false;
+    let up = state.up_axis;
+    let Ok((mut transform, mut editor_cam)) = camera_query.single_mut() else {
+        return;
+    };
+    // Re-frame around the current scene bounds if we have them, otherwise
+    // just re-pin the orbit up so the next frame is correct.
+    if let Some(bounds) = state.current_bounds {
+        frame_camera_initial(bounds, &mut transform, &mut editor_cam, up);
+    } else {
+        set_orbit_up(&mut editor_cam, up);
+    }
+}
+
 pub(crate) fn handle_view_shortcuts(
     mut contexts: EguiContexts,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -1548,6 +1588,7 @@ pub(crate) fn handle_view_shortcuts(
         return;
     };
 
+    let up = state.up_axis;
     let Ok((mut transform, mut editor_cam)) = camera_query.single_mut() else {
         return;
     };
@@ -1555,17 +1596,32 @@ pub(crate) fn handle_view_shortcuts(
     match action {
         ViewShortcutAction::ResetView => {
             if let Some(bounds) = state.current_bounds {
-                frame_camera_initial(bounds, &mut transform, &mut editor_cam);
+                frame_camera_initial(
+                    bounds,
+                    &mut transform,
+                    &mut editor_cam,
+                    up,
+                );
             }
         }
         ViewShortcutAction::FrameScene => {
             if let Some(bounds) = state.current_bounds {
-                focus_camera_on_bounds(bounds, &mut transform, &mut editor_cam);
+                focus_camera_on_bounds(
+                    bounds,
+                    &mut transform,
+                    &mut editor_cam,
+                    up,
+                );
             }
         }
         ViewShortcutAction::CenterSelection => {
             if let Some(bounds) = selected_face_bounds(&state, &meshes) {
-                focus_camera_on_bounds(bounds, &mut transform, &mut editor_cam);
+                focus_camera_on_bounds(
+                    bounds,
+                    &mut transform,
+                    &mut editor_cam,
+                    up,
+                );
             }
         }
     }
@@ -1643,14 +1699,21 @@ fn frame_distance_for_bounds(bounds: Bounds) -> f32 {
     (max_dimension(bounds) * 1.5).max(1.0e-3)
 }
 
-fn initial_camera_offset(distance: f32) -> Vec3 {
+fn initial_camera_offset(distance: f32, up: UpAxis) -> Vec3 {
     let yaw = FRAC_PI_4;
     let pitch = FRAC_PI_6;
-    Vec3::new(
-        distance * yaw.cos() * pitch.cos(),
-        distance * pitch.sin(),
-        distance * yaw.sin() * pitch.cos(),
-    )
+    let horiz = distance * pitch.cos();
+    let elev = distance * pitch.sin();
+    // Elevate along the chosen up axis; the other two axes form the ground
+    // plane the camera orbits in.
+    match up {
+        UpAxis::Y => {
+            Vec3::new(horiz * yaw.cos(), elev, horiz * yaw.sin())
+        }
+        UpAxis::Z => {
+            Vec3::new(horiz * yaw.cos(), horiz * yaw.sin(), elev)
+        }
+    }
 }
 
 fn update_editor_cam_anchor(editor_cam: &mut EditorCam, distance: f32) {
@@ -1658,14 +1721,24 @@ fn update_editor_cam_anchor(editor_cam: &mut EditorCam, distance: f32) {
     editor_cam.current_motion = Default::default();
 }
 
+/// Pin the orbit so the given world axis stays vertical.
+fn set_orbit_up(editor_cam: &mut EditorCam, up: UpAxis) {
+    editor_cam.orbit_constraint = OrbitConstraint::Fixed {
+        up: up.vec(),
+        can_pass_tdc: false,
+    };
+}
+
 fn frame_camera_initial(
     bounds: Bounds,
     transform: &mut Transform,
     editor_cam: &mut EditorCam,
+    up: UpAxis,
 ) -> f32 {
     let distance = frame_distance_for_bounds(bounds);
-    transform.translation = bounds.center + initial_camera_offset(distance);
-    *transform = transform.looking_at(bounds.center, Vec3::Y);
+    transform.translation = bounds.center + initial_camera_offset(distance, up);
+    *transform = transform.looking_at(bounds.center, up.vec());
+    set_orbit_up(editor_cam, up);
     update_editor_cam_anchor(editor_cam, distance);
     distance
 }
@@ -1674,13 +1747,15 @@ fn focus_camera_on_bounds(
     bounds: Bounds,
     transform: &mut Transform,
     editor_cam: &mut EditorCam,
+    up: UpAxis,
 ) -> f32 {
     let distance = (transform.translation - bounds.center)
         .length()
         .max(frame_distance_for_bounds(bounds));
     let forward = transform.forward().as_vec3();
     transform.translation = bounds.center - forward * distance;
-    *transform = transform.looking_at(bounds.center, Vec3::Y);
+    *transform = transform.looking_at(bounds.center, up.vec());
+    set_orbit_up(editor_cam, up);
     update_editor_cam_anchor(editor_cam, distance);
     distance
 }

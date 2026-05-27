@@ -1785,6 +1785,34 @@ fn viewer_ui(
                             }
                             poly_edges_btn.on_hover_text("Polygon edges");
 
+                            // Up-axis flip — a plain button (not a toggle):
+                            // the current up axis is shown first, the other
+                            // second, and the two swap positions each press.
+                            // Plain ASCII text, not a Material Symbols glyph.
+                            let up_btn = ui.add_sized(
+                                egui::vec2(
+                                    TOOLBAR_ICON_BUTTON_SIZE,
+                                    TOOLBAR_ICON_BUTTON_SIZE,
+                                ),
+                                egui::Button::new(
+                                    egui::RichText::new(format!(
+                                        "{}/{}",
+                                        state.up_axis.letter(),
+                                        state.up_axis.toggled().letter(),
+                                    ))
+                                    .size(16.0),
+                                ),
+                            );
+                            if up_btn.clicked() {
+                                state.up_axis = state.up_axis.toggled();
+                                state.up_axis_changed = true;
+                                state.settings_dirty = true;
+                            }
+                            up_btn.on_hover_text(format!(
+                                "Up axis: {} (click to swap)",
+                                state.up_axis.letter()
+                            ));
+
                             #[cfg(all(
                                 feature = "nsi-render",
                                 not(target_arch = "wasm32")

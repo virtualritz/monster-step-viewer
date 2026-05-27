@@ -30,6 +30,46 @@ pub(crate) enum AppMode {
     Browser,
 }
 
+/// Which model axis points up in the viewport. STEP geometry has no
+/// recorded up axis; mechanical CAD is overwhelmingly Z-up, so that's the
+/// default, with a manual toggle for the rare Y-up file. This only affects
+/// the camera (orbit up + framing) — geometry, clip planes and gizmos stay
+/// in model coordinates.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub(crate) enum UpAxis {
+    #[default]
+    Z,
+    Y,
+}
+
+impl UpAxis {
+    /// The world-space up vector for this axis.
+    pub fn vec(self) -> Vec3 {
+        match self {
+            Self::Z => Vec3::Z,
+            Self::Y => Vec3::Y,
+        }
+    }
+
+    /// Flip Y<->Z.
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Z => Self::Y,
+            Self::Y => Self::Z,
+        }
+    }
+
+    /// Single-letter label for the toolbar button.
+    pub fn letter(self) -> &'static str {
+        match self {
+            Self::Z => "Z",
+            Self::Y => "Y",
+        }
+    }
+}
+
 /// Mode selector for the Meshing panel.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
@@ -240,6 +280,10 @@ pub(crate) struct ViewerState {
     pub applied_meshing: MeshingOptions,
     /// Whether the Meshing rollout panel is expanded.
     pub meshing_panel_expanded: bool,
+    /// Which model axis is treated as up by the camera.
+    pub up_axis: UpAxis,
+    /// Set when `up_axis` changed and the camera needs re-framing.
+    pub up_axis_changed: bool,
     /// Flag to trigger visibility update (avoids costly is_changed() checks).
     pub visibility_changed: bool,
     /// Scene normalization: original center (for wireframe rendering).
@@ -333,6 +377,8 @@ impl Default for ViewerState {
             meshing: MeshingOptions::default(),
             applied_meshing: MeshingOptions::default(),
             meshing_panel_expanded: false,
+            up_axis: UpAxis::default(),
+            up_axis_changed: false,
             visibility_changed: false,
             scene_center: Vec3::ZERO,
             scene_scale: 1.0,
