@@ -1,0 +1,97 @@
+name: Build macOS (DMG)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          targets: aarch64-apple-darwin
+
+      # monstertruck is a private git dependency. Set the SALMON_PAT repo secret
+      # to a PAT with read access. Remove this step if it is ever made public.
+      - name: Configure git for private repos
+        run: |
+          git config --global url."https://${{ secrets.SALMON_PAT }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-release-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            macos-release-cargo-
+
+      - name: Install cargo-binstall
+        run: curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+
+      - name: Install cargo-packager
+        run: cargo binstall -y --force cargo-packager
+
+      - name: Build aarch64
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          mkdir -p target/release
+          cp target/aarch64-apple-darwin/release/mstpv target/release/
+
+      - name: Package DMG
+        run: cargo packager --release --formats dmg
+
+      - name: Create tar.gz archive
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          tar -czf "target/release/mstpv-${VERSION}-aarch64-apple-darwin.tar.gz" \
+            -C target/aarch64-apple-darwin/release mstpv
+
+      - name: Rename packages with version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          for f in target/release/*.dmg; do
+            mv "$f" "target/release/mstpv-${VERSION}-aarch64-apple-darwin.dmg"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-packages
+          path: |
+            target/release/*.dmg
+            target/release/*.tar.gz
+          retention-days: 30
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          draft: true
+          files: |
+            target/release/*.dmg
+            target/release/*.tar.gz

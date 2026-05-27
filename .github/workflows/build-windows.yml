@@ -1,0 +1,106 @@
+name: Build Windows (MSI)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          echo "version=v${version}" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          targets: x86_64-pc-windows-msvc
+
+      # monstertruck is a private git dependency. Set the SALMON_PAT repo secret
+      # to a PAT with read access. Remove this step if it is ever made public.
+      - name: Configure git for private repos
+        run: |
+          git config --global url."https://${{ secrets.SALMON_PAT }}@github.com/".insteadOf "https://github.com/"
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+          printf '[net]\ngit-fetch-with-cli = true\n' > "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+        shell: bash
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-release-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            windows-release-cargo-
+
+      - name: Install cargo-binstall
+        run: |
+          iwr https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-x86_64-pc-windows-msvc.zip -OutFile binstall.zip
+          Expand-Archive binstall.zip -DestinationPath $env:USERPROFILE\.cargo\bin -Force
+        shell: pwsh
+
+      - name: Install cargo-packager
+        run: cargo binstall -y --force cargo-packager
+
+      - name: Build release binary
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory -Force -Path target\release | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\mstpv.exe target\release\
+        shell: pwsh
+
+      - name: Package MSI
+        run: cargo packager --release --formats wix
+
+      - name: Create zip archive
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          Compress-Archive -Path "target\x86_64-pc-windows-msvc\release\mstpv.exe" -DestinationPath "target\release\mstpv-${version}-x86_64-pc-windows-msvc.zip"
+        shell: pwsh
+
+      - name: Rename packages with version
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          Get-ChildItem target\release\*.msi | ForEach-Object {
+            Move-Item $_.FullName "target\release\mstpv-${version}-x86_64-windows.msi"
+          }
+        shell: pwsh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-packages
+          path: |
+            target/release/*.msi
+            target/release/*.zip
+          retention-days: 30
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          draft: true
+          files: |
+            target/release/*.msi
+            target/release/*.zip

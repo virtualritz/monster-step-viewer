@@ -9,6 +9,25 @@ rust-version = "1.89"
 name = "mstpv"
 path = "src/main.rs"
 
+# cargo-packager config. `cargo packager --release --formats dmg` (macOS) and
+# `--formats wix` (Windows MSI) read this. Version is inherited from [package].
+[package.metadata.packager]
+product-name = "Monster STEP Viewer"
+identifier = "io.github.virtualritz.monster-step-viewer"
+publisher = "Moritz Moeller"
+description = "STEP CAD viewer with an optional 3Delight path-traced overlay"
+homepage = "https://github.com/virtualritz/monster-step-viewer"
+copyright = "Copyright (c) 2026 Moritz Moeller"
+icons = ["assets/icon-1024.png", "assets/icon-256.png", "assets/favicon.ico"]
+binaries = [{ path = "mstpv", main = true }]
+file-associations = [
+    { extensions = ["stp", "step"], mime-type = "application/step", description = "STEP CAD File" },
+]
+
+[package.metadata.packager.wix]
+
+[package.metadata.packager.dmg]
+
 [dependencies]
 anyhow = "1"
 bytemuck = "1"
