@@ -56,7 +56,11 @@ jobs:
           cp target/aarch64-apple-darwin/release/mstpv target/release/
 
       - name: Package DMG
-        run: cargo packager --release --formats dmg
+        run: |
+          # Stale packaged artifacts can be restored from the `target` cache;
+          # remove them so the archive/rename steps only see this run's output.
+          rm -f target/release/*.dmg target/release/*.tar.gz
+          cargo packager --release --formats dmg
 
       - name: Create tar.gz archive
         run: |

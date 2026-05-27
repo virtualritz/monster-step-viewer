@@ -61,19 +61,24 @@ jobs:
         shell: pwsh
 
       - name: Package MSI
-        run: cargo packager --release --formats wix
+        run: |
+          # Stale packaged artifacts can be restored from the `target` cache;
+          # remove them so the archive/rename steps only see this run's output.
+          Remove-Item target\release\*.msi, target\release\*.zip -Force -ErrorAction SilentlyContinue
+          cargo packager --release --formats wix
+        shell: pwsh
 
       - name: Create zip archive
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          Compress-Archive -Path "target\x86_64-pc-windows-msvc\release\mstpv.exe" -DestinationPath "target\release\mstpv-${version}-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path "target\x86_64-pc-windows-msvc\release\mstpv.exe" -DestinationPath "target\release\mstpv-${version}-x86_64-pc-windows-msvc.zip" -Force
         shell: pwsh
 
       - name: Rename packages with version
         run: |
           $version = "${{ steps.version.outputs.version }}"
           Get-ChildItem target\release\*.msi | ForEach-Object {
-            Move-Item $_.FullName "target\release\mstpv-${version}-x86_64-windows.msi"
+            Move-Item $_.FullName "target\release\mstpv-${version}-x86_64-windows.msi" -Force
           }
         shell: pwsh
 
