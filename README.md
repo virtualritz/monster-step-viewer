@@ -15,6 +15,7 @@ A 3D viewer for STEP (ISO 10303-21) CAD files, built with [`monstertruck`](https
 - Wireframe edge display (boundary edges).
 - Polygon-edge overlay (triangulated mesh edges) and isoparametric curve overlay.
 - Per-axis clip planes (X/Y/Z, flippable, with optional solidify).
+- Manual Y/Z up-axis toggle for files saved in either convention.
 - Bounding box visualization.
 - Pan/orbit camera controls with keyboard shortcuts.
 - Optional 3Delight (NSI) path-traced overlay — see [3Delight Rendering](#3delight-rendering).
@@ -65,6 +66,7 @@ mstpv
 | <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/deployed-code-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/deployed-code-outline.svg" width="20" alt=""></picture> | STEP curve wireframe |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/grid-on-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/grid-on-outline.svg" width="20" alt=""></picture> | Isoparametric curves |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/details.svg?color=white"><img src="https://api.iconify.design/material-symbols/details.svg" width="20" alt=""></picture> | Polygon (mesh) edges |
+| `Z/Y` | Up-axis toggle -- current axis first; clicking swaps |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/material-symbols/counter-3-outline.svg?color=white"><img src="https://api.iconify.design/material-symbols/counter-3-outline.svg" width="20" alt=""></picture> | 3Delight NSI overlay (requires `nsi-render`) |
 
 Per-axis clip planes (X/Y/Z) cycle Off → +axis → −axis → Off. The toolbar also has a tessellation-quality slider and a shading-mode picker.
