@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{HashMap, HashSet};
 
 use super::transform::Transform;
 
@@ -25,23 +25,23 @@ pub(crate) fn preprocess_step_entities(raw: &str) -> String {
 /// top-down.
 pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
     // Parse basic geometric entities.
-    let mut cartesian_points: HashMap<u64, [f64; 3]> = HashMap::new();
-    let mut directions: HashMap<u64, [f64; 3]> = HashMap::new();
-    let mut placement_refs: HashMap<u64, (u64, u64, u64)> = HashMap::new();
+    let mut cartesian_points: HashMap<u64, [f64; 3]> = HashMap::default();
+    let mut directions: HashMap<u64, [f64; 3]> = HashMap::default();
+    let mut placement_refs: HashMap<u64, (u64, u64, u64)> = HashMap::default();
     // ITEM_DEFINED_TRANSFORMATION: id -> (from_placement, to_placement).
-    let mut item_transforms: HashMap<u64, (u64, u64)> = HashMap::new();
+    let mut item_transforms: HashMap<u64, (u64, u64)> = HashMap::default();
     // REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION: (rep_1, rep_2,
     // transform_id).
     let mut rep_relationships: Vec<(u64, u64, u64)> = Vec::new();
     // MANIFOLD_SOLID_BREP: manifold_id -> shell_id.
-    let mut manifold_to_shell: HashMap<u64, u64> = HashMap::new();
+    let mut manifold_to_shell: HashMap<u64, u64> = HashMap::default();
     // ADVANCED_BREP_SHAPE_REPRESENTATION: absr_id -> Vec<all refs including
     // manifolds>.
-    let mut absr_refs: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut absr_refs: HashMap<u64, Vec<u64>> = HashMap::default();
     // SHAPE_REPRESENTATION_RELATIONSHIP: (rep_1, rep_2) - links reps.
     let mut shape_rep_relationships: Vec<(u64, u64)> = Vec::new();
     // SHAPE_REPRESENTATION: id -> Vec<item_refs>.
-    let mut _shape_reps: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut _shape_reps: HashMap<u64, Vec<u64>> = HashMap::default();
 
     // Preprocess: join multi-line entities.
     let joined = preprocess_step_entities(raw);
@@ -109,7 +109,7 @@ pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
     }
 
     // Resolve AXIS2_PLACEMENT_3D.
-    let mut resolved_placements: HashMap<u64, Transform> = HashMap::new();
+    let mut resolved_placements: HashMap<u64, Transform> = HashMap::default();
     for (&id, &(loc_id, axis_id, ref_id)) in &placement_refs {
         let location = cartesian_points
             .get(&loc_id)
@@ -154,7 +154,7 @@ pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
     );
 
     // Step 2: Build shape_rep_relationship map for traversal.
-    let mut shape_rep_map: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut shape_rep_map: HashMap<u64, Vec<u64>> = HashMap::default();
     for &(r1, r2) in &shape_rep_relationships {
         shape_rep_map.entry(r1).or_default().push(r2);
         shape_rep_map.entry(r2).or_default().push(r1);
@@ -165,7 +165,7 @@ pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
     log::info!("Transform roots: {}", roots.len());
 
     // BFS traversal from roots, accumulating transforms.
-    let mut rep_transforms: HashMap<u64, Transform> = HashMap::new();
+    let mut rep_transforms: HashMap<u64, Transform> = HashMap::default();
     let mut todo: Vec<(u64, Transform)> = roots
         .into_iter()
         .map(|r| (r, Transform::identity()))
@@ -201,7 +201,7 @@ pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
     );
 
     // Step 4: Map manifolds to their ABSR's transform.
-    let mut manifold_to_absr: HashMap<u64, u64> = HashMap::new();
+    let mut manifold_to_absr: HashMap<u64, u64> = HashMap::default();
     for (&absr_id, refs) in &absr_refs {
         for &ref_id in refs {
             if manifold_to_shell.contains_key(&ref_id) {
@@ -211,7 +211,7 @@ pub(crate) fn parse_assembly_transforms(raw: &str) -> HashMap<u64, Transform> {
     }
 
     // Step 5: Build shell -> world transform.
-    let mut shell_transforms: HashMap<u64, Transform> = HashMap::new();
+    let mut shell_transforms: HashMap<u64, Transform> = HashMap::default();
     for (&manifold_id, &shell_id) in &manifold_to_shell {
         if let Some(&absr_id) = manifold_to_absr.get(&manifold_id)
             && let Some(&transform) = rep_transforms.get(&absr_id)
@@ -288,7 +288,7 @@ fn build_transform_stack_directed(
     placements: &HashMap<u64, Transform>,
     flip: bool,
 ) -> HashMap<u64, Vec<(u64, Transform)>> {
-    let mut stack: HashMap<u64, Vec<(u64, Transform)>> = HashMap::new();
+    let mut stack: HashMap<u64, Vec<(u64, Transform)>> = HashMap::default();
 
     for &(rep_1, rep_2, transform_id) in rep_relationships {
         let (parent, child) =
@@ -406,20 +406,20 @@ pub(crate) fn parse_step_float(s: &str) -> Option<f64> {
 /// Parse colors from raw STEP file content.
 /// Returns a map from styled entity ID to RGB color.
 pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
-    let mut colours: HashMap<u64, [f32; 3]> = HashMap::new();
+    let mut colours: HashMap<u64, [f32; 3]> = HashMap::default();
     // (style_refs, target_id).
     let mut styled_items: Vec<(Vec<u64>, u64)> = Vec::new();
     let mut fill_area_style_colour_to_colour: HashMap<u64, u64> =
-        HashMap::new();
-    let mut fill_area_style_to_fasc: HashMap<u64, u64> = HashMap::new();
+        HashMap::default();
+    let mut fill_area_style_to_fasc: HashMap<u64, u64> = HashMap::default();
     // SURFACE_STYLE_FILL_AREA -> FAS.
-    let mut ssfa_to_fas: HashMap<u64, u64> = HashMap::new();
+    let mut ssfa_to_fas: HashMap<u64, u64> = HashMap::default();
     // SURFACE_SIDE_STYLE -> SSFA.
-    let mut sss_to_ssfa: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut sss_to_ssfa: HashMap<u64, Vec<u64>> = HashMap::default();
     // SURFACE_STYLE_USAGE -> SSS.
-    let mut ssu_to_sss: HashMap<u64, u64> = HashMap::new();
-    let mut psa_to_styles: HashMap<u64, Vec<u64>> = HashMap::new();
-    let mut manifold_to_shell: HashMap<u64, u64> = HashMap::new();
+    let mut ssu_to_sss: HashMap<u64, u64> = HashMap::default();
+    let mut psa_to_styles: HashMap<u64, Vec<u64>> = HashMap::default();
+    let mut manifold_to_shell: HashMap<u64, u64> = HashMap::default();
 
     let joined = preprocess_step_entities(raw);
 
@@ -517,7 +517,7 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
 
     // Build color chain: follow references to find RGB values.
     // FASC -> COLOUR_RGB.
-    let mut fasc_colors: HashMap<u64, [f32; 3]> = HashMap::new();
+    let mut fasc_colors: HashMap<u64, [f32; 3]> = HashMap::default();
     for (&fasc_id, &colour_id) in &fill_area_style_colour_to_colour {
         if let Some(&rgb) = colours.get(&colour_id) {
             fasc_colors.insert(fasc_id, rgb);
@@ -525,7 +525,7 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
     }
 
     // FAS -> FASC -> COLOUR_RGB.
-    let mut fas_colors: HashMap<u64, [f32; 3]> = HashMap::new();
+    let mut fas_colors: HashMap<u64, [f32; 3]> = HashMap::default();
     for (&fas_id, &fasc_id) in &fill_area_style_to_fasc {
         if let Some(&rgb) = fasc_colors.get(&fasc_id) {
             fas_colors.insert(fas_id, rgb);
@@ -533,7 +533,7 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
     }
 
     // SSFA -> FAS -> ... -> COLOUR_RGB.
-    let mut ssfa_colors: HashMap<u64, [f32; 3]> = HashMap::new();
+    let mut ssfa_colors: HashMap<u64, [f32; 3]> = HashMap::default();
     for (&ssfa_id, &fas_id) in &ssfa_to_fas {
         if let Some(&rgb) = fas_colors.get(&fas_id) {
             ssfa_colors.insert(ssfa_id, rgb);
@@ -541,7 +541,7 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
     }
 
     // SSS -> SSFA -> ... -> COLOUR_RGB.
-    let mut sss_colors: HashMap<u64, [f32; 3]> = HashMap::new();
+    let mut sss_colors: HashMap<u64, [f32; 3]> = HashMap::default();
     for (&sss_id, ssfa_refs) in &sss_to_ssfa {
         for &ssfa_id in ssfa_refs {
             if let Some(&rgb) = ssfa_colors.get(&ssfa_id) {
@@ -552,7 +552,7 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
     }
 
     // SSU -> SSS -> ... -> COLOUR_RGB.
-    let mut ssu_colors: HashMap<u64, [f32; 3]> = HashMap::new();
+    let mut ssu_colors: HashMap<u64, [f32; 3]> = HashMap::default();
     for (&ssu_id, &sss_id) in &ssu_to_sss {
         if let Some(&rgb) = sss_colors.get(&sss_id) {
             ssu_colors.insert(ssu_id, rgb);
@@ -560,7 +560,7 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
     }
 
     // PSA -> SSU -> ... -> COLOUR_RGB.
-    let mut psa_colors: HashMap<u64, [f32; 3]> = HashMap::new();
+    let mut psa_colors: HashMap<u64, [f32; 3]> = HashMap::default();
     for (&psa_id, style_refs) in &psa_to_styles {
         for &style_id in style_refs {
             if let Some(&rgb) = ssu_colors.get(&style_id) {
@@ -571,7 +571,7 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
     }
 
     // STYLED_ITEM targets -> entity colors.
-    let mut shell_colors: HashMap<u64, [f32; 3]> = HashMap::new();
+    let mut shell_colors: HashMap<u64, [f32; 3]> = HashMap::default();
     for (style_refs, target_id) in &styled_items {
         // Find color through style refs.
         let mut found_color: Option<[f32; 3]> = None;
@@ -613,7 +613,7 @@ pub(crate) fn parse_step_colors(raw: &str) -> HashMap<u64, [f32; 3]> {
 /// Parse shell face entity references from raw STEP file content.
 pub(crate) fn parse_shell_face_refs(raw: &str) -> HashMap<u64, Vec<u64>> {
     let joined = preprocess_step_entities(raw);
-    let mut shell_faces = HashMap::new();
+    let mut shell_faces = HashMap::default();
 
     for entity in joined.split(';') {
         let entity = entity.trim();

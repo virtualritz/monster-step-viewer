@@ -35,16 +35,19 @@ file-associations = [
 [package.metadata.packager.dmg]
 
 [dependencies]
+ahash = "0.8"
 anyhow = "1"
 bytemuck = "1"
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.19", default-features = false, features = [
     "3d_bevy_render",
     "default_app",
     "default_platform",
     "picking",
 ] }
-bevy_egui = "0.39"
-bevy_editor_cam = "0.8"
+bevy_egui = "0.41"
+# No bevy 0.19 release yet; tracks the open upstream PR
+# (aevyrie/bevy_editor_cam#66). Switch back to a crates.io version once it lands.
+bevy_editor_cam = { git = "https://github.com/m-edlund/bevy_editor_cam.git", branch = "bevy-0.19" }
 futures-lite = "2"
 env_logger = "0.11"
 glam = "0.32"
@@ -56,7 +59,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 ehttp = "0.7"
-monstertruck = { version = "0.3.1", features = [
+monstertruck = { version = "0.3", features = [
     "step",
     "meshing",
     "solid",
@@ -72,6 +75,12 @@ meshopt = "0.6"
 # akatela's NSI integration, which we model the BRep export on.
 nsi = { git = "https://github.com/virtualritz/nsi.git", features = ["output"], optional = true }
 crossbeam = { version = "0.8", optional = true }
+
+# Track monstertruck's `main` rather than the crates.io release. The sibling
+# `monstertruck-*` crates resolve from the same checkout via their path deps, so
+# a single entry covers the whole workspace.
+[patch.crates-io]
+monstertruck = { git = "https://github.com/virtualritz/monstertruck.git" }
 
 [features]
 default = []

@@ -1,3 +1,5 @@
+pub use monster_step_viewer::{HashMap, HashSet};
+
 mod browser;
 mod icons;
 mod persistence;

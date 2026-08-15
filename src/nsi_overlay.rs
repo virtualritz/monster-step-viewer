@@ -12,7 +12,7 @@
 //! * Visibility updates: `set_attribute("visibility.*", ...)` on each changed
 //!   face's attribute node + one batched `Synchronize`. No geometry re-push.
 
-use std::collections::{HashMap, HashSet};
+use crate::{HashMap, HashSet};
 
 use bevy::prelude::*;
 use bevy_editor_cam::prelude::EditorCam;

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::HashMap;
 
 use monstertruck::meshing::prelude::*;
 use rayon::prelude::*;
@@ -74,7 +74,7 @@ pub(crate) fn extract_mesh_edges(
     // Count how many times each edge appears (using sorted vertex indices as
     // key).
     let mut edge_counts: HashMap<(usize, usize), Vec<(usize, usize)>> =
-        HashMap::new();
+        HashMap::default();
 
     for tri in tri_faces {
         let indices = [tri[0].pos, tri[1].pos, tri[2].pos];

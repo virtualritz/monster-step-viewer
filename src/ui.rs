@@ -25,7 +25,7 @@ use bevy::{
     ecs::system::SystemParam,
     prelude::{MessageWriter, *},
 };
-use bevy_egui::{EguiContextSettings, EguiContexts, PrimaryEguiContext, egui};
+use bevy_egui::{EguiContexts, egui};
 #[cfg(all(feature = "nsi-export", not(target_arch = "wasm32")))]
 use glam::Mat4 as NsiMat4;
 use monster_step_viewer::Parameter;
@@ -38,8 +38,6 @@ const TOOLBAR_ICON_BUTTON_SIZE: f32 = 26.0;
 type MainCameraViewportQuery<'w, 's> =
     Query<'w, 's, &'static mut Camera, With<MainCamera>>;
 type WindowQuery<'w, 's> = Query<'w, 's, &'static Window>;
-type EguiSettingsQuery<'w, 's> =
-    Query<'w, 's, &'static mut EguiContextSettings, With<PrimaryEguiContext>>;
 
 #[cfg(all(feature = "nsi-export", not(target_arch = "wasm32")))]
 type MainCameraExportQuery<'w, 's> = Query<
@@ -60,7 +58,6 @@ pub(crate) struct MainCameraQueries<'w, 's> {
 pub(crate) struct UiSystemParams<'w, 's> {
     windows: WindowQuery<'w, 's>,
     camera_queries: MainCameraQueries<'w, 's>,
-    egui_settings: EguiSettingsQuery<'w, 's>,
     #[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
     nsi_overlay: ResMut<'w, NsiOverlayState>,
 }
@@ -539,8 +536,18 @@ pub(crate) fn ui_system(
     // Poll preview loads.
     poll_preview_loads(&mut browser);
 
+    // egui 0.35 panels attach to a `Ui`, not to the `Context`, so all panels
+    // for this frame have to share one root `Ui` spanning the viewport.
+    let mut root_ui = egui::Ui::new(
+        ctx.clone(),
+        egui::Id::new("viewport"),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(ctx.viewport_rect()),
+    );
+
     // Top bar: File menu on left, mode tabs on right.
-    egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+    egui::Panel::top("menu").show(&mut root_ui, |ui| {
         ui.horizontal(|ui| {
             ui.style_mut().override_text_style = Some(egui::TextStyle::Heading);
 
@@ -750,7 +757,7 @@ pub(crate) fn ui_system(
             #[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
             {
                 viewer_ui(
-                    ctx,
+                    &mut root_ui,
                     &mut state,
                     &params.windows,
                     &mut params.camera_queries.viewport,
@@ -763,17 +770,17 @@ pub(crate) fn ui_system(
             )))]
             {
                 viewer_ui(
-                    ctx,
+                    &mut root_ui,
                     &mut state,
                     &params.windows,
                     &mut params.camera_queries.viewport,
                 )
             }
         }
-        AppMode::Browser => browser_ui(ctx, &mut state, &mut browser),
+        AppMode::Browser => browser_ui(&mut root_ui, &mut state, &mut browser),
     }
 
-    // Ctrl+/- to zoom egui UI via EguiContextSettings::scale_factor.
+    // Ctrl+/- to zoom egui UI via egui's own zoom factor.
     let zoom_delta = ctx.input(|i| {
         if i.modifiers.command {
             if i.key_pressed(egui::Key::Plus)
@@ -791,14 +798,13 @@ pub(crate) fn ui_system(
             None
         }
     });
-    if let Some(delta) = zoom_delta
-        && let Ok(mut settings) = params.egui_settings.single_mut()
-    {
-        settings.scale_factor = if delta == 0.0 {
+    if let Some(delta) = zoom_delta {
+        let zoom = if delta == 0.0 {
             1.0
         } else {
-            (settings.scale_factor + delta as f32).clamp(0.5, 3.0)
+            (ctx.zoom_factor() + delta as f32).clamp(0.5, 3.0)
         };
+        ctx.set_zoom_factor(zoom);
     }
 
     // Allow escape to quit quickly on desktop.
@@ -894,13 +900,15 @@ fn nsi_default_filename(state: &ViewerState) -> String {
 }
 
 fn viewer_ui(
-    ctx: &egui::Context,
+    root_ui: &mut egui::Ui,
     state: &mut ResMut<ViewerState>,
     windows: &Query<&Window>,
     camera_query: &mut MainCameraViewportQuery,
     #[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
     nsi_overlay: &mut ResMut<NsiOverlayState>,
 ) {
+    let ctx = root_ui.ctx().clone();
+    let ctx = &ctx;
     // Pre-seed panel width from settings on first frame (before egui has stored
     // state).
     let panel_id = egui::Id::new("entities");
@@ -914,7 +922,7 @@ fn viewer_ui(
             d.insert_persisted(
                 panel_id,
                 egui::containers::panel::PanelState {
-                    rect: egui::Rect::from_min_size(
+                    outer_rect: egui::Rect::from_min_size(
                         egui::pos2(0.0, 0.0),
                         egui::vec2(state.panel_width, 100.0),
                     ),
@@ -922,10 +930,10 @@ fn viewer_ui(
             );
         });
     }
-    let panel_response = egui::SidePanel::left(panel_id)
+    let panel_response = egui::Panel::left(panel_id)
         .resizable(true)
-        .width_range(100.0..=800.0)
-        .show(ctx, |ui| {
+        .size_range(100.0..=800.0)
+        .show(root_ui, |ui| {
             // Claim the full panel width so the user can drag the resize
             // handle wider than the inner content (collapsed-by-default shell
             // headers are short; without this egui treats the content's tight
@@ -1530,7 +1538,7 @@ fn viewer_ui(
             d.insert_persisted(
                 right_panel_id,
                 egui::containers::panel::PanelState {
-                    rect: egui::Rect::from_min_size(
+                    outer_rect: egui::Rect::from_min_size(
                         egui::pos2(0.0, 0.0),
                         egui::vec2(state.right_panel_width, 100.0),
                     ),
@@ -1538,10 +1546,10 @@ fn viewer_ui(
             );
         });
     }
-    let right_panel_response = egui::SidePanel::right(right_panel_id)
+    let right_panel_response = egui::Panel::right(right_panel_id)
         .resizable(true)
-        .width_range(100.0..=800.0)
-        .show(ctx, |ui| {
+        .size_range(100.0..=800.0)
+        .show(root_ui, |ui| {
             if let Some(meta) = &state.metadata {
                 ui.label(format!("Entity Count: {}", meta.entity_count));
                 ui.separator();
@@ -1960,10 +1968,12 @@ fn viewer_ui(
 }
 
 fn browser_ui(
-    ctx: &egui::Context,
+    root_ui: &mut egui::Ui,
     state: &mut ResMut<ViewerState>,
     browser: &mut ResMut<BrowserState>,
 ) {
+    let ctx = root_ui.ctx().clone();
+    let ctx = &ctx;
     // Left panel: directory tree.
     let browser_panel_id = egui::Id::new("browser_tree");
     if ctx
@@ -1978,7 +1988,7 @@ fn browser_ui(
             d.insert_persisted(
                 browser_panel_id,
                 egui::containers::panel::PanelState {
-                    rect: egui::Rect::from_min_size(
+                    outer_rect: egui::Rect::from_min_size(
                         egui::pos2(0.0, 0.0),
                         egui::vec2(state.panel_width, 100.0),
                     ),
@@ -1986,10 +1996,10 @@ fn browser_ui(
             );
         });
     }
-    egui::SidePanel::left(browser_panel_id)
+    egui::Panel::left(browser_panel_id)
         .resizable(true)
-        .width_range(100.0..=800.0)
-        .show(ctx, |ui| {
+        .size_range(100.0..=800.0)
+        .show(root_ui, |ui| {
             ui.heading("Directories");
             ui.separator();
 
@@ -2045,7 +2055,7 @@ fn browser_ui(
         });
 
     // Main area: preview grid.
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::CentralPanel::default().show(root_ui, |ui| {
         if browser.selected_dir.is_none() {
             ui.centered_and_justified(|ui| {
                 ui.label("Select a directory to browse STEP files");

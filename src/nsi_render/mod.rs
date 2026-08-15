@@ -21,8 +21,8 @@
 //!   unless dropped.
 
 #[cfg(feature = "nsi-render")]
+use crate::{HashMap, HashSet};
 use std::{
-    collections::{HashMap, HashSet},
     env,
     path::PathBuf,
     sync::OnceLock,
@@ -171,7 +171,7 @@ impl NsiRenderState {
             last_view_matrix: Mutex::new(None),
             last_fov: Mutex::new(0.0),
             last_clip_range: Mutex::new(None),
-            brep_handles: Mutex::new(HashMap::new()),
+            brep_handles: Mutex::new(HashMap::default()),
             render_thread: Some(render_thread),
             is_rendering: Mutex::new(false),
         })

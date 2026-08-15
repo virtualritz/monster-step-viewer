@@ -352,7 +352,7 @@ fn spawn_preview_scene(
         PreviewLight { slot: slot_idx },
         DirectionalLight {
             illuminance: 8000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..Default::default()
         },
         Transform::from_rotation(Quat::from_euler(

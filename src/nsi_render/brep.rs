@@ -305,7 +305,7 @@ fn align_surface_to_trim_domain(
         SurfaceAxis::U,
         (u_lo, u_hi),
         surface_u_range(face_surface),
-        face_surface.u_period(),
+        face_surface.period_u(),
     ) {
         let target_u = target_axis_range(
             surface,
@@ -320,7 +320,7 @@ fn align_surface_to_trim_domain(
         SurfaceAxis::V,
         (v_lo, v_hi),
         surface_v_range(face_surface),
-        face_surface.v_period(),
+        face_surface.period_v(),
     ) {
         let target_v = target_axis_range(
             surface,
@@ -1538,7 +1538,7 @@ fn connect_open_mesher_pieces(
                 end_points(&curve1.topology_points),
             );
             if !f64_near(p0.x, p1.x) && !f64_near(q0.x, q1.x) {
-                if let Some(period) = surface.u_period() {
+                if let Some(period) = surface.period_u() {
                     align_periodic_open_piece_pair(
                         &curve0,
                         &mut curve1,
@@ -1550,7 +1550,7 @@ fn connect_open_mesher_pieces(
                     normalize_piece_range(&mut curve1, 0, urange);
                 }
             } else if !f64_near(p0.y, p1.y) && !f64_near(q0.y, q1.y) {
-                if let Some(period) = surface.v_period() {
+                if let Some(period) = surface.period_v() {
                     align_periodic_open_piece_pair(
                         &curve0,
                         &mut curve1,
@@ -1792,7 +1792,7 @@ fn periodic_axis_full_span(
     if curve.len() < 4 || !closed {
         None
     } else {
-        [(0usize, surface.u_period()), (1usize, surface.v_period())]
+        [(0usize, surface.period_u()), (1usize, surface.period_v())]
             .into_iter()
             .filter_map(|(axis, period)| Some((axis, period?)))
             .find(|(axis, period)| {
@@ -1831,8 +1831,8 @@ fn surface_axis_range(
 ) -> (Option<f64>, Option<(f64, f64)>) {
     let (urange, vrange) = surface.try_range_tuple();
     match axis {
-        0 => (surface.u_period(), urange),
-        _ => (surface.v_period(), vrange),
+        0 => (surface.period_u(), urange),
+        _ => (surface.period_v(), vrange),
     }
 }
 
@@ -2995,8 +2995,8 @@ mod tests {
             surface_kind(&face.surface),
             face.orientation,
             face.surface.try_range_tuple(),
-            face.surface.u_period(),
-            face.surface.v_period(),
+            face.surface.period_u(),
+            face.surface.period_v(),
         );
         face.boundaries
             .iter()
@@ -3150,9 +3150,9 @@ mod tests {
         next: Point2,
     ) -> bool {
         uv_near(current, next)
-            || periodic_uv_near(surface.u_period(), current.x, next.x)
+            || periodic_uv_near(surface.period_u(), current.x, next.x)
                 && f64_near(current.y, next.y)
-            || periodic_uv_near(surface.v_period(), current.y, next.y)
+            || periodic_uv_near(surface.period_v(), current.y, next.y)
                 && f64_near(current.x, next.x)
     }
 

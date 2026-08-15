@@ -43,10 +43,12 @@ mstpv
 
 ### Mouse
 
-- **Right-drag**: Orbit.
+- **Left-drag** or **right-drag**: Orbit. Left-drag keeps this reachable on a
+  touchpad, where a single-finger drag is all you need.
 - **Middle-drag**: Pan.
 - **Scroll wheel**: Zoom (dolly).
-- **Left-click**: Pick face/hierarchy item.
+- **Left-click**: Pick face/hierarchy item. A click only selects if the pointer
+  stays put; move it and the gesture orbits instead.
 
 ### Keyboard
 

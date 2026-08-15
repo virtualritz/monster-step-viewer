@@ -1,3 +1,4 @@
+use crate::{HashMap, HashSet};
 use bevy::{
     asset::RenderAssetUsages,
     camera::{RenderTarget, visibility::RenderLayers},
@@ -19,7 +20,6 @@ use monster_step_viewer::{
 use monstertruck::meshing::prelude::PolygonMesh;
 use rayon::prelude::*;
 use std::{
-    collections::{HashMap, HashSet},
     f32::consts::{FRAC_PI_2, FRAC_PI_4, FRAC_PI_6, PI},
     path::PathBuf,
     sync::mpsc::TryRecvError,
@@ -73,7 +73,7 @@ pub(crate) fn setup_scene(
             parent.spawn((
                 DirectionalLight {
                     illuminance: KEY_LIGHT_ILLUMINANCE,
-                    shadows_enabled: true,
+                    shadow_maps_enabled: true,
                     ..Default::default()
                 },
                 Transform::from_rotation(Quat::from_euler(
@@ -88,7 +88,7 @@ pub(crate) fn setup_scene(
             parent.spawn((
                 DirectionalLight {
                     illuminance: BACK_LIGHT_ILLUMINANCE,
-                    shadows_enabled: false,
+                    shadow_maps_enabled: false,
                     ..Default::default()
                 },
                 Transform::from_rotation(Quat::from_euler(
@@ -124,7 +124,14 @@ pub(crate) fn editor_cam_mouse_inputs(
     >,
     primary_window: Query<Entity, With<PrimaryWindow>>,
 ) {
-    let orbit_start = MouseButton::Right;
+    // Left also orbits so a single-finger touchpad drag works: a two-finger
+    // (right) click-drag is awkward on a touchpad and a middle click is
+    // usually impossible. Click-to-select is unaffected -- selection is
+    // decided on release against `CLICK_DRAG_THRESHOLD_SQ`, so a press that
+    // does not move still reads as a click. Grabbing a clip-plane handle or
+    // touching egui does not orbit either; both already clear
+    // `EditorCam::enabled_motion` in `disable_camera_when_egui_wants_input`.
+    let orbit_starts = [MouseButton::Right, MouseButton::Left];
     let pan_start = MouseButton::Middle;
     let zoom_stop = 0.0;
 
@@ -144,8 +151,11 @@ pub(crate) fn editor_cam_mouse_inputs(
             .unwrap_or(0.0);
         let should_zoom_end = is_in_zoom_mode && zoom_amount_abs <= zoom_stop;
 
-        if mouse_input.any_just_released([orbit_start, pan_start])
-            || should_zoom_end
+        if mouse_input.any_just_released([
+            orbit_starts[0],
+            orbit_starts[1],
+            pan_start,
+        ]) || should_zoom_end
         {
             controller.write(EditorCamInputMessage::End { camera });
         }
@@ -171,7 +181,7 @@ pub(crate) fn editor_cam_mouse_inputs(
             continue;
         };
 
-        if mouse_input.just_pressed(orbit_start) {
+        if mouse_input.any_just_pressed(orbit_starts) {
             controller.write(EditorCamInputMessage::Start {
                 kind: MotionKind::OrbitZoom,
                 camera,
@@ -675,7 +685,7 @@ pub(crate) fn spawn_shell_faces_normalized(
     }
 
     // Register loop records and link edges to faces.
-    let mut referenced_edge_ids = HashSet::new();
+    let mut referenced_edge_ids = HashSet::default();
     let mut face_edge_loop_data: Vec<(usize, Vec<usize>, Vec<usize>)> =
         Vec::new();
 
@@ -848,7 +858,10 @@ pub(crate) fn build_indexed_face_geometry(
     // work for typical triangle meshes (each vertex is shared by 4–6
     // triangles).
     let mut vertex_lookup: HashMap<(usize, Option<usize>), u32> =
-        HashMap::with_capacity(corners.len() / 2);
+        HashMap::with_capacity_and_hasher(
+            corners.len() / 2,
+            Default::default(),
+        );
     let mut unique_vertices: Vec<(usize, Option<usize>)> =
         Vec::with_capacity(corners.len() / 2);
     let indices: Vec<u32> = corners
@@ -977,14 +990,17 @@ pub(crate) fn build_shell_merged_mesh(
     // chunks (rayon-friendly). The chunks are small enough that par_iter
     // overhead may eat the win for small parts; on big STEP files with many
     // chunks it parallelises well.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut merged_positions: Vec<[f32; 3]> = chunks
         .par_iter()
         .flat_map_iter(|c| c.positions.iter().copied())
         .collect();
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut merged_normals: Vec<[f32; 3]> = chunks
         .par_iter()
         .flat_map_iter(|c| c.normals.iter().copied())
         .collect();
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut merged_colors: Vec<[f32; 4]> = chunks
         .par_iter()
         .flat_map_iter(|c| std::iter::repeat_n(c.color, c.positions.len()))
@@ -993,6 +1009,7 @@ pub(crate) fn build_shell_merged_mesh(
     // `ATTRIBUTE_FACE_ID` for the shader to look up `face_state`, and into
     // the CPU `vertex_face_index` for click picking.
     let base = base_face_id as u32;
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut vertex_face_index: Vec<u32> = chunks
         .par_iter()
         .enumerate()
@@ -1014,6 +1031,7 @@ pub(crate) fn build_shell_merged_mesh(
         running += c.positions.len() as u32;
     });
     chunk_vertex_offsets.push(running);
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut merged_indices: Vec<u32> = chunks
         .par_iter()
         .zip(chunk_vertex_offsets.par_iter().copied())
@@ -1174,9 +1192,7 @@ pub(crate) fn update_face_state_buffer(
     mut state: ResMut<ViewerState>,
     face_state_buffer: Res<FaceStateBuffer>,
     palette: Res<MaterialPalette>,
-    mut storage_buffers: ResMut<
-        Assets<bevy::render::storage::ShaderStorageBuffer>,
-    >,
+    mut storage_buffers: ResMut<Assets<bevy::render::storage::ShaderBuffer>>,
     mut materials: ResMut<Assets<ViewerMaterial>>,
 ) {
     let sel_changed = state.selection != state.prev_face_state_selection;
@@ -1202,7 +1218,7 @@ pub(crate) fn update_face_state_buffer(
                 .find(|f| f.edge_ids.contains(eid))
                 .map(|f| [f.id].into_iter().collect())
                 .unwrap_or_default(),
-            _ => HashSet::new(),
+            _ => HashSet::default(),
         }
     };
     let sel_faces = resolve(&state.selection, &state.faces, &state.loops);
@@ -1234,7 +1250,7 @@ pub(crate) fn update_face_state_buffer(
         })
         .collect();
 
-    if let Some(buffer) = storage_buffers.get_mut(&face_state_buffer.0) {
+    if let Some(mut buffer) = storage_buffers.get_mut(&face_state_buffer.0) {
         buffer.set_data(face_state);
         // Touch every palette material so its bind group is rebuilt against
         // the (possibly resized) GPU storage buffer. Without this the bind
@@ -1401,7 +1417,7 @@ pub(crate) fn rebuild_meshes_on_toggle(
         .collect();
 
     for (handle, colors, face_ui_updates) in updates {
-        if let Some(mesh) = meshes.get_mut(&handle) {
+        if let Some(mut mesh) = meshes.get_mut(&handle) {
             mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
         }
         for (fid, rgb) in face_ui_updates {
@@ -1499,7 +1515,7 @@ pub(crate) fn disable_camera_when_egui_wants_input(
     };
 
     let egui_wants_input =
-        ctx.wants_pointer_input() || ctx.is_pointer_over_area();
+        ctx.egui_wants_pointer_input() || ctx.is_pointer_over_egui();
 
     if let Ok(mut editor_cam) = camera_query.single_mut() {
         let enabled = !egui_wants_input && !drag_state.dragging;
@@ -1543,10 +1559,7 @@ fn view_shortcut_action(
 /// pose change.
 pub(crate) fn apply_up_axis_change(
     mut state: ResMut<ViewerState>,
-    mut camera_query: Query<
-        (&mut Transform, &mut EditorCam),
-        With<MainCamera>,
-    >,
+    mut camera_query: Query<(&mut Transform, &mut EditorCam), With<MainCamera>>,
 ) {
     if !state.up_axis_changed {
         return;
@@ -1575,7 +1588,7 @@ pub(crate) fn handle_view_shortcuts(
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    if ctx.wants_keyboard_input() {
+    if ctx.egui_wants_keyboard_input() {
         return;
     }
 
@@ -1707,12 +1720,8 @@ fn initial_camera_offset(distance: f32, up: UpAxis) -> Vec3 {
     // Elevate along the chosen up axis; the other two axes form the ground
     // plane the camera orbits in.
     match up {
-        UpAxis::Y => {
-            Vec3::new(horiz * yaw.cos(), elev, horiz * yaw.sin())
-        }
-        UpAxis::Z => {
-            Vec3::new(horiz * yaw.cos(), horiz * yaw.sin(), elev)
-        }
+        UpAxis::Y => Vec3::new(horiz * yaw.cos(), elev, horiz * yaw.sin()),
+        UpAxis::Z => Vec3::new(horiz * yaw.cos(), horiz * yaw.sin(), elev),
     }
 }
 
@@ -1724,7 +1733,7 @@ fn update_editor_cam_anchor(editor_cam: &mut EditorCam, distance: f32) {
 /// Pin the orbit so the given world axis stays vertical.
 fn set_orbit_up(editor_cam: &mut EditorCam, up: UpAxis) {
     editor_cam.orbit_constraint = OrbitConstraint::Fixed {
-        up: up.vec(),
+        up: up.vec().as_dvec3(),
         can_pass_tdc: false,
     };
 }
@@ -1960,7 +1969,7 @@ pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
                 .find(|f| f.id == *fid)
                 .map(|f| f.edge_ids.iter().copied().collect())
                 .unwrap_or_default(),
-            _ => HashSet::new(),
+            _ => HashSet::default(),
         };
 
         for shell in &scene.shells {
@@ -2155,7 +2164,7 @@ pub(crate) fn apply_shading_mode(
     for handle in
         [&palette.default, &palette.selected, &palette.hovered].into_iter()
     {
-        if let Some(mat) = materials.get_mut(handle) {
+        if let Some(mut mat) = materials.get_mut(handle) {
             mat.base.alpha_mode = alpha_mode;
             mat.base.cull_mode = cull_mode;
             mat.base.base_color = base_color;
@@ -2307,7 +2316,7 @@ fn find_face_id_at(
     const BARY_TOLERANCE: f32 = 1e-3;
     const PLANE_TOLERANCE: f32 = 1e-2;
 
-    indices.chunks_exact(3).find_map(|tri| {
+    indices.as_chunks::<3>().0.iter().find_map(|tri| {
         let i0 = tri[0] as usize;
         let i1 = tri[1] as usize;
         let i2 = tri[2] as usize;
@@ -2385,7 +2394,7 @@ pub(crate) fn clear_selection_on_empty_click(
         let Ok(ctx) = contexts.ctx_mut() else {
             return;
         };
-        if ctx.wants_pointer_input() || ctx.is_pointer_over_area() {
+        if ctx.egui_wants_pointer_input() || ctx.is_pointer_over_egui() {
             return;
         }
 
@@ -2748,7 +2757,7 @@ mod tests {
 
     #[test]
     fn initial_camera_offset_matches_startup_view_direction() {
-        let offset = initial_camera_offset(2.0);
+        let offset = initial_camera_offset(2.0, UpAxis::Y);
         let expected = Vec3::new(
             2.0 * FRAC_PI_4.cos() * FRAC_PI_6.cos(),
             2.0 * FRAC_PI_6.sin(),

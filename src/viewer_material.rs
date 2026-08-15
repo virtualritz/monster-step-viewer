@@ -13,7 +13,7 @@ use bevy::{
             SpecializedMeshPipelineError, TextureDimension, TextureFormat,
             VertexFormat,
         },
-        storage::ShaderStorageBuffer,
+        storage::ShaderBuffer,
     },
     shader::ShaderRef,
 };
@@ -80,11 +80,11 @@ fn base_material() -> ViewerMaterial {
 pub(crate) fn setup_material_palette(
     mut commands: Commands,
     mut materials: ResMut<Assets<ViewerMaterial>>,
-    mut storage_buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut storage_buffers: ResMut<Assets<ShaderBuffer>>,
 ) {
     // One zero-initialised u32 keeps the buffer non-empty (WGSL storage
     // buffers can't be zero-sized). Resized by `update_face_state_buffer`.
-    let mut initial_buffer = ShaderStorageBuffer::default();
+    let mut initial_buffer = ShaderBuffer::default();
     initial_buffer.set_data(vec![0u32]);
     let face_state_handle = storage_buffers.add(initial_buffer);
 
@@ -150,7 +150,7 @@ pub(crate) struct ViewerMaterialExt {
     /// underlying buffer is a separate asset; mutating its data triggers a
     /// re-upload to GPU.
     #[storage(103, read_only)]
-    pub face_state: Handle<ShaderStorageBuffer>,
+    pub face_state: Handle<ShaderBuffer>,
 }
 
 impl Default for ViewerMaterialExt {
@@ -170,11 +170,11 @@ impl Default for ViewerMaterialExt {
     }
 }
 
-/// Resource holding the shared `ShaderStorageBuffer` handle that backs
+/// Resource holding the shared `ShaderBuffer` handle that backs
 /// every palette material's `face_state`. The update system mutates this
 /// asset; all bound materials see the change automatically.
 #[derive(Resource, Clone)]
-pub(crate) struct FaceStateBuffer(pub Handle<ShaderStorageBuffer>);
+pub(crate) struct FaceStateBuffer(pub Handle<ShaderBuffer>);
 
 impl MaterialExtension for ViewerMaterialExt {
     fn vertex_shader() -> ShaderRef {

@@ -2,6 +2,7 @@ mod mesh_utils;
 mod parsing;
 pub mod transform;
 
+use crate::HashMap;
 use anyhow::Context;
 use monstertruck::{
     meshing::prelude::*,
@@ -11,13 +12,11 @@ use monstertruck::{
         step_geometry::{Curve3D, StepParameterCurve, Surface},
     },
     topology::compress::{CompressedShell, CompressedTrimmedShell},
-    traits::ParametricCurve,
 };
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::{
     any::Any,
-    collections::HashMap,
     fmt::{Debug, Formatter, Result as FmtResult},
     path::{Path, PathBuf},
     sync::{
@@ -463,7 +462,7 @@ fn resolve_to_shell_id(table: &Table, idx: u64) -> u64 {
 /// References may go through an `oriented_shell` indirection, so we resolve
 /// those to the underlying shell ID.
 fn build_shell_to_solid_map(table: &Table) -> HashMap<u64, u64> {
-    let mut shell_to_solid: HashMap<u64, u64> = HashMap::new();
+    let mut shell_to_solid: HashMap<u64, u64> = HashMap::default();
     for (solid_id, solid_holder) in &table.manifold_solid_brep {
         // Extract the outer shell entity ID (may be shell or oriented_shell).
         if let PlaceHolder::Ref(Name::Entity(outer_idx)) = &solid_holder.outer {
@@ -558,28 +557,25 @@ fn compute_shell_bounds(
     compressed: &OriginalShell,
     transform: Option<&Transform>,
 ) -> Option<StepBounds> {
-    let mut bounds = StepBoundsBuilder::default();
-    let mut push_point = |point: Point3| {
-        let mut coord = [point.x, point.y, point.z];
-        if let Some(xform) = transform {
-            coord = xform.transform_point(coord);
+    // Mapping each sampled point rather than transforming the finished box's
+    // corners keeps the bounds exact: `mesh_fits_shell_bounds` compares
+    // already-transformed face meshes against them, and a box inflated by a
+    // rotation (up to `sqrt(3)`) would silently weaken that check.
+    //
+    // monstertruck handles the tiers, including the fallback to face surfaces
+    // for shells that carry no vertices or edges at all.
+    let bdd_box = compressed.bounding_box_with(|point| match transform {
+        Some(xform) => {
+            let [x, y, z] = xform.transform_point([point.x, point.y, point.z]);
+            Point3::new(x, y, z)
         }
-        bounds.push(coord);
-    };
+        None => point,
+    });
 
-    compressed
-        .vertices
-        .iter()
-        .for_each(|point| push_point(*point));
-    for edge in &compressed.edges {
-        let (start, end) = edge.curve.range_tuple();
-        for idx in 0..=16 {
-            let t = start + (end - start) * idx as f64 / 16.0;
-            push_point(edge.curve.evaluate(t));
-        }
-    }
-
-    bounds.finish()
+    (!bdd_box.is_empty()).then(|| {
+        let (min, max) = (bdd_box.min(), bdd_box.max());
+        StepBounds::from_min_max([min.x, min.y, min.z], [max.x, max.y, max.z])
+    })
 }
 
 fn mesh_fits_shell_bounds(
@@ -639,7 +635,7 @@ pub fn load_step_file_with_progress(
     // Build shell-to-solid mapping for topology preservation.
     let shell_to_solid = build_shell_to_solid_map(&table);
     let solid_cache: Mutex<HashMap<u64, CompressedShellData>> =
-        Mutex::new(HashMap::new());
+        Mutex::new(HashMap::default());
 
     // Convert each shell into a triangulated mesh (in parallel).
     let mut shell_entries: Vec<_> = table.shell.iter().collect();
@@ -685,12 +681,7 @@ pub fn load_step_file_with_progress(
                 .collect();
 
             let shell_bounds = compute_shell_bounds(&compressed, None);
-            let diameter =
-                shell_bounds.map(StepBounds::diameter).unwrap_or_default();
-            let mut tol = f64::max(diameter * 0.001, TOLERANCE);
-            if !tol.is_finite() {
-                tol = 0.01;
-            }
+            let tol = compressed.relative_tolerance(0.001);
 
             let has_boundaries = shell_requires_trimmed_meshing(&compressed);
             let original_shell = CompressedShellData::new(compressed.clone());
@@ -988,7 +979,7 @@ fn load_step_from_string_inner(
     // Build shell-to-solid mapping for topology preservation.
     let shell_to_solid = build_shell_to_solid_map(&table);
     let solid_cache: Arc<Mutex<HashMap<u64, CompressedShellData>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+        Arc::new(Mutex::new(HashMap::default()));
     let prepared_count = Arc::new(AtomicUsize::new(0));
 
     let prepared_shells: Result<Vec<PreparedShell>, anyhow::Error> =
@@ -1043,11 +1034,9 @@ fn load_step_from_string_inner(
                 let bounds = compute_shell_bounds(&compressed, transform.as_ref());
                 let bbox_diameter =
                     bounds.map(StepBounds::diameter).unwrap_or_default();
-                let mut tol =
-                    f64::max(bbox_diameter * tolerance_factor, TOLERANCE);
-                if !tol.is_finite() {
-                    tol = 0.01;
-                }
+                // Tessellation runs before the assembly placement is applied,
+                // so the tolerance wants the shell's own scale.
+                let tol = compressed.relative_tolerance(tolerance_factor);
                 log::info!(
                     "Tessellation: bbox_diameter={:.4}, factor={:.6}, tol={:.6}",
                     bbox_diameter,
@@ -1364,11 +1353,7 @@ fn retessellate_one_shell(
     let transform = shell.transform;
 
     let bounds = compute_shell_bounds(compressed, transform.as_ref());
-    let diameter = bounds.map(StepBounds::diameter).unwrap_or_default();
-    let mut tol = f64::max(diameter * tolerance_factor, TOLERANCE);
-    if !tol.is_finite() {
-        tol = 0.01;
-    }
+    let tol = compressed.relative_tolerance(tolerance_factor);
 
     let tessellation = tessellate_original_shell(compressed, tol, meshing);
     let face_isoparams = tessellation.face_isoparams;
@@ -1617,6 +1602,54 @@ mod tests {
 
         assert_eq!(bounds.min, [0.0, 0.0, 0.0]);
         assert_eq!(bounds.max, [1.0, 0.0, 0.0]);
+    }
+
+    /// Regression for the quality slider going dead on shells whose faces are
+    /// untrimmed (`FACE_SURFACE` bounded by a degenerate `VERTEX_LOOP`, as
+    /// written by truck's STEP exporter for faces with no boundaries). The
+    /// bounds used to come out empty, pinning the tolerance to `TOLERANCE`
+    /// regardless of the slider and tessellating a single patch into tens of
+    /// thousands of triangles.
+    #[test]
+    fn untrimmed_patch_tessellation_responds_to_tolerance_factor() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/untrimmed_patch.step");
+
+        let count_triangles = |factor: f64| {
+            let rx = load_step_file_streaming(
+                path.clone(),
+                factor,
+                MeshingConfig::default(),
+            );
+            let mut tris = 0usize;
+            for message in rx {
+                match message {
+                    LoadMessage::Shell(shell) => {
+                        tris += shell
+                            .faces
+                            .iter()
+                            .map(|face| face.mesh.tri_faces().len())
+                            .sum::<usize>();
+                    }
+                    LoadMessage::Done => break,
+                    _ => {}
+                }
+            }
+            tris
+        };
+
+        let coarse = count_triangles(1.0e-2);
+        let fine = count_triangles(1.0e-5);
+
+        assert!(coarse > 0, "coarse tessellation produced no triangles");
+        assert!(
+            coarse < fine,
+            "quality slider has no effect: coarse={coarse} fine={fine}"
+        );
+        assert!(
+            coarse < 4096,
+            "lowest quality should stay cheap for one patch, got {coarse}"
+        );
     }
 
     #[test]
