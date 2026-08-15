@@ -1315,10 +1315,164 @@ fn close_topology_piece(points: Vec<Point2>) -> Option<(Vec<Point2>, bool)> {
     }
 }
 
+// --- Generic periodic-surface parameter maths ------------------------------
+// The next three functions touch only monstertruck types (`Surface`,
+// `Point2`) and plain scalars — no NSI data. They are candidates for
+// upstreaming into monstertruck's geometry/topology layer, next to the
+// tessellator's own seam handling.
+
+/// Identifies a parameter-space boundary polyline that runs one full lap
+/// around a periodic axis at a constant cross parameter — the image of a
+/// cylinder or cone cap circle. Returns the periodic axis and the constant
+/// cross value.
+fn girdle_axis_and_value(
+    points: &[Point2],
+    surface: &Surface,
+) -> Option<(usize, f64)> {
+    (0..=1usize).find_map(|axis| {
+        let (period, _) = surface_axis_range(surface, axis);
+        let period = period?;
+        let (lo, hi) = curve_axis_span(points, axis)?;
+        let (cross_lo, cross_hi) = curve_axis_span(points, 1 - axis)?;
+        ((hi - lo - period).abs() <= TRIM_CLOSURE_TOLERANCE
+            && cross_hi - cross_lo <= TRIM_CLOSURE_TOLERANCE)
+            .then_some((axis, (cross_lo + cross_hi) * 0.5))
+    })
+}
+
+/// Cross-axis parameter interval bounded by a set of girdles that all lap the
+/// same periodic axis. Returns that axis and the interval.
+///
+/// Two or more girdles bound the band between the outermost pair; a lone
+/// girdle bounds the patch that closes at the surface's apex (verified
+/// against the mesher for the cone faces of the boxy fixture).
+fn girdle_band_range(
+    girdles: &[(usize, f64)],
+    surface: &Surface,
+) -> Option<(usize, (f64, f64))> {
+    let (axis, _) = *girdles.first()?;
+    if girdles.iter().any(|(other_axis, _)| *other_axis != axis) {
+        return None;
+    }
+    let (band_lo, band_hi) = match girdles {
+        [(_, value)] => {
+            let apex = surface_apex_parameter(surface, 1 - axis)?;
+            (f64::min(*value, apex), f64::max(*value, apex))
+        }
+        _ => girdles.iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(lo, hi), (_, value)| (lo.min(*value), hi.max(*value)),
+        ),
+    };
+    (band_hi - band_lo > TOLERANCE).then_some((axis, (band_lo, band_hi)))
+}
+
+/// Parameter along `band_axis` at which the surface collapses to a point (a
+/// cone's apex), found from the linear taper of the ruled surface. `None`
+/// when the surface does not taper or never reaches zero radius.
+fn surface_apex_parameter(surface: &Surface, band_axis: usize) -> Option<f64> {
+    let (_, periodic_range) = surface_axis_range(surface, 1 - band_axis);
+    let (periodic_lo, periodic_hi) = periodic_range?;
+    let (_, band_range) = surface_axis_range(surface, band_axis);
+    let (band_lo, band_hi) = band_range?;
+    let radius = |band: f64| {
+        let point = |periodic: f64| match band_axis {
+            0 => surface.evaluate(band, periodic),
+            _ => surface.evaluate(periodic, band),
+        };
+        // Half the distance between diametrically opposite points; the
+        // natural periodic range is one full lap, so its midpoint is the
+        // antipode of its start.
+        point(periodic_lo).distance(point((periodic_lo + periodic_hi) * 0.5))
+            * 0.5
+    };
+    let (r_lo, r_hi) = (radius(band_lo), radius(band_hi));
+    if (r_hi - r_lo).abs() <= TOLERANCE {
+        return None;
+    }
+    let apex = band_lo - r_lo * (band_hi - band_lo) / (r_hi - r_lo);
+    // Re-evaluating guards against non-linear tapers where extrapolating the
+    // two samples lands somewhere the surface has not actually collapsed.
+    (apex.is_finite() && radius(apex) <= TRIM_CLOSURE_TOLERANCE).then_some(apex)
+}
+
+// --- End of upstreaming candidates ------------------------------------------
+
+/// Replaces a face boundary made entirely of girdle pieces with the
+/// axis-aligned parameter rectangle they bound.
+///
+/// A girdle encloses no area of its own — the region it bounds on a closed
+/// surface is the band between girdles (or between a lone girdle and the
+/// surface's apex). Emitting girdles directly produces zero-area loops on
+/// whatever parameter lap they were authored on — usually outside the
+/// exported domain, where renderers clamp them into visible slivers — while
+/// the fallback outer loop lands on the surface's natural rectangle, which
+/// sits at the wrong place along the band axis. The rectangle is exact
+/// because girdles are constant-parameter curves.
+fn girdle_pieces_to_band_loop(
+    pieces: &[TrimPiece],
+    surface: &Surface,
+) -> Option<TrimLoop> {
+    // The reproducer build deliberately keeps the escaping girdle loops so
+    // `nsi-export` can hand 3Delight an `.nsi` demonstrating the clamping.
+    if cfg!(feature = "nsi-out-of-domain-trims") {
+        return None;
+    }
+    let girdles: Vec<(usize, f64)> = pieces
+        .iter()
+        .map(|piece| {
+            // Girdles close in 3D only; pieces that already close in
+            // parameter space enclose real area and must be kept as authored.
+            piece
+                .closed_by_topology
+                .then(|| girdle_axis_and_value(&piece.topology_points, surface))
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let (axis, (band_lo, band_hi)) = girdle_band_range(&girdles, surface)?;
+    let (_, periodic_range) = surface_axis_range(surface, axis);
+    let (periodic_lo, periodic_hi) = periodic_range?;
+    let corner = |periodic: f64, band: f64| match axis {
+        0 => Point2::new(periodic, band),
+        _ => Point2::new(band, periodic),
+    };
+    let points = [
+        corner(periodic_lo, band_lo),
+        corner(periodic_hi, band_lo),
+        corner(periodic_hi, band_hi),
+        corner(periodic_lo, band_hi),
+    ];
+    let mut band_loop = TrimLoop {
+        curves: vec![
+            line_trim_curve(points[0], points[1]),
+            line_trim_curve(points[1], points[2]),
+            line_trim_curve(points[2], points[3]),
+            line_trim_curve(points[3], points[0]),
+        ],
+        topology_points: connect_edges([
+            uv_line(points[0], points[1]),
+            uv_line(points[1], points[2]),
+            uv_line(points[2], points[3]),
+            uv_line(points[3], points[0]),
+        ]),
+        sampled_fallback_count: pieces
+            .iter()
+            .map(|piece| piece.sampled_fallback_count)
+            .sum(),
+    };
+    if !loop_orientation(&band_loop.topology_points) {
+        reverse_trim_loop(&mut band_loop);
+    }
+    Some(band_loop)
+}
+
 fn pieces_to_trim_loops(
     pieces: Vec<TrimPiece>,
     surface: &Surface,
 ) -> Vec<TrimLoop> {
+    if let Some(band_loop) = girdle_pieces_to_band_loop(&pieces, surface) {
+        return vec![band_loop];
+    }
     let (mut closed, mut open) = (Vec::new(), Vec::new());
     pieces.into_iter().for_each(|mut piece| {
         if piece
@@ -3026,6 +3180,169 @@ mod tests {
                 sense.len()
             );
         });
+    }
+
+    /// Every trim loop must lie inside the surface's declared parameter
+    /// domain. Renderers clamp trim parameters to the knot range rather than
+    /// wrapping them around a closed surface, so a loop left on another lap
+    /// draws as a wedge sliver instead of a clean hole.
+    ///
+    /// Regression: cap circles of closed cylinders/cones came out as
+    /// zero-area "girdle" loops on the lap they happened to be authored on —
+    /// `u` in `[pi, 3pi]` against a declared `[0, 2pi]` — while the visible
+    /// band fell back to the surface's natural rectangle at the wrong
+    /// position along the axis.
+    #[test]
+    #[cfg_attr(
+        feature = "nsi-out-of-domain-trims",
+        ignore = "reproducer build deliberately leaves trims off-domain"
+    )]
+    fn boxy_trim_loops_stay_inside_the_exported_parameter_domain() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/boxy_with_surfacetex.stp");
+        let scene = monster_step_viewer::load_step_file(&path)
+            .expect("STEP fixture should load");
+        let shell_data = scene
+            .shells
+            .first()
+            .and_then(|shell| shell.original_shell.as_ref())
+            .expect("STEP fixture should preserve original shell data");
+        let shell: &StepCompressedShell = shell_data
+            .downcast_ref()
+            .expect("STEP fixture should preserve compressed BRep data");
+
+        let tolerance = 1.0e-3;
+        let escapes: Vec<String> = shell
+            .faces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, face)| face_to_nsi(index, face, &shell.edges))
+            .filter_map(|surface| {
+                let trims = surface.trims.as_ref()?;
+                let (min_u, max_u) = trim_u_range(trims);
+                let (min_v, max_v) = trim_v_range(trims);
+                let out_u = min_u < surface.umin as f64 - tolerance
+                    || max_u > surface.umax as f64 + tolerance;
+                let out_v = min_v < surface.vmin as f64 - tolerance
+                    || max_v > surface.vmax as f64 + tolerance;
+                (out_u || out_v).then(|| {
+                    format!(
+                        "face {} trim u=[{min_u:.4},{max_u:.4}] v=[{min_v:.4},{max_v:.4}] outside u=[{:.4},{:.4}] v=[{:.4},{:.4}]",
+                        surface.face_index,
+                        surface.umin,
+                        surface.umax,
+                        surface.vmin,
+                        surface.vmax,
+                    )
+                })
+            })
+            .collect();
+
+        assert!(
+            escapes.is_empty(),
+            "{} face(s) emit trims outside their parameter domain:\n  {}",
+            escapes.len(),
+            escapes.join("\n  ")
+        );
+    }
+
+    /// Companion pin for one bolt-hole wall (one-based face 4): its exported
+    /// band must sit between the two cap circles at `z = 8` and
+    /// `z = 10.4978`, not on the surface's natural `v` range near `z = 0`.
+    #[test]
+    #[cfg_attr(
+        feature = "nsi-out-of-domain-trims",
+        ignore = "reproducer build deliberately leaves trims off-domain"
+    )]
+    fn boxy_bolt_hole_wall_band_sits_between_its_cap_circles() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/boxy_with_surfacetex.stp");
+        let scene = monster_step_viewer::load_step_file(&path)
+            .expect("STEP fixture should load");
+        let shell_data = scene
+            .shells
+            .first()
+            .and_then(|shell| shell.original_shell.as_ref())
+            .expect("STEP fixture should preserve original shell data");
+        let shell: &StepCompressedShell = shell_data
+            .downcast_ref()
+            .expect("STEP fixture should preserve compressed BRep data");
+        let face_index = 3;
+        let nsi_surface =
+            face_to_nsi(face_index, &shell.faces[face_index], &shell.edges)
+                .expect("face should export to NSI");
+        let trims = nsi_surface.trims.as_ref().expect("face should be trimmed");
+
+        assert_eq!(trims.nloops, 1);
+        let (z_lo, z_hi) = homogeneous_axis_range(&nsi_surface, 2);
+        assert!(
+            (z_lo - 8.0).abs() < 1.0e-3 && (z_hi - 10.4978).abs() < 1.0e-3,
+            "band should span the cap circles, got z=[{z_lo},{z_hi}]"
+        );
+    }
+
+    /// Companion pin for a lone-girdle cone (one-based face 11): the face
+    /// closes at the apex, so the exported band must run from the cap circle
+    /// to the apex — along the cone's axis (`y` here) from `-29.5022` to
+    /// `-28.0` — instead of the natural `v` range hundreds of units away.
+    #[test]
+    #[cfg_attr(
+        feature = "nsi-out-of-domain-trims",
+        ignore = "reproducer build deliberately leaves trims off-domain"
+    )]
+    fn boxy_lone_girdle_cone_band_reaches_the_apex() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/boxy_with_surfacetex.stp");
+        let scene = monster_step_viewer::load_step_file(&path)
+            .expect("STEP fixture should load");
+        let shell_data = scene
+            .shells
+            .first()
+            .and_then(|shell| shell.original_shell.as_ref())
+            .expect("STEP fixture should preserve original shell data");
+        let shell: &StepCompressedShell = shell_data
+            .downcast_ref()
+            .expect("STEP fixture should preserve compressed BRep data");
+        let face_index = 10;
+        let nsi_surface =
+            face_to_nsi(face_index, &shell.faces[face_index], &shell.edges)
+                .expect("face should export to NSI");
+        let trims = nsi_surface.trims.as_ref().expect("face should be trimmed");
+
+        assert_eq!(trims.nloops, 1);
+        let (y_lo, y_hi) = homogeneous_axis_range(&nsi_surface, 1);
+        // The apex end tolerates ~1e-2: the surface's natural `v` origin
+        // lies ~515 spans away, and the f32 linear-axis extrapolation
+        // cancels at that distance.
+        assert!(
+            (y_lo + 29.5022).abs() < 1.0e-3 && (y_hi + 28.0).abs() < 5.0e-2,
+            "band should span cap circle to apex, got y=[{y_lo},{y_hi}]"
+        );
+    }
+
+    fn homogeneous_axis_range(
+        surface: &NsiBrepSurfaceData,
+        axis: usize,
+    ) -> (f64, f64) {
+        surface
+            .pw
+            .iter()
+            .filter(|point| point[3].abs() > f32::EPSILON)
+            .map(|point| point[axis] as f64 / point[3] as f64)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), value| {
+                (lo.min(value), hi.max(value))
+            })
+    }
+
+    fn trim_v_range(trims: &NsiBrepTrimData) -> (f64, f64) {
+        trims
+            .v
+            .iter()
+            .zip(trims.w.iter())
+            .map(|(v, w)| *v as f64 / *w as f64)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), v| {
+                (min.min(v), max.max(v))
+            })
     }
 
     /// Companion pin for one known face: two loops, opposite senses.

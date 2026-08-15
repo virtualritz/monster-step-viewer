@@ -87,6 +87,12 @@ default = []
 # Writes standalone `.nsi` files. Native-only and independent from live
 # rendering.
 nsi-export = []
+# Reproducer build: keeps trim curves on their original parameter lap even
+# when that escapes the surface's declared domain. 3Delight clamps rather than
+# wrapping those, which renders as wedge slivers on cylinders; this exists so
+# `nsi-export` can emit an `.nsi` demonstrating it upstream. Never enable for
+# normal rendering.
+nsi-out-of-domain-trims = []
 # Renders trimmed NURBS surfaces via 3Delight (NSI) and overlays the result
 # in the viewport. Native-only; requires 3Delight installed locally
 # (`/usr/local/3delight/...` or `$DELIGHT`).
