@@ -315,8 +315,7 @@ impl NsiRenderState {
         shell_data: &CompressedShellData,
         model_matrix: Mat4,
     ) {
-        let surfaces =
-            brep::shell_data_to_nsi_surfaces_for_scalar_trim_sense(shell_data);
+        let surfaces = brep::shell_data_to_nsi_surfaces(shell_data);
         if surfaces.is_empty() {
             self.hide_shell_faces(key);
             return;
@@ -522,10 +521,7 @@ impl NsiRenderState {
                     nsi::f32_slice!("trimcurves.u", &trims.u),
                     nsi::f32_slice!("trimcurves.v", &trims.v),
                     nsi::f32_slice!("trimcurves.w", &trims.w),
-                    nsi::i32!(
-                        "trimcurves.sense",
-                        trims.scalar_sense_workaround()
-                    ),
+                    nsi::i32_slice!("trimcurves.sense", &trims.sense),
                 ],
             );
         }

@@ -50,8 +50,6 @@ const MAX_RATIONAL_QUADRATIC_ARC: f64 = FRAC_PI_2;
 /// scaling, returning None).
 const PARAMETER_CURVE_TOLERANCE: f64 = 1.0e-3;
 const TRIM_CLOSURE_TOLERANCE: f64 = 1.0e-3;
-#[cfg(feature = "nsi-render")]
-const SCALAR_COMPATIBLE_TRIM_SENSE: i32 = 1;
 type StepFaceTrim = CompressedEdgeUse<StepParameterCurve>;
 type StepCompressedFace = CompressedTrimmedFace<Surface, StepParameterCurve>;
 type StepCompressedShell =
@@ -91,21 +89,6 @@ pub(crate) struct NsiBrepTrimData {
     pub w: Vec<f32>,
     /// Per-loop `trimcurves.sense` values.
     pub sense: Vec<i32>,
-}
-
-impl NsiBrepTrimData {
-    #[cfg(feature = "nsi-render")]
-    pub(crate) fn scalar_sense_workaround(&self) -> i32 {
-        self.sense.first().copied().unwrap_or(0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TrimSenseMode {
-    #[cfg(any(feature = "nsi-export", test))]
-    PerLoop,
-    #[cfg(feature = "nsi-render")]
-    ScalarCompatible,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -191,29 +174,8 @@ enum SurfaceAxis {
 /// boundaries (if any) close cleanly. Faces with non-NURBS surfaces or
 /// incomplete trim boundaries are silently skipped — they just won't
 /// appear in the NSI overlay.
-#[cfg(any(feature = "nsi-export", test))]
 pub(crate) fn shell_data_to_nsi_surfaces(
     shell_data: &CompressedShellData,
-) -> Vec<NsiBrepSurfaceData> {
-    shell_data_to_nsi_surfaces_with_trim_sense(
-        shell_data,
-        TrimSenseMode::PerLoop,
-    )
-}
-
-#[cfg(feature = "nsi-render")]
-pub(crate) fn shell_data_to_nsi_surfaces_for_scalar_trim_sense(
-    shell_data: &CompressedShellData,
-) -> Vec<NsiBrepSurfaceData> {
-    shell_data_to_nsi_surfaces_with_trim_sense(
-        shell_data,
-        TrimSenseMode::ScalarCompatible,
-    )
-}
-
-fn shell_data_to_nsi_surfaces_with_trim_sense(
-    shell_data: &CompressedShellData,
-    trim_sense_mode: TrimSenseMode,
 ) -> Vec<NsiBrepSurfaceData> {
     let Some(shell): Option<&StepCompressedShell> = shell_data.downcast_ref()
     else {
@@ -224,7 +186,7 @@ fn shell_data_to_nsi_surfaces_with_trim_sense(
         .iter()
         .enumerate()
         .filter_map(|(face_index, face)| {
-            face_to_nsi(face_index, face, &shell.edges, trim_sense_mode)
+            face_to_nsi(face_index, face, &shell.edges)
         })
         .collect()
 }
@@ -233,7 +195,6 @@ fn face_to_nsi(
     face_index: usize,
     face: &StepCompressedFace,
     edges: &[CompressedEdge<Curve3D>],
-    trim_sense_mode: TrimSenseMode,
 ) -> Option<NsiBrepSurfaceData> {
     let mut surface = surface_to_nsi_data(&face.surface)?;
     let has_boundaries =
@@ -278,8 +239,7 @@ fn face_to_nsi(
             "NSI BRep emitter: face {face_index} uses {sampled_trim_fallback_count} sampled trim fallback(s)"
         );
     }
-    let trims =
-        trim_loops.map(|loops| trim_loops_to_nsi_data(loops, trim_sense_mode));
+    let trims = trim_loops.map(trim_loops_to_nsi_data);
 
     Some(NsiBrepSurfaceData {
         face_index,
@@ -694,24 +654,8 @@ fn trims_to_nsi_data(
     face_surface: &Surface,
     _surface: &NsiBrepSurfaceData,
 ) -> Option<Option<NsiBrepTrimData>> {
-    trims_to_nsi_data_with_mode(
-        boundaries,
-        edges,
-        face_surface,
-        TrimSenseMode::PerLoop,
-    )
-}
-
-#[cfg(test)]
-fn trims_to_nsi_data_with_mode(
-    boundaries: &[Vec<StepFaceTrim>],
-    edges: &[CompressedEdge<Curve3D>],
-    face_surface: &Surface,
-    trim_sense_mode: TrimSenseMode,
-) -> Option<Option<NsiBrepTrimData>> {
-    trim_loops_from_boundaries(boundaries, edges, face_surface).map(|loops| {
-        loops.map(|loops| trim_loops_to_nsi_data(loops, trim_sense_mode))
-    })
+    trim_loops_from_boundaries(boundaries, edges, face_surface)
+        .map(|loops| loops.map(trim_loops_to_nsi_data))
 }
 
 fn trim_loops_from_boundaries(
@@ -838,11 +782,8 @@ fn mirror_trim_loop_u_axis(trim_loop: &mut TrimLoop, umin: f32, umax: f32) {
         .for_each(|point| point.x = u_origin as f64 - point.x);
 }
 
-fn trim_loops_to_nsi_data(
-    mut loops: Vec<TrimLoop>,
-    trim_sense_mode: TrimSenseMode,
-) -> NsiBrepTrimData {
-    let sense = trim_senses_for_mode(&mut loops, trim_sense_mode);
+fn trim_loops_to_nsi_data(mut loops: Vec<TrimLoop>) -> NsiBrepTrimData {
+    let sense: Vec<i32> = loops.iter().map(trim_loop_sense).collect();
     loops.iter_mut().for_each(snap_trim_loop_curve_endpoints);
     let nloops = loops.len() as i32;
     let ncurves = loops
@@ -879,32 +820,6 @@ fn trim_loops_to_nsi_data(
             .collect(),
         sense,
     }
-}
-
-#[cfg(feature = "nsi-render")]
-fn trim_senses_for_mode(
-    loops: &mut [TrimLoop],
-    trim_sense_mode: TrimSenseMode,
-) -> Vec<i32> {
-    if matches!(trim_sense_mode, TrimSenseMode::ScalarCompatible) {
-        loops
-            .iter_mut()
-            .filter(|trim_loop| {
-                trim_loop_sense(trim_loop) != SCALAR_COMPATIBLE_TRIM_SENSE
-            })
-            .for_each(reverse_trim_loop);
-        vec![SCALAR_COMPATIBLE_TRIM_SENSE; loops.len()]
-    } else {
-        loops.iter().map(trim_loop_sense).collect()
-    }
-}
-
-#[cfg(not(feature = "nsi-render"))]
-fn trim_senses_for_mode(
-    loops: &mut [TrimLoop],
-    _trim_sense_mode: TrimSenseMode,
-) -> Vec<i32> {
-    loops.iter().map(trim_loop_sense).collect()
 }
 
 fn trim_loop_sense(trim_loop: &TrimLoop) -> i32 {
@@ -2473,8 +2388,8 @@ mod tests {
             surface,
         };
 
-        let nsi_surface = face_to_nsi(0, &face, &[], TrimSenseMode::PerLoop)
-            .expect("cylinder should export to NSI");
+        let nsi_surface =
+            face_to_nsi(0, &face, &[]).expect("cylinder should export to NSI");
 
         assert_eq!(nsi_surface.nv, 2);
         assert_eq!(nsi_surface.face_index, 0);
@@ -2543,75 +2458,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "nsi-render")]
-    fn scalar_compatible_trim_sense_uses_fixed_outside_sense() {
-        let surface =
-            Surface::ElementarySurface(ElementarySurface::Plane(Plane::xy()));
-        let mut hole = rectangle_parameter_curve(&surface, 0.5, 1.0, 0.5, 1.0);
-        hole.invert();
-        let boundaries = vec![
-            vec![edge_use_with_trim(rectangle_parameter_curve(
-                &surface, 0.0, 2.0, 0.0, 2.0,
-            ))],
-            vec![edge_use_with_trim(hole)],
-        ];
-
-        let trims = trims_to_nsi_data_with_mode(
-            &boundaries,
-            &[],
-            &surface,
-            TrimSenseMode::ScalarCompatible,
-        )
-        .expect("trim extraction should succeed")
-        .expect("trim data should be emitted");
-
-        assert_eq!(trims.nloops, 2);
-        assert_eq!(trims.ncurves, vec![1, 1]);
-        assert_eq!(trims.sense, vec![1, 1]);
-        assert!(uv_near(trim_point(&trims, 0), Point2::new(0.0, 0.0)));
-        assert!(uv_near(trim_point(&trims, 1), Point2::new(0.0, 2.0)));
-        let hole_start = usize::try_from(trims.n[0])
-            .expect("trim point count should fit usize");
-        assert!(uv_near(
-            trim_point(&trims, hole_start),
-            Point2::new(0.5, 0.5)
-        ));
-        assert!(uv_near(
-            trim_point(&trims, hole_start + 1),
-            Point2::new(0.5, 1.0)
-        ));
-    }
-
-    #[test]
-    #[cfg(feature = "nsi-render")]
-    fn boxy_face_12_scalar_trim_sense_uses_fixed_outside_sense() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("step-files/boxy_with_surfacetex.stp");
-        let scene = monster_step_viewer::load_step_file(&path)
-            .expect("STEP fixture should load");
-        let shell_data = scene
-            .shells
-            .first()
-            .and_then(|shell| shell.original_shell.as_ref())
-            .expect("STEP fixture should preserve original shell data");
-        let shell: &StepCompressedShell = shell_data
-            .downcast_ref()
-            .expect("STEP fixture should preserve compressed BRep data");
-        let face_index = 11;
-        let nsi_surface = face_to_nsi(
-            face_index,
-            &shell.faces[face_index],
-            &shell.edges,
-            TrimSenseMode::ScalarCompatible,
-        )
-        .expect("face should export to NSI");
-        let trims = nsi_surface.trims.expect("face should be trimmed");
-
-        assert_eq!(trims.nloops, 1);
-        assert_eq!(trims.sense, vec![1]);
-    }
-
-    #[test]
-    #[cfg(feature = "nsi-render")]
     fn ap224_face_22_trim_uses_positive_cone_lap() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("step-files/ap224_995277945.stp");
@@ -2626,28 +2472,20 @@ mod tests {
             .downcast_ref()
             .expect("STEP fixture should preserve compressed BRep data");
         let face_index = 21;
-        [TrimSenseMode::PerLoop, TrimSenseMode::ScalarCompatible]
-            .into_iter()
-            .for_each(|trim_sense_mode| {
-                let nsi_surface = face_to_nsi(
-                    face_index,
-                    &shell.faces[face_index],
-                    &shell.edges,
-                    trim_sense_mode,
-                )
+        let nsi_surface =
+            face_to_nsi(face_index, &shell.faces[face_index], &shell.edges)
                 .expect("face should export to NSI");
-                let trims = nsi_surface.trims.expect("face should be trimmed");
-                let (min_u, max_u) = trim_u_range(&trims);
+        let trims = nsi_surface.trims.expect("face should be trimmed");
+        let (min_u, max_u) = trim_u_range(&trims);
 
-                assert!(
-                    min_u >= PI - 1.0e-4,
-                    "one-based face 22 {trim_sense_mode:?} should stay on the positive cone lap, got min_u={min_u}"
-                );
-                assert!(
-                    max_u <= TAU + 1.0e-4,
-                    "one-based face 22 {trim_sense_mode:?} should stay inside the cone period, got max_u={max_u}"
-                );
-            });
+        assert!(
+            min_u >= PI - 1.0e-4,
+            "one-based face 22 should stay on the positive cone lap, got min_u={min_u}"
+        );
+        assert!(
+            max_u <= TAU + 1.0e-4,
+            "one-based face 22 should stay inside the cone period, got max_u={max_u}"
+        );
     }
 
     #[test]
@@ -2666,30 +2504,22 @@ mod tests {
             .downcast_ref()
             .expect("STEP fixture should preserve compressed BRep data");
         let face_index = 39;
-        [TrimSenseMode::PerLoop, TrimSenseMode::ScalarCompatible]
-            .into_iter()
-            .for_each(|trim_sense_mode| {
-                let nsi_surface = face_to_nsi(
-                    face_index,
-                    &shell.faces[face_index],
-                    &shell.edges,
-                    trim_sense_mode,
-                )
+        let nsi_surface =
+            face_to_nsi(face_index, &shell.faces[face_index], &shell.edges)
                 .expect("face should export to NSI");
-                let trims = nsi_surface.trims.expect("face should be trimmed");
-                let (min_u, max_u) = trim_u_range(&trims);
+        let trims = nsi_surface.trims.expect("face should be trimmed");
+        let (min_u, max_u) = trim_u_range(&trims);
 
-                assert!(
-                    min_u >= nsi_surface.umin as f64 - 1.0e-4,
-                    "one-based face 40 {trim_sense_mode:?} should stay inside exported cone u-domain, got min_u={min_u}, umin={}",
-                    nsi_surface.umin
-                );
-                assert!(
-                    max_u <= nsi_surface.umax as f64 + 1.0e-4,
-                    "one-based face 40 {trim_sense_mode:?} should stay inside exported cone u-domain, got max_u={max_u}, umax={}",
-                    nsi_surface.umax
-                );
-            });
+        assert!(
+            min_u >= nsi_surface.umin as f64 - 1.0e-4,
+            "one-based face 40 should stay inside exported cone u-domain, got min_u={min_u}, umin={}",
+            nsi_surface.umin
+        );
+        assert!(
+            max_u <= nsi_surface.umax as f64 + 1.0e-4,
+            "one-based face 40 should stay inside exported cone u-domain, got max_u={max_u}, umax={}",
+            nsi_surface.umax
+        );
     }
 
     #[test]
@@ -2890,13 +2720,9 @@ mod tests {
             .downcast_ref()
             .expect("STEP fixture should preserve compressed BRep data");
         let face_index = 11;
-        let nsi_surface = face_to_nsi(
-            face_index,
-            &shell.faces[face_index],
-            &shell.edges,
-            TrimSenseMode::PerLoop,
-        )
-        .expect("face should export to NSI");
+        let nsi_surface =
+            face_to_nsi(face_index, &shell.faces[face_index], &shell.edges)
+                .expect("face should export to NSI");
         let trims = nsi_surface.trims.expect("face should be trimmed");
 
         assert_trim_loops_are_connected(
@@ -3041,32 +2867,18 @@ mod tests {
                 trim_loop.topology_points,
             );
         });
-        dump_step_face_nsi_payload_for_mode(
-            face_index,
-            face,
-            &shell.edges,
-            TrimSenseMode::PerLoop,
-        );
-        #[cfg(feature = "nsi-render")]
-        dump_step_face_nsi_payload_for_mode(
-            face_index,
-            face,
-            &shell.edges,
-            TrimSenseMode::ScalarCompatible,
-        );
+        dump_face_nsi_payload(face_index, face, &shell.edges);
     }
 
-    fn dump_step_face_nsi_payload_for_mode(
+    fn dump_face_nsi_payload(
         face_index: usize,
         face: &StepCompressedFace,
         edges: &[CompressedEdge<Curve3D>],
-        trim_sense_mode: TrimSenseMode,
     ) {
-        let nsi_surface = face_to_nsi(face_index, face, edges, trim_sense_mode)
+        let nsi_surface = face_to_nsi(face_index, face, edges)
             .expect("face should export to NSI");
         eprintln!(
-            "nsi {:?} surface face={} nu={} nv={} uorder={} vorder={} u=[{}..{}] v=[{}..{}] fallbacks={}",
-            trim_sense_mode,
+            "nsi surface face={} nu={} nv={} uorder={} vorder={} u=[{}..{}] v=[{}..{}] fallbacks={}",
             nsi_surface.face_index + 1,
             nsi_surface.nu,
             nsi_surface.nv,
@@ -3164,5 +2976,80 @@ mod tests {
                 .min(period - (current - next).abs().rem_euclid(period))
                 <= TOLERANCE
         })
+    }
+    /// A face's holes must not share the outer loop's sense, or the renderer
+    /// cannot tell which side to keep and renders the holes solid while
+    /// cutting the face body away.
+    ///
+    /// Regression: `trimcurves.sense` used to be forced to a single scalar for
+    /// the live renderer, geometrically reversing every loop that disagreed,
+    /// because 3Delight only accepted one value. That version accepts the
+    /// per-loop array, so the workaround is gone.
+    #[test]
+    fn boxy_multi_loop_faces_emit_per_loop_trim_senses() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/boxy_with_surfacetex.stp");
+        let scene = monster_step_viewer::load_step_file(&path)
+            .expect("STEP fixture should load");
+        let shell_data = scene
+            .shells
+            .first()
+            .and_then(|shell| shell.original_shell.as_ref())
+            .expect("STEP fixture should preserve original shell data");
+        let shell: &StepCompressedShell = shell_data
+            .downcast_ref()
+            .expect("STEP fixture should preserve compressed BRep data");
+
+        let multi_loop_faces: Vec<(usize, Vec<i32>)> = shell
+            .faces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, face)| face_to_nsi(index, face, &shell.edges))
+            .filter_map(|surface| {
+                let face_index = surface.face_index;
+                surface
+                    .trims
+                    .filter(|trims| trims.nloops > 1)
+                    .map(|trims| (face_index, trims.sense))
+            })
+            .collect();
+
+        assert!(
+            !multi_loop_faces.is_empty(),
+            "fixture should have faces with holes"
+        );
+        multi_loop_faces.iter().for_each(|(face_index, sense)| {
+            assert!(
+                sense.iter().any(|value| *value != sense[0]),
+                "face {face_index} emitted a single sense {sense:?} for {} loops; \
+                 holes would render solid",
+                sense.len()
+            );
+        });
+    }
+
+    /// Companion pin for one known face: two loops, opposite senses.
+    #[test]
+    fn boxy_face_13_hole_sense_opposes_its_outer_loop() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/boxy_with_surfacetex.stp");
+        let scene = monster_step_viewer::load_step_file(&path)
+            .expect("STEP fixture should load");
+        let shell_data = scene
+            .shells
+            .first()
+            .and_then(|shell| shell.original_shell.as_ref())
+            .expect("STEP fixture should preserve original shell data");
+        let shell: &StepCompressedShell = shell_data
+            .downcast_ref()
+            .expect("STEP fixture should preserve compressed BRep data");
+        let face_index = 12;
+        let nsi_surface =
+            face_to_nsi(face_index, &shell.faces[face_index], &shell.edges)
+                .expect("face should export to NSI");
+        let trims = nsi_surface.trims.expect("face should be trimmed");
+
+        assert_eq!(trims.nloops, 2);
+        assert_eq!(trims.sense, vec![0, 1]);
     }
 }
