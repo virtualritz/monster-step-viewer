@@ -2757,14 +2757,35 @@ mod tests {
 
     #[test]
     fn initial_camera_offset_matches_startup_view_direction() {
-        let offset = initial_camera_offset(2.0, UpAxis::Y);
+        // Startup uses `UpAxis::default()`, which is Z -- CAD models are
+        // usually Z-up. The pinned expectation is the Z branch: the camera
+        // orbits in the XY ground plane and elevates along Z.
+        let offset = initial_camera_offset(2.0, UpAxis::default());
+        let horizontal = 2.0 * FRAC_PI_6.cos();
         let expected = Vec3::new(
-            2.0 * FRAC_PI_4.cos() * FRAC_PI_6.cos(),
+            horizontal * FRAC_PI_4.cos(),
+            horizontal * FRAC_PI_4.sin(),
             2.0 * FRAC_PI_6.sin(),
-            2.0 * FRAC_PI_4.sin() * FRAC_PI_6.cos(),
         );
 
         assert!((offset - expected).length() < 1.0e-6);
+    }
+
+    #[test]
+    fn initial_camera_offset_elevates_along_the_chosen_up_axis() {
+        let elevation = 2.0 * FRAC_PI_6.sin();
+
+        let z_up = initial_camera_offset(2.0, UpAxis::Z);
+        let y_up = initial_camera_offset(2.0, UpAxis::Y);
+
+        assert!(
+            (z_up.z - elevation).abs() < 1.0e-6,
+            "Z-up should elevate along Z, got {z_up:?}"
+        );
+        assert!(
+            (y_up.y - elevation).abs() < 1.0e-6,
+            "Y-up should elevate along Y, got {y_up:?}"
+        );
     }
 
     #[test]
