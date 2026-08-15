@@ -35,6 +35,7 @@ use monstertruck::{
     traits::{
         ExactParameterBoundary2D, Invertible, ParameterBoundary2D,
         ParameterDivision1D, ParametricSurface,
+        algo::surface::{girdle_axis_and_value, girdle_band_range},
     },
 };
 
@@ -1315,89 +1316,6 @@ fn close_topology_piece(points: Vec<Point2>) -> Option<(Vec<Point2>, bool)> {
     }
 }
 
-// --- Generic periodic-surface parameter maths ------------------------------
-// The next three functions touch only monstertruck types (`Surface`,
-// `Point2`) and plain scalars — no NSI data. They are candidates for
-// upstreaming into monstertruck's geometry/topology layer, next to the
-// tessellator's own seam handling.
-
-/// Identifies a parameter-space boundary polyline that runs one full lap
-/// around a periodic axis at a constant cross parameter — the image of a
-/// cylinder or cone cap circle. Returns the periodic axis and the constant
-/// cross value.
-fn girdle_axis_and_value(
-    points: &[Point2],
-    surface: &Surface,
-) -> Option<(usize, f64)> {
-    (0..=1usize).find_map(|axis| {
-        let (period, _) = surface_axis_range(surface, axis);
-        let period = period?;
-        let (lo, hi) = curve_axis_span(points, axis)?;
-        let (cross_lo, cross_hi) = curve_axis_span(points, 1 - axis)?;
-        ((hi - lo - period).abs() <= TRIM_CLOSURE_TOLERANCE
-            && cross_hi - cross_lo <= TRIM_CLOSURE_TOLERANCE)
-            .then_some((axis, (cross_lo + cross_hi) * 0.5))
-    })
-}
-
-/// Cross-axis parameter interval bounded by a set of girdles that all lap the
-/// same periodic axis. Returns that axis and the interval.
-///
-/// Two or more girdles bound the band between the outermost pair; a lone
-/// girdle bounds the patch that closes at the surface's apex (verified
-/// against the mesher for the cone faces of the boxy fixture).
-fn girdle_band_range(
-    girdles: &[(usize, f64)],
-    surface: &Surface,
-) -> Option<(usize, (f64, f64))> {
-    let (axis, _) = *girdles.first()?;
-    if girdles.iter().any(|(other_axis, _)| *other_axis != axis) {
-        return None;
-    }
-    let (band_lo, band_hi) = match girdles {
-        [(_, value)] => {
-            let apex = surface_apex_parameter(surface, 1 - axis)?;
-            (f64::min(*value, apex), f64::max(*value, apex))
-        }
-        _ => girdles.iter().fold(
-            (f64::INFINITY, f64::NEG_INFINITY),
-            |(lo, hi), (_, value)| (lo.min(*value), hi.max(*value)),
-        ),
-    };
-    (band_hi - band_lo > TOLERANCE).then_some((axis, (band_lo, band_hi)))
-}
-
-/// Parameter along `band_axis` at which the surface collapses to a point (a
-/// cone's apex), found from the linear taper of the ruled surface. `None`
-/// when the surface does not taper or never reaches zero radius.
-fn surface_apex_parameter(surface: &Surface, band_axis: usize) -> Option<f64> {
-    let (_, periodic_range) = surface_axis_range(surface, 1 - band_axis);
-    let (periodic_lo, periodic_hi) = periodic_range?;
-    let (_, band_range) = surface_axis_range(surface, band_axis);
-    let (band_lo, band_hi) = band_range?;
-    let radius = |band: f64| {
-        let point = |periodic: f64| match band_axis {
-            0 => surface.evaluate(band, periodic),
-            _ => surface.evaluate(periodic, band),
-        };
-        // Half the distance between diametrically opposite points; the
-        // natural periodic range is one full lap, so its midpoint is the
-        // antipode of its start.
-        point(periodic_lo).distance(point((periodic_lo + periodic_hi) * 0.5))
-            * 0.5
-    };
-    let (r_lo, r_hi) = (radius(band_lo), radius(band_hi));
-    if (r_hi - r_lo).abs() <= TOLERANCE {
-        return None;
-    }
-    let apex = band_lo - r_lo * (band_hi - band_lo) / (r_hi - r_lo);
-    // Re-evaluating guards against non-linear tapers where extrapolating the
-    // two samples lands somewhere the surface has not actually collapsed.
-    (apex.is_finite() && radius(apex) <= TRIM_CLOSURE_TOLERANCE).then_some(apex)
-}
-
-// --- End of upstreaming candidates ------------------------------------------
-
 /// Replaces a face boundary made entirely of girdle pieces with the
 /// axis-aligned parameter rectangle they bound.
 ///
@@ -1425,11 +1343,23 @@ fn girdle_pieces_to_band_loop(
             // parameter space enclose real area and must be kept as authored.
             piece
                 .closed_by_topology
-                .then(|| girdle_axis_and_value(&piece.topology_points, surface))
+                .then(|| {
+                    let points: Vec<(f64, f64)> = piece
+                        .topology_points
+                        .iter()
+                        .map(|point| (point.x, point.y))
+                        .collect();
+                    girdle_axis_and_value(
+                        &points,
+                        surface,
+                        TRIM_CLOSURE_TOLERANCE,
+                    )
+                })
                 .flatten()
         })
         .collect::<Option<Vec<_>>>()?;
-    let (axis, (band_lo, band_hi)) = girdle_band_range(&girdles, surface)?;
+    let (axis, (band_lo, band_hi)) =
+        girdle_band_range(&girdles, surface, TRIM_CLOSURE_TOLERANCE)?;
     let (_, periodic_range) = surface_axis_range(surface, axis);
     let (periodic_lo, periodic_hi) = periodic_range?;
     let corner = |periodic: f64, band: f64| match axis {
