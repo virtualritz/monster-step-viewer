@@ -1793,21 +1793,20 @@ fn viewer_ui(
                             }
                             poly_edges_btn.on_hover_text("Polygon edges");
 
-                            // Up-axis flip — a plain button (not a toggle):
-                            // the current up axis is shown first, the other
-                            // second, and the two swap positions each press.
-                            // Plain ASCII text, not a Material Symbols glyph.
+                            // Up-axis flip — a plain button (not a toggle).
+                            // It shows the axis that is up *now*: `Z/Y` read
+                            // as either "Z now" or "switches to Z", so only
+                            // the active axis is labelled. Plain ASCII text,
+                            // not a Material Symbols glyph.
                             let up_btn = ui.add_sized(
                                 egui::vec2(
                                     TOOLBAR_ICON_BUTTON_SIZE,
                                     TOOLBAR_ICON_BUTTON_SIZE,
                                 ),
                                 egui::Button::new(
-                                    egui::RichText::new(format!(
-                                        "{}/{}",
+                                    egui::RichText::new(
                                         state.up_axis.letter(),
-                                        state.up_axis.toggled().letter(),
-                                    ))
+                                    )
                                     .size(16.0),
                                 ),
                             );
@@ -1817,8 +1816,9 @@ fn viewer_ui(
                                 state.settings_dirty = true;
                             }
                             up_btn.on_hover_text(format!(
-                                "Up axis: {} (click to swap)",
-                                state.up_axis.letter()
+                                "{} is up — click to switch to {}",
+                                state.up_axis.letter(),
+                                state.up_axis.toggled().letter(),
                             ));
 
                             #[cfg(all(

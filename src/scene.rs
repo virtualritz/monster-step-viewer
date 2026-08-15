@@ -1564,18 +1564,32 @@ pub(crate) fn apply_up_axis_change(
     if !state.up_axis_changed {
         return;
     }
-    state.up_axis_changed = false;
     let up = state.up_axis;
     let Ok((mut transform, mut editor_cam)) = camera_query.single_mut() else {
+        // Keep the request pending. Clearing the flag before knowing the
+        // camera exists dropped the change on any frame the query missed,
+        // which is why the button needed several presses to do anything.
         return;
     };
-    // Re-frame around the current scene bounds if we have them, otherwise
-    // just re-pin the orbit up so the next frame is correct.
-    if let Some(bounds) = state.current_bounds {
-        frame_camera_initial(bounds, &mut transform, &mut editor_cam, up);
-    } else {
-        set_orbit_up(&mut editor_cam, up);
-    }
+    state.up_axis_changed = false;
+
+    // Orbit to the equivalent vantage for the new up axis rather than
+    // re-framing. The model appears to re-orient while the camera keeps the
+    // distance and angle the user had dialled in; re-framing threw that away
+    // and snapped back to the startup view.
+    //
+    // `UpAxis` has two variants, so the axis we came from is the other one.
+    let pivot = state
+        .current_bounds
+        .map_or(Vec3::ZERO, |bounds| bounds.center);
+    transform.translation = reorient_camera_around_pivot(
+        transform.translation,
+        pivot,
+        up.toggled(),
+        up,
+    );
+    *transform = transform.looking_at(pivot, up.vec());
+    set_orbit_up(&mut editor_cam, up);
 }
 
 pub(crate) fn handle_view_shortcuts(
@@ -1731,6 +1745,21 @@ fn update_editor_cam_anchor(editor_cam: &mut EditorCam, distance: f32) {
 }
 
 /// Pin the orbit so the given world axis stays vertical.
+/// Camera position that views the scene the same way after the up axis flips.
+///
+/// Orbits the camera about `pivot` by the rotation taking `from`'s up vector to
+/// `to`'s, which preserves the distance to the pivot -- and so the framing and
+/// the orbit anchor depth -- while the model appears to re-orient.
+fn reorient_camera_around_pivot(
+    translation: Vec3,
+    pivot: Vec3,
+    from: UpAxis,
+    to: UpAxis,
+) -> Vec3 {
+    pivot
+        + Quat::from_rotation_arc(from.vec(), to.vec()) * (translation - pivot)
+}
+
 fn set_orbit_up(editor_cam: &mut EditorCam, up: UpAxis) {
     editor_cam.orbit_constraint = OrbitConstraint::Fixed {
         up: up.vec().as_dvec3(),
@@ -2793,6 +2822,45 @@ mod tests {
         assert_eq!(
             view_shortcut_action(false, true, false),
             Some(ViewShortcutAction::FrameScene)
+        );
+    }
+    /// The up-axis flip used to call `frame_camera_initial`, which teleported
+    /// the camera to the startup vantage. It must keep the framing the user
+    /// dialled in and only re-orient the view.
+    #[test]
+    fn up_axis_flip_keeps_the_camera_distance_to_the_pivot() {
+        let pivot = Vec3::new(1.0, 2.0, 3.0);
+        let camera = pivot + Vec3::new(4.0, -5.0, 6.0);
+
+        let moved =
+            reorient_camera_around_pivot(camera, pivot, UpAxis::Z, UpAxis::Y);
+
+        assert!(
+            ((moved - pivot).length() - (camera - pivot).length()).abs()
+                < 1.0e-5,
+            "framing changed: {} -> {}",
+            (camera - pivot).length(),
+            (moved - pivot).length()
+        );
+        assert!(
+            (moved - camera).length() > 1.0e-3,
+            "the view should actually re-orient"
+        );
+    }
+
+    #[test]
+    fn up_axis_flip_round_trips_back_to_the_original_vantage() {
+        let pivot = Vec3::ZERO;
+        let camera = Vec3::new(2.0, 3.0, 4.0);
+
+        let flipped =
+            reorient_camera_around_pivot(camera, pivot, UpAxis::Z, UpAxis::Y);
+        let back =
+            reorient_camera_around_pivot(flipped, pivot, UpAxis::Y, UpAxis::Z);
+
+        assert!(
+            (back - camera).length() < 1.0e-5,
+            "flipping twice should return to {camera:?}, got {back:?}"
         );
     }
 }
