@@ -21,6 +21,7 @@ use crate::{
     nsi_render::{NsiRenderState, detect_3delight},
     state::{MainCamera, ViewerState},
 };
+use monster_step_viewer::StepShell;
 
 /// Bevy resource holding NSI overlay state.
 #[derive(Resource, Default)]
@@ -106,6 +107,14 @@ fn init_nsi_render_state(mut overlay: ResMut<NsiOverlayState>) {
     }
 }
 
+/// A shell's STEP assembly placement, or the identity when it has none.
+fn shell_placement(shell: &StepShell) -> glam::Mat4 {
+    shell
+        .transform
+        .as_ref()
+        .map_or(glam::Mat4::IDENTITY, |transform| transform.to_mat4())
+}
+
 fn scene_normalize_matrix(state: &ViewerState) -> glam::Mat4 {
     // Bevy world coords use `(p - center) * scale` per shell mesh; the same
     // transform must be applied to the BRep so it overlays cleanly.
@@ -145,7 +154,15 @@ fn push_scene_brep_to_nsi(
             .filter_map(|shell| {
                 let original = shell.original_shell.as_ref()?;
                 let key = format!("shell_{}", shell.id);
-                render.update_shell_brep(&key, original, matrix);
+                // The BRep is in the shell's own coordinates; the mesh path
+                // bakes the assembly placement into its vertices, so the
+                // exporter has to apply it here or every shell renders at the
+                // origin.
+                render.update_shell_brep(
+                    &key,
+                    original,
+                    matrix * shell_placement(shell),
+                );
                 Some(key)
             })
             .collect();

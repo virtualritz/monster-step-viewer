@@ -44,12 +44,26 @@ fn write_scene(
         .shells
         .iter()
         .filter_map(|shell| {
-            shell.original_shell.as_ref().map(|data| (shell.id, data))
+            shell
+                .original_shell
+                .as_ref()
+                .map(|data| (shell.id, data, shell.transform))
         })
-        .try_fold(0usize, |surface_count, (shell_id, shell_data)| {
-            write_shell(output, shell_id, shell_data, options.model_matrix)
-                .map(|shell_surface_count| surface_count + shell_surface_count)
-        })
+        .try_fold(
+            0usize,
+            |surface_count, (shell_id, shell_data, placement)| {
+                // The BRep is in the shell's own coordinates, so the assembly
+                // placement has to be composed in or the shell lands at the
+                // origin.
+                let matrix = options.model_matrix
+                    * placement.map_or(Mat4::IDENTITY, |placement| {
+                        placement.to_mat4()
+                    });
+                write_shell(output, shell_id, shell_data, matrix).map(
+                    |shell_surface_count| surface_count + shell_surface_count,
+                )
+            },
+        )
 }
 
 fn write_scene_header(

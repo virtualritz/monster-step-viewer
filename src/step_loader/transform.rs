@@ -91,6 +91,14 @@ impl Transform {
     }
 
     /// Transform a point.
+    /// The same matrix as a [`glam::Mat4`], for callers that hand geometry to
+    /// a renderer rather than transforming points themselves.
+    pub fn to_mat4(&self) -> glam::Mat4 {
+        glam::Mat4::from_cols_array_2d(
+            &self.cols.map(|col| col.map(|value| value as f32)),
+        )
+    }
+
     pub fn transform_point(&self, p: [f64; 3]) -> [f64; 3] {
         [
             self.cols[0][0] * p[0]
@@ -139,4 +147,47 @@ pub(crate) fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `to_mat4` has to agree with `transform_point`, or geometry handed to a
+    /// renderer as a matrix lands somewhere else than the same geometry
+    /// transformed point by point -- which is how assembly placements went
+    /// missing from the NSI export while the meshes were placed correctly.
+    #[test]
+    fn to_mat4_agrees_with_transform_point() {
+        let placement = Transform {
+            cols: [
+                [0.0, 1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [10.0, -5.0, 2.5, 1.0],
+            ],
+        };
+        let point = [3.0, 7.0, -1.0];
+
+        let by_point = placement.transform_point(point);
+        let by_matrix = placement.to_mat4()
+            * glam::Vec4::new(
+                point[0] as f32,
+                point[1] as f32,
+                point[2] as f32,
+                1.0,
+            );
+
+        assert!(
+            (by_matrix.x - by_point[0] as f32).abs() < 1.0e-4
+                && (by_matrix.y - by_point[1] as f32).abs() < 1.0e-4
+                && (by_matrix.z - by_point[2] as f32).abs() < 1.0e-4,
+            "matrix gave {by_matrix:?}, point-wise gave {by_point:?}"
+        );
+    }
+
+    #[test]
+    fn identity_to_mat4_is_the_identity() {
+        assert_eq!(Transform::identity().to_mat4(), glam::Mat4::IDENTITY);
+    }
 }
