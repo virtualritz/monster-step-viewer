@@ -98,7 +98,13 @@ fn write_scene_header(
     writeln!(output)?;
     writeln!(output, "Create \"mstpv_screen\" \"screen\"")?;
     write_set_attribute(output, "mstpv_screen")?;
-    write_u32_slice_attr(output, "resolution", &options.resolution)?;
+    // `resolution` is a single `int[2]`, not two `int`s: declaring it as the
+    // latter makes 3Delight reject the attribute and fall back to its default.
+    writeln!(
+        output,
+        "  \"resolution\" \"int[2]\" 1 [ {} {} ]",
+        options.resolution[0], options.resolution[1]
+    )?;
     write_i32_attr(output, "oversampling", 16)?;
     writeln!(
         output,
@@ -284,14 +290,6 @@ fn write_color_attr(
     writeln!(output, " ]")
 }
 
-fn write_u32_slice_attr(
-    output: &mut String,
-    name: &str,
-    values: &[u32],
-) -> fmt::Result {
-    write_slice_attr(output, name, "int", values)
-}
-
 fn write_i32_slice_attr(
     output: &mut String,
     name: &str,
@@ -313,7 +311,12 @@ fn write_f64_matrix_attr(
     name: &str,
     values: &[f64; 16],
 ) -> fmt::Result {
-    write_slice_attr(output, name, "doublematrix", values)
+    // `doublematrix` counts MATRICES, not doubles. Writing 16 here claims 16
+    // matrices -- 256 doubles -- against the 16 supplied, and 3Delight skips
+    // the whole `SetAttribute`, leaving the node at identity.
+    write!(output, "  \"{name}\" \"doublematrix\" 1 [")?;
+    write_values(output, values)?;
+    writeln!(output, " ]")
 }
 
 fn write_slice_attr<T: Display>(

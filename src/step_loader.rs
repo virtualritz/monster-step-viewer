@@ -604,198 +604,51 @@ pub fn load_step_file_with_progress(
     let raw = std::fs::read_to_string(path).with_context(|| {
         format!("Failed to read STEP file {}", path.display())
     })?;
+    collect_step_scene(raw, progress)
+}
 
-    let exchange = parse(&raw).context("Failed to parse STEP file")?;
-    let table = Table::from_data_section(
-        exchange
-            .data
-            .first()
-            .context("STEP file has no data sections")?,
+/// Tessellation tolerance as a fraction of a shell's diameter, used when the
+/// caller has no opinion. Matches the viewer's default quality setting.
+const DEFAULT_TOLERANCE_FACTOR: f64 = 0.001;
+
+/// Drains the streaming loader into a whole scene.
+///
+/// This shares [`load_step_from_string_inner`] with the streaming API rather
+/// than reimplementing it, so both see the same assembly transforms, tolerance
+/// and meshing options. They used to be separate implementations, and the
+/// duplicate quietly dropped every shell's assembly placement -- scenes loaded
+/// through here came back with their parts stacked at the origin.
+fn collect_step_scene(
+    raw: String,
+    progress: &LoadProgress,
+) -> anyhow::Result<StepScene> {
+    let (tx, rx) = mpsc::channel();
+    // The channel is unbounded, so running the loader inline just buffers.
+    let outcome = load_step_from_string_inner(
+        raw,
+        &tx,
+        DEFAULT_TOLERANCE_FACTOR,
+        MeshingConfig::default(),
     );
-    let entity_colors = parse_step_colors(&raw);
-    let shell_face_refs = parse_shell_face_refs(&raw);
+    drop(tx);
+    outcome?;
 
-    // Extract metadata.
-    let metadata = StepMetadata {
-        headers: exchange
-            .header
-            .iter()
-            .map(|r| HeaderEntry {
-                name: r.name.clone(),
-                parameter: r.parameter.clone(),
-            })
-            .collect(),
-        entity_count: exchange
-            .data
-            .iter()
-            .map(|section| section.entities.len())
-            .sum(),
-    };
-
-    // Build shell-to-solid mapping for topology preservation.
-    let shell_to_solid = build_shell_to_solid_map(&table);
-    let solid_cache: Mutex<HashMap<u64, CompressedShellData>> =
-        Mutex::new(HashMap::default());
-
-    // Convert each shell into a triangulated mesh (in parallel).
-    let mut shell_entries: Vec<_> = table.shell.iter().collect();
-    shell_entries.sort_by_key(|(id, _)| *id);
-
-    let total = shell_entries.len();
-    progress.set(0, total as u16);
-    let completed = AtomicUsize::new(0);
-
-    let shells: Result<Vec<StepShell>, anyhow::Error> = shell_entries
-        .into_par_iter()
-        .enumerate()
-        .map(|(local_idx, (shell_id, shell_holder))| {
-            let color = entity_colors.get(shell_id).copied();
-            let face_colors = face_colors_for_shell(
-                shell_id,
-                &shell_face_refs,
-                &entity_colors,
-            );
-            let compressed = table
-                .to_compressed_trimmed_shell(shell_holder)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to convert STEP shell into topology: {e}"
-                    )
-                })?;
-
-            // Build topology (Solid or Shell).
-            let topology = build_topology_for_shell(
-                shell_id,
-                &compressed,
-                &table,
-                &shell_to_solid,
-                &solid_cache,
-            );
-
-            // Classify curve types from original geometry (before
-            // tessellation).
-            let curve_types: Vec<String> = compressed
-                .edges
-                .iter()
-                .map(|e| classify_curve_type(&e.curve))
-                .collect();
-
-            let shell_bounds = compute_shell_bounds(&compressed, None);
-            let tol = compressed.relative_tolerance(0.001);
-
-            let has_boundaries = shell_requires_trimmed_meshing(&compressed);
-            let original_shell = CompressedShellData::new(compressed.clone());
-            let meshing_defaults = MeshingConfig::default();
-            let tessellation =
-                tessellate_original_shell(&compressed, tol, &meshing_defaults);
-            let face_isoparams = tessellation.face_isoparams;
-            let poly_shell = tessellation.shell;
-            let mut failed_faces = count_failed_face_meshes(&poly_shell);
-
-            // Extract tessellated curve edges from the meshed shell edges.
-            let curve_edges: Vec<StepEdge> = poly_shell
-                .edges
-                .iter()
-                .enumerate()
-                .map(|(i, edge)| {
-                    let points =
-                        edge.curve.iter().map(|p| [p.x, p.y, p.z]).collect();
-                    StepEdge {
-                        id: i,
-                        curve_type: curve_types
-                            .get(i)
-                            .cloned()
-                            .unwrap_or_else(|| "Unknown".to_string()),
-                        points,
-                    }
-                })
-                .collect();
-
-            // Extract individual faces and boundary edges from each face mesh.
-            let mut all_edges: Vec<([f64; 3], [f64; 3])> = Vec::new();
-            let faces: Vec<StepFace> = poly_shell
-                .faces
-                .iter()
-                .enumerate()
-                .filter_map(|(face_idx, face)| {
-                    face.surface.as_ref().and_then(|surface| {
-                        let mesh = match face.orientation {
-                            true => surface.clone(),
-                            false => surface.inverse(),
-                        };
-                        if !mesh_fits_shell_bounds(&mesh, shell_bounds, tol) {
-                            failed_faces += 1;
-                            None
-                        } else {
-                            // Extract boundary edges from this face's mesh.
-                            let face_edges = extract_mesh_edges(&mesh, None);
-                            all_edges.extend(face_edges);
-
-                            // Extract boundary loop topology.
-                            let boundary_loops: Vec<StepBoundaryLoop> = face
-                                .boundaries
-                                .iter()
-                                .enumerate()
-                                .map(|(loop_idx, loop_edges)| {
-                                    StepBoundaryLoop {
-                                        edge_indices: loop_edges
-                                            .iter()
-                                            .map(|ei| ei.index)
-                                            .collect(),
-                                        is_outer: loop_idx == 0,
-                                    }
-                                })
-                                .collect();
-
-                            Some(StepFace {
-                                id: face_idx,
-                                name: format!("Face {}", face_idx + 1),
-                                mesh,
-                                isoparams: face_isoparams
-                                    .get(face_idx)
-                                    .map(|curves| {
-                                        isoparam_curves_to_coords(curves, None)
-                                    })
-                                    .unwrap_or_default(),
-                                boundary_loops,
-                                color: face_color_at(&face_colors, face_idx),
-                            })
-                        }
-                    })
-                })
-                .collect();
-            if failed_faces > 0 {
-                log::warn!(
-                    "Shell {}: {} face meshes failed (has_boundaries={})",
-                    local_idx,
-                    failed_faces,
-                    has_boundaries
-                );
+    let mut metadata = StepMetadata::default();
+    let mut shells = Vec::new();
+    for message in rx {
+        match message {
+            LoadMessage::Metadata(parsed) => metadata = parsed,
+            LoadMessage::Shell(shell) => shells.push(shell),
+            LoadMessage::Progress { current, total, .. } => {
+                progress.set(current as u16, total as u16)
             }
+            LoadMessage::Error(error) => anyhow::bail!(error),
+            _ => {}
+        }
+    }
 
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            progress.set(done as u16, total as u16);
-
-            Ok(StepShell {
-                id: local_idx,
-                name: format!("Shell {}", local_idx + 1),
-                faces,
-                color,
-                transform: None,
-                edges: all_edges,
-                curve_edges,
-                original_shell: Some(original_shell),
-                topology,
-                tessellation_tolerance: tol,
-                failed_faces,
-            })
-        })
-        .collect();
-
-    let mut shells = shells?;
-    // Sort by id to maintain consistent ordering after parallel processing.
-    shells.sort_by_key(|s| s.id);
-
+    // Shells arrive in completion order from the parallel tessellator.
+    shells.sort_by_key(|shell| shell.id);
     if shells.is_empty() {
         anyhow::bail!("No shells found in STEP file");
     }
@@ -1890,5 +1743,44 @@ mod tests {
 
         assert_eq!(bounds.min, [0.0, 0.0, 0.0]);
         assert_eq!(bounds.max, [1.0, 1.0, 1.0]);
+    }
+    /// `load_step_file` used to be a separate implementation from the
+    /// streaming loader and hardcoded `transform: None`, so every assembly
+    /// placement was dropped and a multi-part scene came back with its parts
+    /// stacked at the origin. The meshes are placed, the BRep in
+    /// `original_shell` is not -- consumers of the BRep apply `transform`
+    /// themselves -- so this pins both halves.
+    #[test]
+    fn non_streaming_load_keeps_assembly_placements() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/Raspberry Pi 4 Model B.STEP");
+        let scene = load_step_file(&path).expect("STEP fixture should load");
+
+        assert!(scene.shells.len() > 50, "expected an assembly");
+        assert!(
+            scene.shells.iter().all(|shell| shell.transform.is_some()),
+            "every shell should carry its placement"
+        );
+
+        let centres: Vec<f64> = scene
+            .shells
+            .iter()
+            .filter_map(|shell| {
+                let (low, high) = shell
+                    .faces
+                    .iter()
+                    .flat_map(|face| face.mesh.positions())
+                    .fold((f64::MAX, f64::MIN), |(low, high), point| {
+                        (low.min(point.x), high.max(point.x))
+                    });
+                (low <= high).then_some((low + high) * 0.5)
+            })
+            .collect();
+        let spread = centres.iter().copied().fold(f64::MIN, f64::max)
+            - centres.iter().copied().fold(f64::MAX, f64::min);
+        assert!(
+            spread > 50.0,
+            "placed shells should spread across the board, got {spread}"
+        );
     }
 }
