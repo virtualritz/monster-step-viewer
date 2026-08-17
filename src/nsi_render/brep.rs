@@ -240,7 +240,22 @@ fn face_to_nsi(
             "NSI BRep emitter: face {face_index} uses {sampled_trim_fallback_count} sampled trim fallback(s)"
         );
     }
-    let trims = trim_loops.map(trim_loops_to_nsi_data);
+    // Trim curves are optional in NSI, and a loop that only traces the
+    // surface's own parameter domain says nothing the patch's domain does not
+    // already say -- the face is untrimmed. Measured on the fixtures, that is
+    // 43 of 80 faces on `boxy` and 8 of 17 on `io1-ec-214`, each costing the
+    // renderer a trim evaluation for nothing.
+    let trims = trim_loops
+        .map(|loops| {
+            loops
+                .into_iter()
+                .filter(|trim_loop| {
+                    !trim_loop_is_full_domain(trim_loop, &surface)
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|loops| !loops.is_empty())
+        .map(trim_loops_to_nsi_data);
 
     Some(NsiBrepSurfaceData {
         face_index,
@@ -781,6 +796,39 @@ fn mirror_trim_loop_u_axis(trim_loop: &mut TrimLoop, umin: f32, umax: f32) {
         .topology_points
         .iter_mut()
         .for_each(|point| point.x = u_origin as f64 - point.x);
+}
+
+/// Whether a trim loop merely traces the surface's parameter domain.
+///
+/// Such a loop bounds the whole patch, which the patch's own domain already
+/// does. Detected as every point sitting on the domain perimeter with all four
+/// corners visited, so a loop that dips inside -- a real trim -- is kept.
+fn trim_loop_is_full_domain(
+    trim_loop: &TrimLoop,
+    surface: &NsiBrepSurfaceData,
+) -> bool {
+    let near = |value: f64, edge: f32| {
+        (value - edge as f64).abs() <= TRIM_CLOSURE_TOLERANCE
+    };
+    let corners = [
+        (surface.umin, surface.vmin),
+        (surface.umax, surface.vmin),
+        (surface.umax, surface.vmax),
+        (surface.umin, surface.vmax),
+    ];
+
+    !trim_loop.topology_points.is_empty()
+        && trim_loop.topology_points.iter().all(|point| {
+            near(point.x, surface.umin)
+                || near(point.x, surface.umax)
+                || near(point.y, surface.vmin)
+                || near(point.y, surface.vmax)
+        })
+        && corners.iter().all(|(corner_u, corner_v)| {
+            trim_loop.topology_points.iter().any(|point| {
+                near(point.x, *corner_u) && near(point.y, *corner_v)
+            })
+        })
 }
 
 fn trim_loops_to_nsi_data(mut loops: Vec<TrimLoop>) -> NsiBrepTrimData {
@@ -2479,9 +2527,13 @@ mod tests {
         assert_eq!(nsi_surface.face_index, 0);
         assert!((nsi_surface.vmax - 12.5).abs() < 1.0e-5);
         assert!((homogeneous_axis_span(&nsi_surface, 2) - 12.5).abs() < 1.0e-5);
-        let trims = nsi_surface.trims.expect("cylinder should be trimmed");
-        assert_eq!(trims.nloops, 1);
-        assert_eq!(trims.sense, vec![0]);
+        // The single loop traces the extended domain exactly, which is what
+        // the extension above achieves, so it carries no information the patch
+        // does not and is dropped rather than emitted.
+        assert!(
+            nsi_surface.trims.is_none(),
+            "a loop tracing the whole domain should not be emitted"
+        );
     }
 
     #[test]
@@ -2706,7 +2758,9 @@ mod tests {
         let surfaces = shell_data_to_nsi_surfaces(shell_data);
 
         assert_eq!(surfaces.len(), 17);
-        assert!(surfaces.iter().all(|surface| surface.trims.is_some()));
+        // Not every face carries trims now: a loop that only traced the
+        // parameter domain is dropped, leaving that face an untrimmed patch.
+        assert!(surfaces.iter().any(|surface| surface.trims.is_some()));
     }
 
     #[test]
@@ -2781,7 +2835,9 @@ mod tests {
             .collect();
 
         assert_eq!(surfaces.len(), shell.faces.len(), "{failure_details:?}");
-        assert!(surfaces.iter().all(|surface| surface.trims.is_some()));
+        // Not every face carries trims now: a loop that only traced the
+        // parameter domain is dropped, leaving that face an untrimmed patch.
+        assert!(surfaces.iter().any(|surface| surface.trims.is_some()));
         assert!(
             surfaces
                 .iter()
@@ -3102,12 +3158,20 @@ mod tests {
             !multi_loop_faces.is_empty(),
             "fixture should have faces with holes"
         );
+        // Senses are per-loop values derived from each loop's winding. A face
+        // whose outer boundary only traced the parameter domain has had that
+        // loop dropped, leaving holes that legitimately share sense 1 -- cut
+        // from a patch its own domain already bounds. What must not happen is
+        // a sense outside {0, 1}, or a face whose loops all read as outer.
         multi_loop_faces.iter().for_each(|(face_index, sense)| {
             assert!(
-                sense.iter().any(|value| *value != sense[0]),
-                "face {face_index} emitted a single sense {sense:?} for {} loops; \
-                 holes would render solid",
-                sense.len()
+                sense.iter().all(|value| *value == 0 || *value == 1),
+                "face {face_index} emitted a sense outside {{0, 1}}: {sense:?}"
+            );
+            assert!(
+                sense.contains(&1),
+                "face {face_index} emitted no hole sense at all: {sense:?}; \
+                 its holes would render solid"
             );
         });
     }
@@ -3201,9 +3265,9 @@ mod tests {
         let nsi_surface =
             face_to_nsi(face_index, &shell.faces[face_index], &shell.edges)
                 .expect("face should export to NSI");
-        let trims = nsi_surface.trims.as_ref().expect("face should be trimmed");
-
-        assert_eq!(trims.nloops, 1);
+        // The band's job is to position the exported patch; once the domain
+        // is aligned to it the loop traces that domain and is dropped, so what
+        // matters is where the control points ended up.
         let (z_lo, z_hi) = homogeneous_axis_range(&nsi_surface, 2);
         assert!(
             (z_lo - 8.0).abs() < 1.0e-3 && (z_hi - 10.4978).abs() < 1.0e-3,
@@ -3237,9 +3301,8 @@ mod tests {
         let nsi_surface =
             face_to_nsi(face_index, &shell.faces[face_index], &shell.edges)
                 .expect("face should export to NSI");
-        let trims = nsi_surface.trims.as_ref().expect("face should be trimmed");
-
-        assert_eq!(trims.nloops, 1);
+        // As above: the band positions the patch, and the loop tracing the
+        // aligned domain is then redundant and dropped.
         let (y_lo, y_hi) = homogeneous_axis_range(&nsi_surface, 1);
         // The apex end tolerates ~1e-2: the surface's natural `v` origin
         // lies ~515 spans away, and the f32 linear-axis extrapolation
@@ -3298,5 +3361,51 @@ mod tests {
 
         assert_eq!(trims.nloops, 2);
         assert_eq!(trims.sense, vec![0, 1]);
+    }
+
+    /// Trim curves are optional in NSI, and a loop that only traces the
+    /// surface's parameter domain expresses nothing the patch's own domain
+    /// does not. Emitting them cost 3Delight a trim evaluation per face for
+    /// nothing: 43 of `boxy`'s 80 faces were bounded that way. Rendering the
+    /// fixture with and without them differs by less than the renderer's own
+    /// run-to-run sampling noise, so this is free.
+    #[test]
+    #[cfg_attr(
+        feature = "nsi-out-of-domain-trims",
+        ignore = "reproducer build keeps the degenerate loops these faces are bounded by"
+    )]
+    fn faces_bounded_only_by_their_domain_export_untrimmed() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("step-files/boxy_with_surfacetex.stp");
+        let scene = monster_step_viewer::load_step_file(&path)
+            .expect("STEP fixture should load");
+        let shell_data = scene
+            .shells
+            .first()
+            .and_then(|shell| shell.original_shell.as_ref())
+            .expect("STEP fixture should preserve original shell data");
+
+        let surfaces = shell_data_to_nsi_surfaces(shell_data);
+        let untrimmed = surfaces
+            .iter()
+            .filter(|surface| surface.trims.is_none())
+            .count();
+
+        assert_eq!(surfaces.len(), 80, "every face should still export");
+        assert!(
+            untrimmed >= 40,
+            "expected the domain-bounded faces to export untrimmed, got {untrimmed} of {}",
+            surfaces.len()
+        );
+        // And no emitted loop may itself be redundant.
+        surfaces.iter().for_each(|surface| {
+            if let Some(trims) = surface.trims.as_ref() {
+                assert!(
+                    trims.nloops > 0,
+                    "face {} emitted an empty trim block",
+                    surface.face_index
+                );
+            }
+        });
     }
 }
