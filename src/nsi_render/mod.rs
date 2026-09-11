@@ -24,6 +24,7 @@
 use crate::{HashMap, HashSet};
 use std::{
     env,
+    num::NonZeroUsize,
     path::PathBuf,
     sync::OnceLock,
     thread::{self, JoinHandle},
@@ -203,7 +204,8 @@ impl NsiRenderState {
         ctx.set_attribute(
             &handles.screen,
             &[
-                nsi::i32_slice!("resolution", &[1024, 1024]).array_len(2),
+                nsi::i32_slice!("resolution", &[1024, 1024])
+                    .array_len(NonZeroUsize::new(2).unwrap()),
                 nsi::i32!("oversampling", 16),
             ],
         );
@@ -725,4 +727,76 @@ fn mat4_to_nsi(mat: Mat4) -> [f64; 16] {
     // (RenderMan-style) uses row-vector convention — they're transposes
     // of each other and the storage transposes back.
     mat.to_cols_array().map(|v| v as f64)
+}
+
+#[cfg(all(test, feature = "nsi-render"))]
+mod tests {
+    use super::{NsiHandles, NsiRenderState};
+    use std::path::PathBuf;
+
+    /// Path of the recorded ɴsɪ call stream for the singleton scene
+    /// nodes.
+    fn fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/nsi_scene_nodes.nsi")
+    }
+
+    /// Drop 3Delight's banner and timestamp comments so the comparison
+    /// is about the calls we made, not about when we made them.
+    fn calls_only(stream: &str) -> Vec<String> {
+        stream
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Record `create_scene_nodes` into an ɴsɪ stream instead of
+    /// rendering it.
+    fn record_scene_nodes() -> Vec<String> {
+        let out = std::env::temp_dir().join("mstpv_scene_nodes.nsi");
+        let _ = std::fs::remove_file(&out);
+
+        {
+            let ctx = nsi::Context::new(Some(&[
+                nsi::string!("type", "apistream"),
+                nsi::string!("streamfilename", out.to_str().unwrap()),
+                nsi::string!("streamformat", "nsi"),
+            ]))
+            .expect("could not create an apistream ɴsɪ context");
+
+            NsiRenderState::create_scene_nodes(&ctx, &NsiHandles::default())
+                .expect("create_scene_nodes failed");
+        } // Context::drop calls NSIEnd, which flushes the stream.
+
+        calls_only(&std::fs::read_to_string(&out).expect("stream written"))
+    }
+
+    /// The singleton scene setup must emit exactly the same ɴsɪ calls,
+    /// in the same order, as the recorded fixture.
+    ///
+    /// This is the regression gate for making `create_scene_nodes`
+    /// generic over `nsi_trait::Nsi`: the refactor must not add, drop
+    /// or reorder a single call. Handles are fixed literals, so the
+    /// stream is byte-reproducible.
+    ///
+    /// Regenerate deliberately with `MSTPV_BLESS_NSI=1`.
+    #[test]
+    fn scene_nodes_emit_the_expected_nsi_calls() {
+        let actual = record_scene_nodes();
+        let path = fixture_path();
+
+        if std::env::var_os("MSTPV_BLESS_NSI").is_some() || !path.exists() {
+            std::fs::write(&path, actual.join("\n") + "\n")
+                .expect("could not write fixture");
+            eprintln!("blessed fixture at {}", path.display());
+            return;
+        }
+
+        let expected = calls_only(
+            &std::fs::read_to_string(&path).expect("fixture readable"),
+        );
+        assert_eq!(expected, actual, "ɴsɪ call stream changed");
+    }
 }
