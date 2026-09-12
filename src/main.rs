@@ -1,9 +1,13 @@
+#![recursion_limit = "256"]
+
 pub use monster_step_viewer::{HashMap, HashSet};
 
 mod browser;
 mod icons;
 mod persistence;
 mod scene;
+#[cfg(not(target_arch = "wasm32"))]
+mod screenshot;
 mod state;
 mod ui;
 mod viewer_material;
@@ -29,7 +33,8 @@ use bevy_editor_cam::{
 };
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass, EguiUserTextures};
 use state::{
-    AppMode, BrowserState, ClipPlaneDragState, ViewerState, ViewportClickGuard,
+    AppMode, BrowserState, ClipPlaneDragState, RealtimeViewportSuppressed,
+    ViewerState, ViewportClickGuard,
 };
 use std::{
     env,
@@ -120,6 +125,7 @@ fn main() {
     })
     .insert_resource(persistence::SaveTimer::default())
     .insert_resource(ClipPlaneDragState::default())
+    .insert_resource(RealtimeViewportSuppressed::default())
     .insert_resource(ViewportClickGuard::default())
     .add_plugins(
         DefaultPlugins
@@ -222,6 +228,9 @@ fn main() {
         Update,
         browser::manage_render_slots_system.run_if(in_browser_mode),
     );
+
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_observer(screenshot::save_captured_viewport);
 
     #[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
     app.add_plugins(nsi_overlay::NsiOverlayPlugin);

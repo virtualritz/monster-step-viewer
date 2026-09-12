@@ -532,6 +532,10 @@ pub(crate) struct ViewportClickGuard {
     pub mesh_consumed: bool,
 }
 
+/// Whether NSI owns the 3D viewport instead of Bevy's real-time renderer.
+#[derive(Resource, Default)]
+pub(crate) struct RealtimeViewportSuppressed(pub bool);
+
 #[derive(Debug)]
 pub(crate) struct LoadJob {
     pub path: PathBuf,

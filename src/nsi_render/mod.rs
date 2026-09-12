@@ -1,9 +1,8 @@
 //! NSI (3Delight) renderer driver.
 //!
-//! Drives an interactive `idisplay` render: 3Delight pops up its own
-//! image window (via the `idisplay` driver) and we just push scene
-//! changes through the `Context` and call `render_control(Synchronize)`
-//! to nudge the renderer to refresh its pixels.
+//! Drives an interactive in-viewport render: 3Delight writes progressive
+//! pixels through its callback driver while we push scene changes through the
+//! `Context` and call `render_control(Synchronize)` to refresh them.
 //!
 //! Lifecycle:
 //! * `NsiRenderState::new()` creates the context, all singleton scene nodes
@@ -35,6 +34,10 @@ use crossbeam::channel::{Receiver, Sender};
 use glam::Mat4;
 #[cfg(feature = "nsi-render")]
 use parking_lot::Mutex;
+#[cfg(feature = "nsi-render")]
+use rayon::prelude::*;
+#[cfg(feature = "nsi-render")]
+use std::sync::Arc;
 
 #[cfg(feature = "nsi-render")]
 use monster_step_viewer::CompressedShellData;
@@ -132,6 +135,17 @@ struct DynamicBrepHandles {
     surfaces: Vec<DynamicBrepSurfaceHandles>,
 }
 
+/// Pixels supplied by 3Delight's callback driver for the egui overlay.
+#[cfg(feature = "nsi-render")]
+struct OverlayImage {
+    pixels: Vec<u8>,
+    width: usize,
+    height: usize,
+    dirty: bool,
+    first_dirty_row: usize,
+    last_dirty_row: usize,
+}
+
 /// Persistent NSI render state — context + scene nodes + render-control
 /// worker.
 #[cfg(feature = "nsi-render")]
@@ -145,6 +159,7 @@ pub struct NsiRenderState {
     brep_handles: Mutex<HashMap<String, DynamicBrepHandles>>,
     render_thread: Option<JoinHandle<()>>,
     is_rendering: Mutex<bool>,
+    overlay_image: Arc<Mutex<OverlayImage>>,
 }
 
 #[cfg(feature = "nsi-render")]
@@ -156,8 +171,9 @@ impl NsiRenderState {
         let context =
             nsi::Context::new(None).ok_or("Failed to create NSI context")?;
         let handles = NsiHandles::default();
+        let overlay_image = Self::new_overlay_image();
 
-        Self::create_scene_nodes(&context, &handles)?;
+        Self::create_scene_nodes(&context, &handles, overlay_image.clone())?;
 
         let (command_tx, command_rx) = crossbeam::channel::unbounded();
         let ctx_for_thread = context.clone();
@@ -175,12 +191,25 @@ impl NsiRenderState {
             brep_handles: Mutex::new(HashMap::default()),
             render_thread: Some(render_thread),
             is_rendering: Mutex::new(false),
+            overlay_image,
         })
+    }
+
+    fn new_overlay_image() -> Arc<Mutex<OverlayImage>> {
+        Arc::new(Mutex::new(OverlayImage {
+            pixels: vec![0; 1024 * 1024 * 4],
+            width: 1024,
+            height: 1024,
+            dirty: false,
+            first_dirty_row: usize::MAX,
+            last_dirty_row: 0,
+        }))
     }
 
     fn create_scene_nodes(
         ctx: &nsi::Context,
         handles: &NsiHandles,
+        overlay_image: Arc<Mutex<OverlayImage>>,
     ) -> Result<(), String> {
         // Camera transform.
         ctx.create(&handles.camera_xform, nsi::TRANSFORM, None);
@@ -197,8 +226,7 @@ impl NsiRenderState {
         );
         ctx.set_attribute(&handles.camera, &[nsi::f32!("fov", 45.0)]);
 
-        // Screen — fixed render resolution. idisplay opens its own
-        // window at this size; the user can scale it.
+        // Screen resolution matches the in-viewport NSI texture.
         ctx.create(&handles.screen, nsi::SCREEN, None);
         ctx.connect(&handles.screen, None, &handles.camera, "screens", None);
         ctx.set_attribute(
@@ -210,16 +238,15 @@ impl NsiRenderState {
             ],
         );
 
-        // Output layer (beauty, sRGB u8 — idisplay renders straight to a
-        // sRGB image window).
+        // Output layer is delivered to an in-process callback as float RGBA.
         ctx.create(&handles.output_layer, nsi::OUTPUT_LAYER, None);
         ctx.set_attribute(
             &handles.output_layer,
             &[
                 nsi::string!("variablename", "Ci"),
                 nsi::i32!("withalpha", 1),
-                nsi::string!("scalarformat", "uint8"),
-                nsi::string!("colorprofile", "srgb"),
+                nsi::string!("scalarformat", "float"),
+                nsi::f64!("filterwidth", 1.0),
             ],
         );
         ctx.connect(
@@ -230,8 +257,8 @@ impl NsiRenderState {
             None,
         );
 
-        // Output driver — 3Delight's `idisplay` opens an external image
-        // window. No callbacks, no shared image, no readback.
+        // Output driver — 3Delight writes progressive buckets into the shared
+        // image, which egui composites over the viewport.
         ctx.create(&handles.output_driver, nsi::OUTPUT_DRIVER, None);
         ctx.connect(
             &handles.output_driver,
@@ -240,11 +267,90 @@ impl NsiRenderState {
             "outputdrivers",
             None,
         );
+        let write_callback = nsi::output::WriteCallback::<f32>::new(
+            move |_name: &str,
+                  _width: usize,
+                  _height: usize,
+                  x_min: usize,
+                  x_max_plus_one: usize,
+                  y_min: usize,
+                  y_max_plus_one: usize,
+                  pixel_format: &nsi::output::PixelFormat,
+                  bucket_data: &[f32]| {
+                let channels = pixel_format.channels();
+                if channels < 3 {
+                    return nsi::output::Error::None;
+                }
+                let mut image = overlay_image.lock();
+                let width = image.width;
+                let height = image.height;
+                let x_end = x_max_plus_one.min(width);
+                let y_end = y_max_plus_one.min(height);
+                let x_start = x_min.min(width);
+                image
+                    .pixels
+                    .par_chunks_exact_mut(width * 4)
+                    .enumerate()
+                    .skip(y_min.min(height))
+                    .take(y_end.saturating_sub(y_min))
+                    .for_each(|(y, row)| {
+                        row[x_start * 4..x_end * 4]
+                            .as_chunks_mut::<4>()
+                            .0
+                            .iter_mut()
+                            .enumerate()
+                            .for_each(|(column, pixel)| {
+                                let x = x_start + column;
+                                let source = ((y - y_min)
+                                    * (x_max_plus_one - x_min)
+                                    + (x - x_min))
+                                    * channels;
+                                if source + channels > bucket_data.len() {
+                                    return;
+                                }
+                                let alpha = if channels >= 4 {
+                                    bucket_data[source + 3]
+                                } else {
+                                    1.0
+                                };
+                                let to_srgb = |linear: f32| {
+                                    let straight = if alpha > 0.0 {
+                                        linear / alpha
+                                    } else {
+                                        0.0
+                                    };
+                                    (straight.clamp(0.0, 1.0).powf(1.0 / 2.2)
+                                        * 255.0)
+                                        as u8
+                                };
+                                pixel.copy_from_slice(&[
+                                    to_srgb(bucket_data[source]),
+                                    to_srgb(bucket_data[source + 1]),
+                                    to_srgb(bucket_data[source + 2]),
+                                    (alpha.clamp(0.0, 1.0) * 255.0) as u8,
+                                ]);
+                            });
+                    });
+                image.dirty = true;
+                image.first_dirty_row = image.first_dirty_row.min(y_min);
+                image.last_dirty_row = image.last_dirty_row.max(y_end);
+                nsi::output::Error::None
+            },
+        );
+        let open_callback = nsi::output::OpenCallback::new(
+            |_name, _width, _height, _format| nsi::output::Error::None,
+        );
+        let finish_callback = nsi::output::FinishCallback::new(
+            |_name, _width, _height, _format| nsi::output::Error::None,
+        );
         ctx.set_attribute(
             &handles.output_driver,
             &[
-                nsi::string!("drivername", "idisplay"),
-                nsi::string!("imagefilename", "mstpv_nsi"),
+                nsi::string!("drivername", nsi::output::FERRIS_F32),
+                nsi::string!("imagefilename", "mstpv_nsi_overlay"),
+                nsi::callback!("callback.open", open_callback),
+                nsi::callback!("callback.write", write_callback),
+                nsi::callback!("callback.finish", finish_callback),
             ],
         );
 
@@ -661,6 +767,64 @@ impl NsiRenderState {
         self.send_command(NsiCommand::Stop);
         *state = false;
     }
+
+    /// Resize the callback image and matching NSI screen to the viewport.
+    pub fn set_overlay_resolution(&self, width: u32, height: u32) {
+        let width = width.max(1) as usize;
+        let height = height.max(1) as usize;
+        let mut image = self.overlay_image.lock();
+        if image.width == width && image.height == height {
+            return;
+        }
+        image.width = width;
+        image.height = height;
+        image.pixels = vec![0; width * height * 4];
+        image.dirty = false;
+        image.first_dirty_row = usize::MAX;
+        image.last_dirty_row = 0;
+        drop(image);
+
+        self.context.set_attribute(
+            &self.handles.screen,
+            &[
+                nsi::i32_slice!("resolution", &[width as i32, height as i32])
+                    .array_len(NonZeroUsize::new(2).unwrap()),
+            ],
+        );
+        self.send_command(NsiCommand::Synchronize);
+    }
+
+    /// Return changed image rows once after a 3Delight callback.
+    pub fn take_overlay_rows(
+        &self,
+    ) -> Option<(Vec<u8>, usize, usize, usize, usize)> {
+        let mut image = self.overlay_image.lock();
+        if !image.dirty {
+            return None;
+        }
+        image.dirty = false;
+        let first = image.first_dirty_row.min(image.height);
+        let last = image.last_dirty_row.clamp(first, image.height);
+        image.first_dirty_row = usize::MAX;
+        image.last_dirty_row = 0;
+        let row_count = last.saturating_sub(first);
+        (row_count > 0).then(|| {
+            let stride = image.width * 4;
+            (
+                image.pixels[first * stride..last * stride].to_vec(),
+                image.width,
+                image.height,
+                first,
+                row_count,
+            )
+        })
+    }
+
+    /// Return a full callback-image snapshot for first or resized textures.
+    pub fn overlay_image(&self) -> (Vec<u8>, usize, usize) {
+        let image = self.overlay_image.lock();
+        (image.pixels.clone(), image.width, image.height)
+    }
 }
 
 #[cfg(feature = "nsi-render")]
@@ -685,7 +849,7 @@ fn render_thread_main(ctx: nsi::Context<'static>, rx: Receiver<NsiCommand>) {
             NsiCommand::Start => {
                 if !is_rendering {
                     log::info!(
-                        "NSI: render start (interactive + progressive, idisplay)"
+                        "NSI: render start (interactive + progressive, viewport callback)"
                     );
                     ctx.render_control(
                         nsi::Action::Start,
@@ -766,8 +930,12 @@ mod tests {
             ]))
             .expect("could not create an apistream ɴsɪ context");
 
-            NsiRenderState::create_scene_nodes(&ctx, &NsiHandles::default())
-                .expect("create_scene_nodes failed");
+            NsiRenderState::create_scene_nodes(
+                &ctx,
+                &NsiHandles::default(),
+                NsiRenderState::new_overlay_image(),
+            )
+            .expect("create_scene_nodes failed");
         } // Context::drop calls NSIEnd, which flushes the stream.
 
         calls_only(&std::fs::read_to_string(&out).expect("stream written"))

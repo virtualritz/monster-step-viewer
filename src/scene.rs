@@ -31,9 +31,9 @@ use crate::{
         AMBIENT_BRIGHTNESS, BACK_LIGHT_ILLUMINANCE, Bounds, ClipPlaneDragState,
         ClipPlaneHandle, EdgeRecord, FaceRecord, IsoparamsMaterial,
         IsoparamsMesh, KEY_LIGHT_ILLUMINANCE, LoadJob, LoopRecord, MainCamera,
-        NEUTRAL_GRAY, PolygonEdgesMaterial, PolygonEdgesMesh, Selection,
-        ShadingMode, ShellMesh, ShellRecord, UpAxis, ViewerState,
-        ViewportClickGuard,
+        NEUTRAL_GRAY, PolygonEdgesMaterial, PolygonEdgesMesh,
+        RealtimeViewportSuppressed, Selection, ShadingMode, ShellMesh,
+        ShellRecord, UpAxis, ViewerState, ViewportClickGuard,
     },
     viewer_material::{
         ATTRIBUTE_FACE_ID, FACE_STATE_HIDDEN, FACE_STATE_HOVERED,
@@ -759,20 +759,22 @@ pub(crate) fn spawn_shell_faces_normalized(
 }
 
 pub(crate) fn compute_bounds(scene: &StepScene) -> Option<Bounds> {
-    let mut min = Vec3::splat(f32::MAX);
-    let mut max = Vec3::splat(f32::MIN);
-    let mut has_points = false;
-
-    for shell in &scene.shells {
-        for face in &shell.faces {
-            for p in face.mesh.positions() {
-                let pos = Vec3::new(p.x as f32, p.y as f32, p.z as f32);
-                min = min.min(pos);
-                max = max.max(pos);
-                has_points = true;
-            }
-        }
-    }
+    let (min, max, has_points) = scene
+        .shells
+        .par_iter()
+        .flat_map_iter(|shell| shell.faces.iter())
+        .flat_map_iter(|face| face.mesh.positions().iter())
+        .map(|p| Vec3::new(p.x as f32, p.y as f32, p.z as f32))
+        .fold(
+            || (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN), false),
+            |(min, max, _), pos| (min.min(pos), max.max(pos), true),
+        )
+        .reduce(
+            || (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN), false),
+            |(min_a, max_a, has_a), (min_b, max_b, has_b)| {
+                (min_a.min(min_b), max_a.max(max_b), has_a || has_b)
+            },
+        );
 
     if !has_points {
         return None;
@@ -1968,7 +1970,14 @@ pub(crate) fn configure_gizmos(mut config_store: ResMut<GizmoConfigStore>) {
 }
 
 /// Draw bounding box and wireframe gizmos when enabled.
-pub(crate) fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
+pub(crate) fn draw_gizmos(
+    state: Res<ViewerState>,
+    realtime_viewport: Res<RealtimeViewportSuppressed>,
+    mut gizmos: Gizmos,
+) {
+    if realtime_viewport.0 {
+        return;
+    }
     // Polygon edges are now drawn by per-shell `LineList` `Mesh3d` entities
     // (toggled via `apply_polygon_edges_visibility`); no per-frame gizmo
     // work here.

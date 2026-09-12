@@ -2,8 +2,12 @@
 use crate::icons::ICON_COUNTER_3;
 #[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
 use crate::nsi_overlay::NsiOverlayState;
+#[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
+use crate::nsi_overlay::draw_nsi_overlay;
 #[cfg(all(feature = "nsi-export", not(target_arch = "wasm32")))]
 use crate::nsi_render::{NsiFileExportOptions, export_scene_to_nsi_file};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::screenshot::request_viewport_screenshot;
 use crate::{
     browser::{
         poll_preview_loads, refresh_tree_entry, scan_step_files, scan_subdirs,
@@ -97,8 +101,12 @@ fn nsi_render_toolbar_toggle(
                     render.stop();
                 }
                 overlay.enabled = false;
+                overlay.has_viewport_frame = false;
+                overlay.texture = None;
             } else {
                 overlay.enabled = true;
+                overlay.has_viewport_frame = false;
+                overlay.texture = None;
                 if overlay.render.is_none() {
                     overlay.init_requested = true;
                 } else if let Some(render) = overlay.render.as_ref() {
@@ -517,7 +525,9 @@ pub(crate) fn parameter_ui(
 }
 
 pub(crate) fn ui_system(
+    mut commands: Commands,
     mut contexts: EguiContexts,
+    clear_color: Res<ClearColor>,
     mut state: ResMut<ViewerState>,
     mut browser: ResMut<BrowserState>,
     mut exit: MessageWriter<AppExit>,
@@ -547,7 +557,7 @@ pub(crate) fn ui_system(
     );
 
     // Top bar: File menu on left, mode tabs on right.
-    egui::Panel::top("menu").show(&mut root_ui, |ui| {
+    let menu_response = egui::Panel::top("menu").show(&mut root_ui, |ui| {
         ui.horizontal(|ui| {
             ui.style_mut().override_text_style = Some(egui::TextStyle::Heading);
 
@@ -577,6 +587,24 @@ pub(crate) fn ui_system(
                 if ui.button("Open URL\u{2026}").clicked() {
                     state.show_url_dialog = true;
                     ui.close();
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let screenshot_response = ui.add_enabled(
+                        state.scene_data.is_some(),
+                        egui::Button::new("Save PNG Screenshot"),
+                    );
+                    if screenshot_response.clicked() {
+                        match request_viewport_screenshot(
+                            &mut commands,
+                            &mut params.camera_queries.viewport,
+                            clear_color.0,
+                        ) {
+                            Ok(()) => {}
+                            Err(error) => state.error = Some(error),
+                        }
+                        ui.close();
+                    }
                 }
                 #[cfg(all(
                     feature = "nsi-export",
@@ -762,6 +790,7 @@ pub(crate) fn ui_system(
                     &params.windows,
                     &mut params.camera_queries.viewport,
                     &mut params.nsi_overlay,
+                    menu_response.response.rect.max.y,
                 )
             }
             #[cfg(not(all(
@@ -906,6 +935,8 @@ fn viewer_ui(
     camera_query: &mut MainCameraViewportQuery,
     #[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
     nsi_overlay: &mut ResMut<NsiOverlayState>,
+    #[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
+    nsi_content_top: f32,
 ) {
     let ctx = root_ui.ctx().clone();
     let ctx = &ctx;
@@ -1612,6 +1643,17 @@ fn viewer_ui(
 
         let toolbar_margin = 8.0;
         let toolbar_y = toolbar_margin + 24.0;
+
+        #[cfg(all(feature = "nsi-render", not(target_arch = "wasm32")))]
+        draw_nsi_overlay(
+            root_ui,
+            nsi_overlay,
+            egui::Rect::from_min_size(
+                egui::pos2(viewport_x, 0.0),
+                egui::vec2(viewport_width, window_height),
+            ),
+            nsi_content_top,
+        );
 
         // Viewport overlay frame (no shadow).
         let overlay_frame = egui::Frame::NONE

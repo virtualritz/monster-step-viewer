@@ -52,7 +52,6 @@ bevy_egui = "0.42"
 # (aevyrie/bevy_editor_cam#66). Switch back to a crates.io version once it lands.
 bevy_editor_cam = { git = "https://github.com/m-edlund/bevy_editor_cam.git", branch = "bevy-0.19" }
 futures-lite = "2"
-env_logger = "0.11"
 glam = "0.33"
 log = "0.4"
 parking_lot = "0.12"
@@ -69,11 +68,16 @@ monstertruck = { version = "0.4", features = [
     "modeling",
 ] }
 
+[dev-dependencies]
+env_logger = "0.11"
+
 # meshopt wraps the C++ meshoptimizer library. Keep it native-only for now;
 # the wasm build still gets indexed meshes, just without the
 # vertex-cache/vertex-fetch reordering.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+arboard = "3"
 meshopt = "0.6"
+png = "0.18"
 # NSI live rendering (3Delight). Optional, native-only. Pins the same git rev as
 # akatela's NSI integration, which we model the BRep export on.
 nsi = { git = "https://github.com/virtualritz/nsi.git", features = [

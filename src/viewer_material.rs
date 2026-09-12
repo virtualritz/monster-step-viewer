@@ -17,6 +17,7 @@ use bevy::{
     },
     shader::ShaderRef,
 };
+use rayon::prelude::*;
 
 /// Per-vertex global face id (read by the custom vertex shader and passed
 /// flat to the fragment shader for per-face state lookup).
@@ -230,13 +231,15 @@ impl MaterialExtension for ViewerMaterialExt {
 /// Generate a 256x256 matcap image with a neutral gray clay/studio-lit look.
 fn generate_matcap_image() -> Image {
     const SIZE: usize = 256;
-    let mut data = Vec::with_capacity(SIZE * SIZE * 4);
 
     // Light direction: slightly right, up, towards viewer.
     let light = Vec3::new(0.3, 0.5, 0.8).normalize();
 
-    for v in 0..SIZE {
-        for u in 0..SIZE {
+    let data: Vec<u8> = (0..SIZE * SIZE)
+        .into_par_iter()
+        .flat_map_iter(|index| {
+            let u = index % SIZE;
+            let v = index / SIZE;
             let nx = (u as f32 - 128.0) / 128.0;
             let ny = (128.0 - v as f32) / 128.0;
             let r2 = nx * nx + ny * ny;
@@ -260,12 +263,12 @@ fn generate_matcap_image() -> Image {
 
             // Outside the sphere radius, darken smoothly.
             if r2 > 1.0 {
-                data.extend_from_slice(&[30, 30, 30, 255]);
+                [30, 30, 30, 255]
             } else {
-                data.extend_from_slice(&[r, g, b, 255]);
+                [r, g, b, 255]
             }
-        }
-    }
+        })
+        .collect();
 
     Image::new(
         Extent3d {

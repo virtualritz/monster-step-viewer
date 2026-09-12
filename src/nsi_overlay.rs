@@ -2,8 +2,8 @@
 //!
 //! Owns an `NsiRenderState` (when 3Delight is detected at startup),
 //! pushes scene + camera + visibility updates from Bevy ECS. The render
-//! itself runs asynchronously in 3Delight's `idisplay` window — we
-//! never read pixels back into Bevy.
+//! itself runs asynchronously in 3Delight and is composited into the Bevy
+//! viewport from its progressive pixel callbacks.
 //!
 //! Architecture:
 //! * Geometry is pushed exactly once per shell, when the overlay is first
@@ -16,12 +16,23 @@ use crate::{HashMap, HashSet};
 
 use bevy::prelude::*;
 use bevy_editor_cam::prelude::EditorCam;
+use bevy_egui::egui;
 
 use crate::{
     nsi_render::{NsiRenderState, detect_3delight},
-    state::{MainCamera, ViewerState},
+    state::{
+        IsoparamsMesh, MainCamera, PolygonEdgesMesh,
+        RealtimeViewportSuppressed, ShellMesh, ViewerState,
+    },
 };
 use monster_step_viewer::StepShell;
+
+type RealtimeMeshQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (Option<&'static ShellMesh>, &'static mut Visibility),
+    Or<(With<ShellMesh>, With<PolygonEdgesMesh>, With<IsoparamsMesh>)>,
+>;
 
 /// Bevy resource holding NSI overlay state.
 #[derive(Resource, Default)]
@@ -45,6 +56,94 @@ pub(crate) struct NsiOverlayState {
     /// `init_nsi_render_state` Update system picks it up to lazy-init
     /// the NSI context.
     pub init_requested: bool,
+    /// egui texture receiving the progressive 3Delight pixel callbacks.
+    pub texture: Option<egui::TextureHandle>,
+    /// Whether an NSI frame has reached the viewport at least once.
+    pub has_viewport_frame: bool,
+}
+
+/// Paint the current 3Delight image in the 3D viewport beneath egui chrome.
+pub(crate) fn draw_nsi_overlay(
+    ui: &mut egui::Ui,
+    overlay: &mut NsiOverlayState,
+    rect: egui::Rect,
+    content_top: f32,
+) {
+    if !overlay.enabled {
+        return;
+    }
+    let Some(render) = overlay.render.as_ref() else {
+        return;
+    };
+    let pixels_per_point = ui.pixels_per_point();
+    render.set_overlay_resolution(
+        (rect.width() * pixels_per_point).round() as u32,
+        (rect.height() * pixels_per_point).round() as u32,
+    );
+    if let Some((pixels, width, height, first_row, row_count)) =
+        render.take_overlay_rows()
+    {
+        let rows = egui::ColorImage::from_rgba_unmultiplied(
+            [width, row_count],
+            &pixels,
+        );
+        let texture_matches_image = overlay
+            .texture
+            .as_ref()
+            .is_some_and(|texture| texture.size() == [width, height]);
+        match &mut overlay.texture {
+            Some(texture) if texture_matches_image => texture.set_partial(
+                [0, first_row],
+                rows,
+                egui::TextureOptions::LINEAR,
+            ),
+            None => {
+                let (pixels, width, height) = render.overlay_image();
+                overlay.texture = Some(ui.ctx().load_texture(
+                    "mstpv_nsi_overlay",
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [width, height],
+                        &pixels,
+                    ),
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            Some(texture) => {
+                let (pixels, width, height) = render.overlay_image();
+                texture.set(
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [width, height],
+                        &pixels,
+                    ),
+                    egui::TextureOptions::LINEAR,
+                );
+            }
+        }
+        overlay.has_viewport_frame = true;
+    }
+    if let Some(texture) = &overlay.texture {
+        let clip_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x, content_top.max(rect.min.y)),
+            rect.max,
+        );
+        ui.ctx()
+            .layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("nsi_overlay"),
+            ))
+            .with_clip_rect(clip_rect)
+            .image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(
+                    egui::Pos2::ZERO,
+                    egui::pos2(1.0, 1.0),
+                ),
+                egui::Color32::WHITE,
+            );
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(33));
+    }
 }
 
 impl NsiOverlayState {
@@ -62,8 +161,55 @@ impl Plugin for NsiOverlayPlugin {
             .add_systems(Update, init_nsi_render_state)
             .add_systems(Update, push_scene_brep_to_nsi)
             .add_systems(Update, push_visibility_to_nsi)
-            .add_systems(Update, push_camera_to_nsi);
+            .add_systems(Update, push_camera_to_nsi)
+            .add_systems(
+                Update,
+                suppress_realtime_viewport
+                    .after(crate::scene::apply_face_visibility)
+                    .after(crate::scene::apply_polygon_edges_visibility)
+                    .after(crate::scene::apply_isoparams_visibility)
+                    .before(crate::scene::draw_gizmos),
+            );
     }
+}
+
+/// Keep the real-time meshes out of the NSI image once the latter has pixels.
+/// Rendering both cameras during interactive motion produces two differently
+/// timed projections, which reads as flicker rather than an overlay.
+fn suppress_realtime_viewport(
+    overlay: Res<NsiOverlayState>,
+    mut state: ResMut<ViewerState>,
+    mut realtime_viewport: ResMut<RealtimeViewportSuppressed>,
+    mut meshes: RealtimeMeshQuery,
+    mut was_suppressed: Local<bool>,
+) {
+    let suppress = overlay.enabled && overlay.has_viewport_frame;
+    realtime_viewport.0 = suppress;
+    if suppress {
+        meshes.iter_mut().for_each(|(_, mut visibility)| {
+            *visibility = Visibility::Hidden;
+        });
+    } else if *was_suppressed {
+        meshes
+            .iter_mut()
+            .filter_map(|(shell_mesh, visibility)| {
+                shell_mesh.map(|shell_mesh| (shell_mesh, visibility))
+            })
+            .for_each(|(shell_mesh, mut visibility)| {
+                let visible = state
+                    .shells
+                    .iter()
+                    .find(|shell| shell.id == shell_mesh.shell_id)
+                    .is_none_or(|shell| shell.visible);
+                *visibility = if visible {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                };
+            });
+        state.visibility_changed = true;
+    }
+    *was_suppressed = suppress;
 }
 
 fn detect_3delight_at_startup(mut overlay: ResMut<NsiOverlayState>) {
